@@ -1,0 +1,32 @@
+# Redis Service Docker Compose Configuration
+#
+# This file defines the Redis in-memory data store service.
+# It's a service-specific compose file that can be used standalone or
+# included in the main infra/docker-compose.yml.
+#
+# Redis is used for:
+# - Storing user sessions (server-side sessions)
+# - Caching JWKS (JSON Web Key Set) from Keycloak
+
+services:
+  redis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      # Only expose to localhost (not public internet)
+      - "127.0.0.1:6379:6379"
+    volumes:
+      # Persist Redis data across container restarts
+      - redis_data:/data
+    networks:
+      - infra-network
+
+volumes:
+  # Persistent volume for Redis data
+  redis_data:
+
+networks:
+  infra-network:
+    driver: bridge

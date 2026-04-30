@@ -1,0 +1,22 @@
+{
+  "name": "backend-monorepo",
+  "version": "1.0.0",
+  "description": "",
+  "private": true,
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "test": "turbo test",
+    "infra:up": "docker-compose -f infra/keycloak/docker-compose.yml up -d",
+    "infra:down": "docker-compose -f infra/keycloak/docker-compose.yml down",
+    "format": "prettier --write \"**/*.{ts,js,json,yaml,yml,md,py}\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.33.0",
+  "devDependencies": {
+    "turbo": "^2.9.6"
+  }
+}

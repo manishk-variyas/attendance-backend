@@ -1,0 +1,9 @@
+#!/bin/bash
+# Log cleanup cron jobs
+# Install with: crontab /app/scripts/log-cleanup.cron
+
+# Emergency brake: delete logs exceeding 50MB
+0 * * * * find /app/logs -name "*.log" -size +50M -delete 2>/dev/null
+
+# Daily housekeeping: remove rotated backups older than 14 days
+0 0 * * * find /app/logs -name "*.log.*" -mtime +14 -delete 2>/dev/null

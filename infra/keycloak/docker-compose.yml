@@ -1,0 +1,70 @@
+# Keycloak Service Docker Compose Configuration
+#
+# This file defines the Keycloak identity provider and its PostgreSQL database.
+# It's a service-specific compose file that can be used standalone or
+# included in the main infra/docker-compose.yml.
+#
+# Services:
+# - keycloak-db: PostgreSQL database for Keycloak data
+# - keycloak: Keycloak server (built from local Dockerfile)
+
+services:
+  # PostgreSQL database specifically for Keycloak
+  # Stores users, realms, clients, roles, and session data
+  keycloak-db:
+    image: postgres:16
+    restart: always
+    volumes:
+      # Persist database data across container restarts
+      - keycloak_db_data:/var/lib/postgresql/data
+    environment:
+      # Variables are substituted from infra/.env or environment
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Health check to ensure DB is ready before Keycloak starts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - infra-network
+
+  # Keycloak identity and access management server
+  keycloak:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    command: start-dev
+    env_file:
+      # Load from infra/keycloak/.env
+      - .env
+    environment:
+      KC_DB: postgres
+      # JDBC URL pointing to the keycloak-db service
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/${POSTGRES_DB}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      JAVA_OPTS_APPEND: "-Xms256m -Xmx512m"
+    # Only expose to localhost (not public internet)
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      # Wait for database to be healthy before starting
+      keycloak-db:
+        condition: service_healthy
+    networks:
+      - infra-network
+
+volumes:
+  keycloak_db_data:
+
+networks:
+  infra-network:
+    driver: bridge

@@ -1,0 +1,37 @@
+# Backend Service Docker Compose Configuration
+#
+# This is a service-specific compose file for the backend.
+# It's used in combination with the main infra/docker-compose.yml
+# (included via 'include' or run from this directory).
+#
+# The backend depends on keycloak-db, redis, and keycloak services
+# being healthy before it starts (condition: service_started).
+
+services:
+  backend:
+    build:
+      # Context is the actual backend app directory
+      context: ../../apps/backend
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      # Load environment variables from .env in this directory
+      - .env
+    environment:
+      # Internal Docker network URL for the backend
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      # Wait for these services to be started before starting backend
+      keycloak-db:
+        condition: service_started
+      redis:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    networks:
+      - infra-network
+
+# Reference the shared network from main docker-compose.yml
+networks:
+  infra-network:
+    driver: bridge

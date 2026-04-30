@@ -1,0 +1,26 @@
+# Nginx Reverse Proxy Docker Compose Configuration
+#
+# This file defines the Nginx reverse proxy service.
+# It's a service-specific compose file that can be used standalone or
+# included in the main infra/docker-compose.yml.
+#
+# Nginx is the public entry point (port 80) and forwards requests to the backend.
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      # Expose port 80 to the public internet
+      - "80:80"
+    depends_on:
+      # Ensure backend is started before nginx
+      - backend
+    networks:
+      - infra-network
+
+networks:
+  infra-network:
+    driver: bridge

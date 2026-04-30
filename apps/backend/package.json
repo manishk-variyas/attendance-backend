@@ -1,0 +1,10 @@
+{
+  "name": "core-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "sh -c 'source .venv/bin/activate && python3 -m uvicorn app.main:app --port 8000 --reload'",
+    "start": "sh -c 'source .venv/bin/activate && python3 -m uvicorn app.main:app --port 8000'",
+    "lint": "echo 'No lint configured for Python'"
+  }
+}
