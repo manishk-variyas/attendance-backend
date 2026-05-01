@@ -40,6 +40,7 @@ const API_BASE = "https://api.yourdomain.com"; // or http://api.yourdomain.com
 | Endpoint | Full URL | Method |
 |----------|----------|--------|
 | Health Check | `http://192.168.122.101/health` | GET |
+| Signup | `http://192.168.122.101/auth/signup` | POST |
 | Login | `http://192.168.122.101/auth/login?username=X&password=Y` | POST |
 | Refresh Session | `http://192.168.122.101/auth/refresh` | POST |
 | Logout | `http://192.168.122.101/auth/logout` | POST |
@@ -114,7 +115,93 @@ POST http://192.168.122.101/auth/login?username={username}&password={password}
 
 ---
 
-### 2. Get Current User
+### 2. Signup (Create New User)
+
+Creates a new user account in Keycloak.
+
+**Request**
+
+```
+POST http://192.168.122.101/auth/signup
+Content-Type: application/json
+
+{
+  "username": "newuser",
+  "email": "newuser@example.com",
+  "password": "Password123"
+}
+```
+
+| Field | Type | Required | Validation |
+|-------|------|----------|-----------|
+| `username` | string | Yes | 3-30 chars, letters/numbers/underscore only |
+| `email` | string | Yes | Valid email format |
+| `password` | string | Yes | Minimum 8 characters |
+
+**Request Payload (JavaScript)**
+
+```javascript
+const signupData = {
+  username: "newuser",
+  email: "newuser@example.com",
+  password: "Password123"
+};
+
+const res = await fetch("http://192.168.122.101/auth/signup", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",  // IMPORTANT: Required!
+  },
+  body: JSON.stringify(signupData),
+  credentials: "include",
+});
+```
+
+**Response — 201 Created**
+
+```json
+{
+  "message": "User created successfully",
+  "user_id": "012ed70c-da2d-4eb9-92cb-0e86a677fc32"
+}
+```
+
+**Response — 409 Conflict** (username or email already exists)
+
+```json
+{
+  "detail": "Username already exists"
+}
+```
+
+or
+
+```json
+{
+  "detail": "Email already exists"
+}
+```
+
+**Response — 422 Unprocessable Content** (validation error)
+
+```json
+{
+  "detail": "Validation error message"
+}
+```
+
+Common causes:
+- Missing `Content-Type: application/json` header
+- Invalid JSON format
+- Email not valid format
+- Username has special characters (only letters, numbers, underscore allowed)
+- Password too short
+
+**Rate limit:** 5 requests per minute per IP.
+
+---
+
+### 3. Get Current User
 
 Returns the authenticated user's profile.
 
@@ -248,6 +335,24 @@ GET http://192.168.122.101/health
 ```javascript
 // Replace with your VM's IP address
 const API = "http://192.168.122.101";
+
+async function signup(username, email, password) {
+  const res = await fetch(`${API}/auth/signup`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",  // IMPORTANT!
+    },
+    body: JSON.stringify({ username, email, password }),
+    credentials: "include",
+  });
+
+  if (!res.ok) {
+    const body = await res.json();
+    throw new Error(body.detail || "Signup failed");
+  }
+
+  return res.json();
+}
 
 async function login(username, password) {
   const res = await fetch(`${API}/auth/login?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`, {
