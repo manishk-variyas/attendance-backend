@@ -11,7 +11,7 @@ Schemas vs Models:
 - Schemas (here): API input/output validation (Pydantic)
 - Models (models/): Database tables (SQLAlchemy)
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
 
 
@@ -45,3 +45,14 @@ class SessionResponse(BaseModel):
     """
     message: str
     user: UserResponse
+
+
+class SignupRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=30, pattern=r"^[a-zA-Z0-9_]+$")
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+
+
+class SignupResponse(BaseModel):
+    message: str
+    user_id: str

@@ -41,9 +41,10 @@ services:
     env_file:
       # Load from infra/keycloak/.env
       - .env
-    environment:
+environment:
       KC_DB: postgres
-      # JDBC URL pointing to the keycloak-db service
+      KC_HOSTNAME_URL: http://localhost:8080
+      KC_HOSTNAME_STRICT: "false"
       KC_DB_URL: jdbc:postgresql://keycloak-db:5432/${POSTGRES_DB}
       KC_DB_USERNAME: ${POSTGRES_USER}
       KC_DB_PASSWORD: ${POSTGRES_PASSWORD}

@@ -116,3 +116,72 @@ async def get_jwks() -> dict:
     # Cache JWKS for 1 hour (they don't change often)
     await r.setex("jwks:keys", 3600, json.dumps(jwks))
     return jwks
+
+
+async def get_admin_token() -> str:
+    """Get admin access token using client credentials."""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": settings.KEYCLOAK_CLIENT_ID,
+                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to get admin token")
+    return response.json()["access_token"]
+
+
+async def create_keycloak_user(username: str, email: str) -> str:
+    """Create a user in Keycloak. Returns user ID."""
+    admin_token = await get_admin_token()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users",
+            json={
+                "username": username,
+                "email": email,
+                "enabled": True,
+                "emailVerified": False,
+            },
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    if response.status_code == 409:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    if response.status_code == 400 and "email" in response.text:
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    if response.status_code != 201:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+
+    user_id = response.headers["Location"].split("/")[-1]
+    return user_id
+
+
+async def set_keycloak_password(user_id: str, password: str) -> bool:
+    """Set password for a user in Keycloak."""
+    admin_token = await get_admin_token()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/reset-password",
+            json={
+                "type": "password",
+                "value": password,
+                "temporary": False,
+            },
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    return response.status_code == 204

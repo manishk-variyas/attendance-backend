@@ -24,10 +24,11 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
 from app.services.session import create_session, get_session, delete_session, get_redis
-from app.services.keycloak import refresh_keycloak_token, revoke_keycloak_token
+from app.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
 from app.auth.dependencies import get_current_user
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
+from app.schemas.auth import SignupRequest, SignupResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -272,3 +273,41 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
 
     # Return 204 No Content as per spec
     return JSONResponse(status_code=204, content=None)
+
+
+@router.post("/signup")
+@limiter.limit("5/minute")
+async def signup(request: Request, signup_data: SignupRequest):
+    """Signup endpoint - create a new user in Keycloak."""
+    correlation_id = request.state.correlation_id
+    client_ip = request.client.host if request.client else "-"
+
+    try:
+        user_id = await create_keycloak_user(signup_data.username, signup_data.email)
+        await set_keycloak_password(user_id, signup_data.password)
+
+        logger.info(f"User {signup_data.username} created via signup")
+        log_security_event(
+            correlation_id,
+            "signup",
+            f"User {signup_data.username} created",
+            severity="info",
+            extra={"username": signup_data.username, "client_ip": client_ip},
+        )
+
+        return SignupResponse(
+            message="User created successfully",
+            user_id=user_id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Signup error: {e}")
+        log_security_event(
+            correlation_id,
+            "signup",
+            f"Signup failed: {str(e)}",
+            severity="error",
+        )
+        raise HTTPException(status_code=500, detail="Failed to create user")

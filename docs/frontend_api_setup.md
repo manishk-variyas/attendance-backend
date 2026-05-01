@@ -1,13 +1,18 @@
 # Frontend API Setup Guide
 
-How to integrate your frontend with the backend authentication system.
+How to integrate your frontend with the backend authentication system when backend is on a VM.
 
 ---
 
 ## Quick Start
 
+### For VM Deployment (Backend on VM, Frontend Outside)
+
+Since your backend runs on a VM (behind nginx on port 80), use the **VM's IP address**:
+
 ```typescript
-const API_BASE = "http://your-server"; // No trailing slash
+// Replace 192.168.122.101 with your VM's actual IP address
+const API_BASE = "http://192.168.122.101"; // No trailing slash, port 80 is default
 
 // Login
 const res = await fetch(`${API_BASE}/auth/login?username=${u}&password=${p}`, {
@@ -19,11 +24,46 @@ const res = await fetch(`${API_BASE}/auth/login?username=${u}&password=${p}`, {
 // because of credentials: "include"
 ```
 
-**The key rule:** Every request must include `credentials: "include"` so the browser sends the session cookie.
+**Important:** Every request must include `credentials: "include"` so the browser sends the session cookie.
+
+**Important:** If you've set up a domain/DNS for your VM, use that instead:
+```typescript
+const API_BASE = "https://api.yourdomain.com"; // or http://api.yourdomain.com
+```
+
+---
+
+## Full VM URLs (Ready to Use)
+
+**Base URL:** `http://192.168.122.101` (nginx on port 80)
+
+| Endpoint | Full URL | Method |
+|----------|----------|--------|
+| Health Check | `http://192.168.122.101/health` | GET |
+| Login | `http://192.168.122.101/auth/login?username=X&password=Y` | POST |
+| Refresh Session | `http://192.168.122.101/auth/refresh` | POST |
+| Logout | `http://192.168.122.101/auth/logout` | POST |
+| Get Current User | `http://192.168.122.101/api/me` | GET |
+
+### Test Commands
+
+```bash
+# Health check
+curl http://192.168.122.101/health
+# Returns: {"status":"ok"}
+
+# Login
+curl -X POST "http://192.168.122.101/auth/login?username=your_user&password=your_pass" -c cookies.txt
+
+# Get current user (with session cookie)
+curl http://192.168.122.101/api/me -b cookies.txt
+```
 
 ---
 
 ## Endpoints Reference
+
+All endpoints are relative to the VM IP. Base URL: `http://192.168.122.101`
 
 ### 1. Login
 
@@ -32,7 +72,7 @@ Authenticates a user with username and password.
 **Request**
 
 ```
-POST /auth/login?username={username}&password={password}
+POST http://192.168.122.101/auth/login?username={username}&password={password}
 ```
 
 | Parameter | Type | Location | Required | Description |
@@ -81,7 +121,7 @@ Returns the authenticated user's profile.
 **Request**
 
 ```
-GET /api/me
+GET http://192.168.122.101/api/me
 Cookie: session_id=abc123...
 ```
 
@@ -121,7 +161,7 @@ Refreshes the user's session and rotates the session ID. Call this every ~4 minu
 **Request**
 
 ```
-POST /auth/refresh
+POST http://192.168.122.101/auth/refresh
 Cookie: session_id=abc123...
 ```
 
@@ -158,14 +198,14 @@ Logs the user out from the app and revokes their Keycloak token.
 **Request**
 
 ```
-POST /auth/logout
+POST http://192.168.122.101/auth/logout
 Cookie: session_id=abc123...
 ```
 
 or
 
 ```
-GET /auth/logout
+GET http://192.168.122.101/auth/logout
 Cookie: session_id=abc123...
 ```
 
@@ -188,7 +228,7 @@ Checks if the backend is running.
 **Request**
 
 ```
-GET /health
+GET http://192.168.122.101/health
 ```
 
 **Response — 200 OK**
@@ -206,7 +246,8 @@ GET /health
 ### Vanilla JavaScript / Fetch
 
 ```javascript
-const API = "http://your-server";
+// Replace with your VM's IP address
+const API = "http://192.168.122.101";
 
 async function login(username, password) {
   const res = await fetch(`${API}/auth/login?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`, {
@@ -246,8 +287,9 @@ async function logout() {
 ```javascript
 import axios from "axios";
 
+// Replace with your VM's IP address
 const api = axios.create({
-  baseURL: "http://your-server",
+  baseURL: "http://192.168.122.101",
   withCredentials: true, // Same as credentials: "include"
 });
 
@@ -271,7 +313,8 @@ await api.post("/auth/logout");
 ```tsx
 import { useEffect, useState } from "react";
 
-const API = "http://your-server";
+// Replace with your VM's IP address
+const API = "http://192.168.122.101";
 
 function useSession() {
   const [user, setUser] = useState(null);
@@ -312,11 +355,14 @@ function useSession() {
 
 import { useEffect } from "react";
 
+// Replace with your VM's IP address
+const API = "http://192.168.122.101";
+
 export function SessionProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const refresh = async () => {
       try {
-        await fetch("/auth/refresh", {
+        await fetch(`${API}/auth/refresh`, {
           method: "POST",
           credentials: "include",
         });
@@ -333,7 +379,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 }
 ```
 
-For Next.js, set up a rewrite so API calls go through the same domain:
+For Next.js, you can alternatively set up rewrites in next.config.js so API calls go through the same domain (recommended for production):
 
 ```js
 // next.config.js
@@ -342,16 +388,18 @@ module.exports = {
     return [
       {
         source: "/api/:path*",
-        destination: "http://your-server/:path*",
+        destination: "http://192.168.122.101/:path*",
       },
       {
         source: "/auth/:path*",
-        destination: "http://your-server/auth/:path*",
+        destination: "http://192.168.122.101/auth/:path*",
       },
     ];
   },
 };
 ```
+
+This way, frontend calls to `/auth/login` are automatically proxied to your VM backend.
 
 ---
 
@@ -367,11 +415,22 @@ The backend sets an `HttpOnly` cookie. This means:
 
 ### CORS Configuration
 
-If your frontend is on a different domain (e.g., `https://app.example.com` → `https://api.example.com`), you need:
+Since your frontend is on a **different domain** (your frontend machine) than the backend (VM), you need to configure CORS on the backend.
 
-1. **Backend** must have your frontend URL in `CORS_ORIGINS` in `.env`
+1. **Backend** must have your frontend URL in `CORS_ORIGINS` in `apps/backend/.env`
 2. **Frontend** must set `credentials: "include"` (fetch) or `withCredentials: true` (axios)
 3. **Frontend** must NOT use `*` in allowed origins — must be exact URL
+
+Update your backend `.env`:
+
+```bash
+# In apps/backend/.env - add your frontend URL
+CORS_ORIGINS=["http://localhost:5173","http://localhost:3000","http://your-frontend-machine-ip:5173"]
+```
+
+Then restart the backend container.
+
+**For production**, it's recommended to use nginx as a reverse proxy on the VM and serve both frontend and backend from the same domain, avoiding CORS issues entirely.
 
 ### Same-site deployment (recommended)
 
@@ -437,7 +496,7 @@ The backend supports an `X-Correlation-ID` header for request tracing. If you wa
 ```javascript
 const correlationId = `req-${crypto.randomUUID().slice(0, 12)}`;
 
-fetch("/api/me", {
+fetch("http://192.168.122.101/api/me", {
   headers: {
     "X-Correlation-ID": correlationId,
   },
@@ -452,12 +511,14 @@ The backend returns this same ID in the `X-Correlation-ID` response header.
 ## Complete Frontend Flow
 
 ```
+API_BASE = http://192.168.122.101
+
 1. User visits app
-   → Check session: GET /api/me (credentials: "include")
+   → Check session: GET http://192.168.122.101/api/me (credentials: "include")
    → 401? Show login page
 
 2. User logs in
-   → POST /auth/login?username=X&password=Y (credentials: "include")
+   → POST http://192.168.122.101/auth/login?username=X&password=Y (credentials: "include")
    → 200? Store user info, redirect to dashboard
    → 401? Show "wrong credentials" error
    → 429? Show "too many attempts" error
@@ -467,10 +528,10 @@ The backend returns this same ID in the `X-Correlation-ID` response header.
    → Cookie sent automatically by browser
 
 4. Every 4 minutes
-   → POST /auth/refresh (credentials: "include")
+   → POST http://192.168.122.101/auth/refresh (credentials: "include")
    → 401? Redirect to login
 
 5. User clicks logout
-   → POST /auth/logout (credentials: "include")
+   → POST http://192.168.122.101/auth/logout (credentials: "include")
    → Redirect to login page
 ```

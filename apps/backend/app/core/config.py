@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     # Rate limiting - max requests per second per IP
-    RATE_LIMIT_PER_SECOND: int = 10
+    RATE_LIMIT_PER_SECOND: int = 100
 
     @property
     def JWKS_URL(self) -> str:
