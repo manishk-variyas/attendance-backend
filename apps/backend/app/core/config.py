@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     # Rate limiting - max requests per second per IP
     RATE_LIMIT_PER_SECOND: int = 100
 
+    # Redmine integration settings
+    REDMINE_URL: str = "http://redmine:3000" # Internal Docker network address
+    REDMINE_API_KEY: str = "b0c80f3462ddd722de39456e068441d0e057b37b"
+
     @property
     def JWKS_URL(self) -> str:
         """URL to fetch Keycloak's JSON Web Key Set (public keys for verifying JWTs)."""

@@ -1,115 +1,18 @@
 # Infrastructure Docker Compose Configuration
 #
-# This file orchestrates all services needed for the backend application:
-# - keycloak-db: PostgreSQL database for Keycloak user data
-# - keycloak: Identity and access management server
-# - redis: In-memory store for user sessions
-# - backend: The FastAPI backend application
-# - nginx: Reverse proxy (public entry point on port 80)
+# This file orchestrates all services by including their individual configurations.
+# This modular approach makes it easier to manage and test services independently.
 #
-# All services communicate on the internal 'infra-network' Docker network.
-# Only nginx (port 80) and selective service ports (127.0.0.1 only) are exposed to the host.
+# Services included:
+# - Keycloak (Identity & Access Management)
+# - Redis (Session Storage)
+# - Backend (FastAPI application)
+# - Nginx (Reverse Proxy)
+# - Redmine (Project Management)
 
-services:
-  # PostgreSQL database for Keycloak
-  # Stores users, roles, clients, and other Keycloak configuration
-  keycloak-db:
-    image: postgres:16
-    restart: always
-    volumes:
-      # Persist database data across container restarts
-      - keycloak_db_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: keycloak
-    networks:
-      - infra-network
-
-  # Keycloak identity and access management server
-  # Handles user authentication, token issuance, and SSO
-  keycloak:
-    build:
-      context: ./keycloak
-      dockerfile: Dockerfile
-    restart: always
-    command: start-dev
-    environment:
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      KC_HEALTH_ENABLED: "true"
-      KC_METRICS_ENABLED: "true"
-      JAVA_OPTS_APPEND: "-Xms256m -Xmx512m"
-    # Only expose to localhost (not public) - use nginx for public access
-    ports:
-      - "127.0.0.1:8080:8080"
-    depends_on:
-      - keycloak-db
-    networks:
-      - infra-network
-
-  # Redis in-memory data store
-  # Used for storing user sessions (server-side)
-  redis:
-    build:
-      context: ./redis
-      dockerfile: Dockerfile
-    restart: always
-    ports:
-      # Only expose to localhost
-      - "127.0.0.1:6379:6379"
-    volumes:
-      # Persist Redis data
-      - redis_data:/data
-    networks:
-      - infra-network
-
-  # FastAPI backend application
-  # Acts as a BFF (Backend-for-Frontend) with session-based auth
-  backend:
-    build:
-      context: ../apps/backend
-      dockerfile: Dockerfile
-    restart: always
-    env_file:
-      - ./backend/.env
-    environment:
-      BACKEND_URL: http://backend:8000
-    volumes:
-      # Mount logs directory for persistent logging
-      - ../apps/backend/logs:/app/logs
-    depends_on:
-      - keycloak-db
-      - redis
-      - keycloak
-    networks:
-      - infra-network
-
-  # Nginx reverse proxy
-  # Public entry point - forwards requests to backend
-  # Only this service exposes a port to the outside world
-  nginx:
-    build:
-      context: ./nginx
-      dockerfile: Dockerfile
-    restart: always
-    ports:
-      - "80:80"
-    depends_on:
-      - backend
-    networks:
-      - infra-network
-
-# Persistent volumes for data storage
-volumes:
-  keycloak_db_data:
-  redis_data:
-
-# Internal Docker network for service-to-service communication
-networks:
-  infra-network:
-    driver: bridge
+include:
+  - keycloak/docker-compose.yml
+  - redis/docker-compose.yml
+  - backend/docker-compose.yml
+  - nginx/docker-compose.yml
+  - redmine/docker-compose.yml

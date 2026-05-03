@@ -12,6 +12,7 @@ The app acts as a Backend-for-Frontend (BFF) that sits between
 the frontend and Keycloak, using server-side sessions stored in Redis.
 """
 import logging
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ from app.middleware.correlation import set_correlation_id
 from app.middleware.logging import log_requests
 from app.auth.routes import router as auth_router
 from app.auth.dependencies import get_current_user
+from app.redmine.routes import router as redmine_router
 
 
 setup_logging()
@@ -79,6 +81,17 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/server-time")
+def get_server_time():
+    """Returns the current server time in UTC."""
+    now = datetime.now(timezone.utc)
+    return {
+        "server_time": now.isoformat(),
+        "timestamp": int(now.timestamp()),
+        "timezone": "UTC"
+    }
+
+
 @app.get("/api/me")
 def get_me(current_user: dict = Depends(get_current_user)):
     """Return current logged-in user's info - requires valid session cookie."""
@@ -87,3 +100,6 @@ def get_me(current_user: dict = Depends(get_current_user)):
 
 # Register authentication routes (login, logout, refresh, backchannel-logout)
 app.include_router(auth_router)
+
+# Register Redmine integration routes
+app.include_router(redmine_router, prefix="/api", tags=["redmine"])

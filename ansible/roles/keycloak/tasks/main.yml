@@ -1,0 +1,174 @@
+# Keycloak Main Tasks
+#
+# This includes:
+# 1. Login to Keycloak admin
+# 2. Create realm
+# 3. Create backend-client with ROPC and backchannel logout
+# 4. Disable Verify Profile (required for ROPC)
+# 5. Enable login events
+# 6. Enable service accounts
+# 7. Assign realm-admin role to service account
+# 8. Create users (if user_username provided)
+
+---
+- name: Login to Keycloak Admin CLI
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh config credentials
+      --server {{ keycloak_url }}
+      --realm master
+      --user {{ keycloak_admin_user }}
+      --password {{ keycloak_admin_password }}
+  register: kc_login
+  changed_when: false
+  failed_when: false
+
+- name: Create {{ keycloak_realm }} realm
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh create realms
+      -s realm={{ keycloak_realm }} -s enabled=true
+  register: realm_creation
+  changed_when: false
+  failed_when: false
+
+- name: Create backend-client with ROPC and backchannel logout
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh create clients -r {{ keycloak_realm }}
+      -s clientId={{ keycloak_client_id }}
+      -s enabled=true
+      -s publicClient=false
+      -s secret={{ keycloak_client_secret }}
+      -s directAccessGrantsEnabled=true
+      -s "redirectUris=[\"*\"]"
+      -s "webOrigins=[\"*\"]"
+      -s "backchannelLogoutUrl={{ backend_url }}/auth/backchannel-logout"
+      -s backchannelLogoutSessionRequired=true
+      -s backchannelLogoutRevokeOfflineSessions=true
+  register: client_creation
+  changed_when: false
+  failed_when: false
+
+- name: Disable Verify Profile required action (required for ROPC)
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh update
+      authentication/required-actions/VERIFY_PROFILE
+      -r {{ keycloak_realm }}
+      -s enabled=false
+  register: verify_profile
+  changed_when: false
+  failed_when: false
+
+- name: Enable login events
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh update events/config
+      -r {{ keycloak_realm }}
+      -s eventsEnabled=true
+      -s "eventsListeners=[\"jboss-logging\"]"
+  register: events_config
+  changed_when: false
+  failed_when: false
+
+- name: Enable login events storage
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh update events
+      -r {{ keycloak_realm }}
+      -s enabled=true
+      -s storageEnabled=true
+  register: events_storage
+  changed_when: false
+  failed_when: false
+
+- name: Enable service accounts on backend-client
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh update clients/{{ keycloak_client_id }}
+      -r {{ keycloak_realm }}
+      -s serviceAccountsEnabled=true
+  register: service_accounts
+  changed_when: false
+  failed_when: false
+
+- name: Get service account user ID
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh get clients/{{ keycloak_client_id }}/service-account-user
+      -r {{ keycloak_realm }}
+  register: service_account_output
+  changed_when: false
+  failed_when: false
+
+- name: Set service account UID fact
+  set_fact:
+    service_account_uid: "{{ (service_account_output.stdout | from_json).id }}"
+  when: service_account_output.stdout is defined and service_account_output.stdout | from_json | length > 0
+
+- name: Get realm-admin role ID
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh get roles/realm-admin
+      -r {{ keycloak_realm }}
+  register: realm_admin_role
+  changed_when: false
+  failed_when: false
+
+- name: Set realm-admin role ID fact
+  set_fact:
+    realm_admin_role_id: "{{ (realm_admin_role.stdout | from_json | first).id }}"
+  when: realm_admin_role.stdout is defined and realm_admin_role.stdout | from_json | length > 0
+
+- name: Assign realm-admin role to service account
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh add-roles
+      -r {{ keycloak_realm }}
+      --uid {{ service_account_uid }}
+      --cclientid realm-management
+      --roleid {{ realm_admin_role_id }}
+  when:
+    - service_account_uid is defined
+    - realm_admin_role_id is defined
+  register: role_assignment
+  changed_when: false
+  failed_when: false
+
+- name: Create user in Keycloak
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh create users -r {{ keycloak_realm }}
+      -s username={{ user_username }}
+      -s enabled=true
+  when: user_username is defined
+  register: user_create
+  changed_when: false
+  failed_when: false
+
+- name: Set user password
+  community.docker.docker_exec:
+    container: "{{ keycloak_container }}"
+    cmd: >-
+      /opt/keycloak/bin/kcadm.sh set-password -r {{ keycloak_realm }}
+      --username {{ user_username }}
+      --new-password {{ user_password }}
+      --temporary=false
+  when:
+    - user_username is defined
+    - user_password is defined
+  register: password_set
+  changed_when: false
+  failed_when: false

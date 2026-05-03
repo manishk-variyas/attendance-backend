@@ -1,0 +1,47 @@
+# Redmine Docker Compose Configuration
+#
+# This file defines the Redmine service and its database.
+# It can be used standalone or included in the main infra/docker-compose.yml.
+
+services:
+  redmine-db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: ${REDMINE_DB}
+      POSTGRES_USER: ${REDMINE_DB_USER}
+      POSTGRES_PASSWORD: ${REDMINE_DB_PASSWORD}
+    volumes:
+      - redmine_db_data:/var/lib/postgresql/data
+    networks:
+      - infra-network
+
+  redmine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env
+    environment:
+      REDMINE_DB_POSTGRES: redmine-db
+      REDMINE_DB_USERNAME: ${REDMINE_DB_USER}
+      REDMINE_DB_PASSWORD: ${REDMINE_DB_PASSWORD}
+      REDMINE_DB_DATABASE: ${REDMINE_DB}
+      REDMINE_SECRET_KEY_BASE: ${REDMINE_SECRET_KEY_BASE}
+    volumes:
+      - redmine_data:/usr/src/redmine/files
+    depends_on:
+      - redmine-db
+    networks:
+      - infra-network
+
+volumes:
+  redmine_db_data:
+  redmine_data:
+
+networks:
+  infra-network:
+    driver: bridge

@@ -41,7 +41,7 @@ services:
     env_file:
       # Load from infra/keycloak/.env
       - .env
-environment:
+    environment:
       KC_DB: postgres
       KC_HOSTNAME_URL: http://localhost:8080
       KC_HOSTNAME_STRICT: "false"
