@@ -1,4 +1,4 @@
-from app.services.session import (
+from app.features.auth.services.session import (
     create_session,
     get_session,
     delete_session,
@@ -7,7 +7,7 @@ from app.services.session import (
     close_redis,
     get_redis,
 )
-from app.services.keycloak import (
+from app.features.auth.services.keycloak import (
     refresh_keycloak_token,
     revoke_keycloak_token,
     get_jwks,

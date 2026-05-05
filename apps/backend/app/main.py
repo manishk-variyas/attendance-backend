@@ -25,9 +25,9 @@ from app.core.logging import setup_logging
 from app.core.limiter import limiter
 from app.middleware.correlation import set_correlation_id
 from app.middleware.logging import log_requests
-from app.auth.routes import router as auth_router
-from app.auth.dependencies import get_current_user
-from app.redmine.routes import router as redmine_router
+from app.features.auth.routes import router as auth_router
+from app.features.auth.dependencies import get_current_user
+from app.features.redmine.routes import router as redmine_router
 
 
 setup_logging()

@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.database import init_db
-from app.services.session import close_redis
+from app.features.auth.services.session import close_redis
 
 logger = logging.getLogger(__name__)
 

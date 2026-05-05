@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse
 from .service import redmine_service
-from app.auth.dependencies import get_current_user # Assuming this exists for Bearer token
+from app.features.auth.dependencies import get_current_user # Assuming this exists for Bearer token
 
 router = APIRouter()
 
@@ -46,3 +46,38 @@ async def get_user_issues_by_email(email: str):
 @router.get("/user-issues/id/{user_id}", response_model=List[IssueResponse])
 async def get_user_issues_by_id(user_id: int):
     return await redmine_service.get_issues_for_user(user_id)
+
+@router.get("/my-projects", response_model=List[ProjectResponse])
+async def get_my_projects(current_user: dict = Depends(get_current_user)):
+    """Get projects for the currently logged-in user, auto-creating them in Redmine if missing."""
+    email = current_user.get("email")
+    username = current_user.get("username")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found in session")
+        
+    user = await redmine_service.get_user_by_email(email)
+    if not user:
+        # Auto-sync: Create user in Redmine if they exist in Keycloak but not Redmine
+        user = await redmine_service.create_user(username, email)
+        if not user:
+            raise HTTPException(status_code=500, detail="Failed to sync user with Redmine")
+            
+    return await redmine_service.get_projects_for_user(user["id"])
+
+@router.get("/my-issues", response_model=List[IssueResponse])
+async def get_my_issues(current_user: dict = Depends(get_current_user)):
+    """Get issues for the currently logged-in user, auto-creating them in Redmine if missing."""
+    email = current_user.get("email")
+    username = current_user.get("username")
+    
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found in session")
+        
+    user = await redmine_service.get_user_by_email(email)
+    if not user:
+        user = await redmine_service.create_user(username, email)
+        if not user:
+            raise HTTPException(status_code=500, detail="Failed to sync user with Redmine")
+            
+    return await redmine_service.get_issues_for_user(user["id"])

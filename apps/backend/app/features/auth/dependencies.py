@@ -16,7 +16,7 @@ Usage:
         return current_user
 """
 from fastapi import Request, HTTPException
-from app.services.session import get_session
+from app.features.auth.services.session import get_session
 
 
 async def get_current_user(request: Request) -> dict:

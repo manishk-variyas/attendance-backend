@@ -101,7 +101,7 @@ async def get_jwks() -> dict:
     Returns:
         dict: The JWKS containing public keys
     """
-    from app.services.session import get_redis
+    from .session import get_redis
 
     r = await get_redis()
     cached = await r.get("jwks:keys")

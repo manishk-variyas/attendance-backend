@@ -18,17 +18,18 @@ How it works:
 import json
 import logging
 
-from fastapi import APIRouter, Request, HTTPException, Depends, Form
+from fastapi import APIRouter, Request, HTTPException, Depends, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.services.session import create_session, get_session, delete_session, get_redis
-from app.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
-from app.auth.dependencies import get_current_user
+from app.features.auth.services.session import create_session, get_session, delete_session, get_redis
+from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
+from app.features.auth.dependencies import get_current_user
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
-from app.schemas.auth import SignupRequest, SignupResponse
+from app.features.auth.schemas import SignupRequest, SignupResponse
+from app.features.redmine.service import redmine_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -277,8 +278,11 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
 
 @router.post("/signup")
 @limiter.limit("5/minute")
-async def signup(request: Request, signup_data: SignupRequest):
-    """Signup endpoint - create a new user in Keycloak."""
+async def signup(request: Request, signup_data: SignupRequest, background_tasks: BackgroundTasks):
+    """
+    Signup endpoint - create a new user in Keycloak.
+    Syncs to Redmine in the background to keep the response fast.
+    """
     correlation_id = request.state.correlation_id
     client_ip = request.client.host if request.client else "-"
 
@@ -293,6 +297,14 @@ async def signup(request: Request, signup_data: SignupRequest):
             f"User {signup_data.username} created",
             severity="info",
             extra={"username": signup_data.username, "client_ip": client_ip},
+        )
+
+        # BEST PRACTICE: Sync to Redmine in the background
+        # This keeps the signup request fast and responsive
+        background_tasks.add_task(
+            redmine_service.create_user, 
+            signup_data.username, 
+            signup_data.email
         )
 
         return SignupResponse(

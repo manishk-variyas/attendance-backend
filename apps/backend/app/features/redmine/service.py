@@ -2,6 +2,7 @@ import httpx
 from typing import List, Optional
 from app.core.config import settings
 from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse
+import secrets
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,42 @@ class RedmineService:
             response = await client.get(f"{self.url}/custom_fields.json", headers=self.headers)
             response.raise_for_status()
             return response.json().get("custom_fields", [])
+
+    async def create_user(self, username: str, email: str, firstname: str = "User", lastname: str = "Backend"):
+        """
+        Creates a user in Redmine. If the user already exists, returns the existing user.
+        """
+        # 1. Check for existing user (Idempotency)
+        existing_user = await self.get_user_by_email(email)
+        if existing_user:
+            logger.info(f"User {email} already exists in Redmine. Sync skipped.")
+            return existing_user
+
+        # 2. Create in Redmine
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "user": {
+                    "login": username,
+                    "mail": email,
+                    "firstname": firstname,
+                    "lastname": lastname,
+                    "password": secrets.token_urlsafe(16)
+                }
+            }
+            try:
+                response = await client.post(f"{self.url}/users.json", json=payload, headers=self.headers)
+                if response.status_code == 201:
+                    logger.info(f"Successfully synced user {email} to Redmine.")
+                    return response.json().get("user")
+                elif response.status_code == 422:
+                    logger.warning(f"Redmine user creation failed (duplicate?): {response.text}")
+                    return await self.get_user_by_email(email)
+                response.raise_for_status()
+            except Exception as e:
+                logger.error(f"Failed to sync user to Redmine: {e}")
+                # We don't raise here if called from background task, but we might want to 
+                # if called synchronously.
+                raise
 
     async def get_user_by_email(self, email: str):
         async with httpx.AsyncClient() as client:
@@ -51,7 +88,7 @@ class RedmineService:
                     customerName=p["name"], # mapping name to customerName for now
                     customerOfficeLocation=custom_values.get("Customer Office Location", ""),
                     projectType=custom_values.get("Project Type", ""),
-                    status="active" # placeholder
+                    status="active" if p.get("status") == 1 else "closed" if p.get("status") == 5 else "archived"
                 ))
             return projects
 
