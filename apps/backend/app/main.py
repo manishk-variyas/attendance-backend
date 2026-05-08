@@ -103,3 +103,8 @@ app.include_router(auth_router)
 
 # Register Redmine integration routes
 app.include_router(redmine_router, prefix="/api", tags=["redmine"])
+
+# Register Recording routes
+from app.routes.recordings import router as recordings_router
+app.include_router(recordings_router, prefix="/api", tags=["recordings"])
+

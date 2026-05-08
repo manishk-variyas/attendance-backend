@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://redis:6379"  # Redis for session storage
 
     # CORS - list of allowed frontend origins
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000", "http://95.216.39.97:8086"]
 
     # Rate limiting - max requests per second per IP
     RATE_LIMIT_PER_SECOND: int = 100
@@ -54,6 +54,19 @@ class Settings(BaseSettings):
     # Redmine integration settings
     REDMINE_URL: str = "http://redmine:3000" # Internal Docker network address
     REDMINE_API_KEY: str = "b0c80f3462ddd722de39456e068441d0e057b37b"
+    
+    # MinIO / S3 Settings
+    MINIO_URL: str = "http://minio:9000"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin"
+    MINIO_BUCKET_NAME: str = "recordings"
+    MINIO_REGION: str = "us-east-1"
+
+    # MongoDB Settings
+    MONGO_URL: str = "mongodb://admin:adminpassword@mongodb:27017"
+    MONGO_DB_NAME: str = "attendance_db"
+
+
 
     @property
     def JWKS_URL(self) -> str:

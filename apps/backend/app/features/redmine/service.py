@@ -184,4 +184,17 @@ class RedmineService:
                 ))
             return issues
 
+    async def get_issue_by_id(self, issue_id: int) -> Optional[dict]:
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(f"{self.url}/issues/{issue_id}.json", headers=self.headers)
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                return response.json().get("issue")
+            except Exception as e:
+                logger.error(f"Error fetching issue {issue_id} from Redmine: {e}")
+                return None
+
 redmine_service = RedmineService()
+

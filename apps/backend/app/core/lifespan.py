@@ -18,7 +18,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.database import init_db
+from app.core.mongodb import connect_to_mongo, close_mongo_connection
 from app.features.auth.services.session import close_redis
+
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Backend API...")
     # Startup: Initialize database tables
     init_db()
+    await connect_to_mongo()
     
     # Hand over control to the app - it's now ready to handle requests
     yield
@@ -43,3 +46,5 @@ async def lifespan(app: FastAPI):
     # Shutdown: Clean up resources
     logger.info("Shutting down Backend API...")
     await close_redis()
+    await close_mongo_connection()
+

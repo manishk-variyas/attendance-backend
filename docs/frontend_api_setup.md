@@ -328,7 +328,150 @@ GET http://192.168.122.101/health
 
 ---
 
+## Audio & Recording APIs
+
+---
+
+## Redmine Ticket Discovery
+
+Before uploading a recording, the frontend should fetch the list of active tickets (issues) assigned to the logged-in user to allow them to select the correct `ticketId`.
+
+### 5. Get My Issues
+
+Returns a list of Redmine issues assigned to the authenticated user.
+
+**Request**
+
+```
+GET http://192.168.122.101/api/my-issues
+```
+
+**Response — 200 OK**
+
+```json
+[
+  {
+    "id": 123,
+    "subject": "Implement Login Flow",
+    "project_name": "Attendance App",
+    "status": "In Progress",
+    "priority": "High"
+  },
+  {
+    "id": 124,
+    "subject": "Bug: Audio not saving",
+    "project_name": "Attendance App",
+    "status": "New",
+    "priority": "Immediate"
+  }
+]
+```
+
+---
+
+### 6. Upload Recording
+
+
+Uploads a new audio recording with metadata.
+
+**Request**
+
+```
+POST http://192.168.122.101/api/upload
+Content-Type: multipart/form-data
+```
+
+| Parameter | Type | Location | Required | Description |
+|-----------|------|----------|----------|-------------|
+| `audio` | File | Form | Yes | Audio file. **Allowed types:** `.mp3`, `.wav`, `.ogg`, `.webm`, `.m4a`. |
+| `email` | string | Form | Yes | User's email |
+| `ticketId` | string | Form | Yes | Related Redmine ticket ID. Used to fetch project, priority, and status. |
+
+
+
+**Response — 200 OK**
+
+
+```json
+{
+  "id": "69fd77aedaaa03774af22719",
+  "email": "test@gmail.com",
+  "ticket_id": "123",
+  "project": "DevOps",
+  "priority": "HIGH",
+  "status": "open",
+  "filename": "audio.mp3",
+  "recording_url": "http://192.168.122.101/api/recordings/...",
+  "is_played": false,
+  "created_at": "2026-05-08T05:42:06.280Z"
+}
+```
+
+### 7. Get My Recordings
+
+Retrieves all recordings for a specific user.
+
+**Request**
+
+```
+GET http://192.168.122.101/api/my-recordings/{email}
+```
+
+**Response — 200 OK**
+
+```json
+[
+  {
+    "id": "69fd77aedaaa03774af22719",
+    "email": "test@gmail.com",
+    "filename": "audio.mp3",
+    "recording_url": "...",
+    "is_played": false,
+    "created_at": "2026-05-08T05:42:06.280Z"
+  }
+]
+```
+
+### 8. Mark Recording as Played
+
+Marks a specific recording as played.
+
+**Request**
+
+```
+POST http://192.168.122.101/api/mark-played
+Content-Type: application/json
+```
+
+```json
+{
+  "email": "test@gmail.com",
+  "recordingUrl": "http://192.168.122.101/api/recordings/..."
+}
+```
+
+### 9. Delete Recording
+
+Deletes a recording from storage and database.
+
+**Request**
+
+```
+DELETE http://192.168.122.101/api/delete-recording
+Content-Type: application/json
+```
+
+```json
+{
+  "email": "test@gmail.com",
+  "recordingUrl": "http://192.168.122.101/api/recordings/..."
+}
+```
+
+---
+
 ## How to Use in Different Frontends
+
 
 ### Vanilla JavaScript / Fetch
 
