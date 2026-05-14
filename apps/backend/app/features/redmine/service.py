@@ -69,6 +69,24 @@ class RedmineService:
                     return user
             return None
 
+    async def get_all_users(self) -> list:
+        """Fetch all active users from Redmine — lightweight list for dropdowns."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.url}/users.json?limit=100&status=1",
+                headers=self.headers
+            )
+            response.raise_for_status()
+            users = response.json().get("users", [])
+            return [
+                {
+                    "id": u["id"],
+                    "name": f"{u['firstname']} {u['lastname']}".strip(),
+                    "email": u.get("mail", ""),
+                }
+                for u in users
+            ]
+
     async def get_projects_for_user(self, user_id: int) -> List[ProjectResponse]:
         async with httpx.AsyncClient() as client:
             # We need to get projects where user is a member

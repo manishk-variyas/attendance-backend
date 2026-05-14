@@ -105,6 +105,24 @@ app.include_router(auth_router)
 app.include_router(redmine_router, prefix="/api", tags=["redmine"])
 
 # Register Recording routes
-from app.routes.recordings import router as recordings_router
+from app.features.recordings.routes import router as recordings_router
 app.include_router(recordings_router, prefix="/api", tags=["recordings"])
+
+# Register Leave Management routes
+from app.features.leaves.routes import router as leaves_router
+app.include_router(leaves_router, prefix="/api", tags=["leaves"])
+
+# Register Location Tracking routes
+from app.features.location.routes import router as location_router
+app.include_router(location_router, prefix="/api/location", tags=["location"])
+
+# Register Shift Management routes
+from app.features.shifts.routes import router as shifts_router
+app.include_router(shifts_router, prefix="/api", tags=["shifts"])
+
+# Register Advanced Admin Dashboard (Integrated UI)
+from app.features.admin.routes import router as admin_router
+from fastapi.staticfiles import StaticFiles
+app.include_router(admin_router)
+app.mount("/admin-static", StaticFiles(directory="app/features/admin/static"), name="admin-static")
 

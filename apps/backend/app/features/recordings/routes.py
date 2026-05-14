@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status as fastapi_status
-
 from typing import List, Optional
 import uuid
 import os
 from datetime import datetime, timezone
 
 from app.core.mongodb import get_mongodb
-from app.schemas.recording import RecordingResponse, MarkPlayedRequest, DeleteRecordingRequest
+from app.features.recordings.schemas.recording import RecordingResponse, MarkPlayedRequest, DeleteRecordingRequest
 from app.utils.storage import storage_service
 from app.features.redmine.service import redmine_service
+from app.features.auth.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -31,8 +31,16 @@ async def upload_recording(
     priority: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
     audio: UploadFile = File(...),
-    db = Depends(get_mongodb)
+    db = Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user)
 ):
+    # Security: Only allow users to upload for their own email or if admin
+    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+         raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="You can only upload recordings for your own account."
+        )
+
     # Validate MIME type
     if audio.content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(
@@ -64,8 +72,6 @@ async def upload_recording(
              raise HTTPException(status_code=fastapi_status.HTTP_400_BAD_REQUEST, detail="Invalid Ticket ID format. Must be numeric.")
 
     # Create a unique filename
-
-
     ext = os.path.splitext(audio.filename)[1] or ".mp3"
     unique_filename = f"{uuid.uuid4()}{ext}"
     object_name = f"{email}/{unique_filename}"
@@ -102,7 +108,18 @@ async def upload_recording(
     return recording_data
 
 @router.get("/my-recordings/{email}", response_model=List[RecordingResponse])
-async def get_user_recordings(email: str, db = Depends(get_mongodb)):
+async def get_user_recordings(
+    email: str, 
+    db = Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user)
+):
+    # Security: Only allow users to view their own recordings or if admin
+    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+         raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own recordings."
+        )
+
     cursor = db.recordings.find({"email": email})
     recordings = []
     async for doc in cursor:
@@ -111,7 +128,17 @@ async def get_user_recordings(email: str, db = Depends(get_mongodb)):
     return recordings
 
 @router.get("/all-recordings", response_model=List[RecordingResponse])
-async def get_all_recordings(db = Depends(get_mongodb)):
+async def get_all_recordings(
+    db = Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user)
+):
+    # Security: Only admins can see all recordings
+    if "admin" not in current_user.get("roles", []):
+         raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="Admin access required."
+        )
+
     cursor = db.recordings.find({})
     recordings = []
     async for doc in cursor:
@@ -120,7 +147,18 @@ async def get_all_recordings(db = Depends(get_mongodb)):
     return recordings
 
 @router.post("/mark-played")
-async def mark_played(payload: MarkPlayedRequest, db = Depends(get_mongodb)):
+async def mark_played(
+    payload: MarkPlayedRequest, 
+    db = Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user)
+):
+    # Security: Ensure user is marking their own recording or is admin
+    if current_user["email"] != payload.email and "admin" not in current_user.get("roles", []):
+         raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="You can only modify your own recordings."
+        )
+
     result = await db.recordings.update_one(
         {"email": payload.email, "recording_url": payload.recordingUrl},
         {"$set": {"is_played": True}}
@@ -132,7 +170,18 @@ async def mark_played(payload: MarkPlayedRequest, db = Depends(get_mongodb)):
     return {"message": "Recording marked as played"}
 
 @router.delete("/delete-recording")
-async def delete_recording(payload: DeleteRecordingRequest, db = Depends(get_mongodb)):
+async def delete_recording(
+    payload: DeleteRecordingRequest, 
+    db = Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user)
+):
+    # Security: Ensure user is deleting their own recording or is admin
+    if current_user["email"] != payload.email and "admin" not in current_user.get("roles", []):
+         raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own recordings."
+        )
+
     recording = await db.recordings.find_one({
         "email": payload.email,
         "recording_url": payload.recordingUrl

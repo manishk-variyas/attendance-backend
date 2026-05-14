@@ -14,7 +14,7 @@ This backend stores sessions in Redis, not PostgreSQL.
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from app.core.config import settings
-from app.models.base import Base
+from app.core.models import Base
 
 
 # Create the database engine with connection pooling

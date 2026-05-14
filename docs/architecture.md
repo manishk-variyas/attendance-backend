@@ -14,6 +14,8 @@ graph TD
         Backend -- "ROPC / Token refresh / Logout" --> Keycloak[Keycloak Auth]
         Backend -. "Backchannel logout callback" .-> Backend
         Keycloak -- "User/Token data" --> Postgres[(Postgres DB)]
+        Backend -- "Audio / Attachments" --> MinIO[MinIO Storage]
+        Backend -- "Metadata / Logs" --> Mongo[(MongoDB)]
     end
 
     style Nginx fill:#f9f,stroke:#333,stroke-width:2px
@@ -22,6 +24,8 @@ graph TD
     style Keycloak fill:#fdd,stroke:#333,stroke-width:2px
     style Redis fill:#ffd,stroke:#333,stroke-width:2px
     style Postgres fill:#ffd,stroke:#333,stroke-width:2px
+    style MinIO fill:#f96,stroke:#333,stroke-width:2px
+    style Mongo fill:#6f6,stroke:#333,stroke-width:2px
 ```
 
 ## 2. Authentication Flow (Step-by-Step)
@@ -94,6 +98,7 @@ sequenceDiagram
 *   **JWTs never reach browser**: Stored server-side in Redis; browser only sees random session ID
 *   **Session rotation**: Each refresh creates new session ID, preventing session fixation
 *   **Backchannel logout**: Keycloak can invalidate backend sessions when admin disables a user
+*   **Data Isolation**: PostgreSQL, MongoDB, and MinIO are all locked within the internal network.
 
 ## 4. Folder Structure
 
@@ -176,6 +181,9 @@ infra/                              # Infrastructure (Docker)
 | Add a new ORM model | `models/` (new file + add to `__init__.py`) |
 | Add a new Pydantic schema | `schemas/` (new file + add to `__init__.py`) |
 | Add a new external API client | `services/` (new file) |
+| Change MinIO/Storage logic | `utils/storage.py` |
+| Change MongoDB logic | `core/mongodb.py` |
 | Add a new auth endpoint | `auth/routes.py` |
+
 | Add a new protected dependency | `auth/dependencies.py` |
 | Add a utility/helper | `utils/` (new file) |

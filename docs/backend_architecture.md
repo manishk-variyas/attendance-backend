@@ -19,37 +19,37 @@ The backend implements a **Backend-for-Frontend (BFF)** pattern with server-side
                                              │ HTTP Requests
                                              │ (Port 80)
                                              ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              VPS / VM                                     │
-│  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │                                                              │   │
-│  │    ┌─────────────┐                                            │   │
-│  │    │   Nginx     │ ◄──── Public Entry Point (Port 80)        │   │
-│  │    │ Reverse     │                                            │   │
-│  │    │   Proxy    │                                            │   │
-│  │    └──────┬──────┘                                            │   │
-│  │           │                                                   │   │
-│  │           │ Proxy All Requests                                │   │
-│  │           ▼                                                   │   │
-│  │    ┌─────────────┐                                            │   │
-│  │    │   FastAPI   │ ◄──── BFF Backend (Port 8000)              │   │
-│  │    │   Backend  │         (Internal Only)                     │   │
-│  │    └──────┬──────┘                                            │   │
-│  │           │                                                   │   │
-│  │    ┌──────┴──────┬────────────────┬──────────────────┐      │   │
-│  │    │             │                │                  │      │   │
-│  │    ▼             ▼                ▼                  ▼      │   │
-│  │ ┌──────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐   │   │
-│  │ │Redis │  │  Keycloak  │  │  Redmine   │  │  Postgres │   │   │
-│  │ │Cache │  │    (IdP)   │  │    (PM)   │  │   (DB)    │   │   │
-│  │ └──────┘  └────────────┘  └────────────┘  └────────────┘   │   │
-│  │    │           │                │                  │         │   │
-│  └────┼───────────┼────────────────┼──────────────────┼─────────┘   │
-│       │           │                │                  │           │
-│       │      127.0.0.1:8080   127.0.0.1:3000   127.0.0.1:5432    │
-│       │      (localhost only)                                       │
-│       │           │                                                │
-│       └───────────┴────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              VPS / VM                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐       │
+│  │                                                                                  │       │
+│  │    ┌─────────────┐                                                                │       │
+│  │    │   Nginx     │ ◄──── Public Entry Point (Port 80)                            │       │
+│  │    │ Reverse     │                                                                │       │
+│  │    │   Proxy     │                                                                │       │
+│  │    └──────┬──────┘                                                                │       │
+│  │           │                                                                       │       │
+│  │           │ Proxy All Requests                                                    │       │
+│  │           ▼                                                                       │       │
+│  │    ┌─────────────┐                                                                │       │
+│  │    │   FastAPI   │ ◄──── BFF Backend (Port 8000)                                  │       │
+│  │    │   Backend   │         (Internal Only)                                        │       │
+│  │    └──────┬──────┘                                                                │       │
+│  │           │                                                                       │       │
+│  │    ┌──────┴──────┬──────────┬───────────┬───────────┬───────────┬───────────┐      │       │
+│  │    │             │          │           │           │           │           │      │       │
+│  │    ▼             ▼          ▼           ▼           ▼           ▼           ▼      │       │
+│  │ ┌──────┐  ┌────────────┐ ┌────────┐ ┌──────────┐ ┌────────┐ ┌──────────┐ ┌────────┐  │       │
+│  │ │Redis │  │  Keycloak  │ │Redmine │ │Postgres │ │ MinIO  │ │ MongoDB  │ │Redmine │  │       │
+│  │ │Cache │  │    (IdP)   │ │  (PM)  │ │   (DB)   │ │(Object)│ │(Metadata)│ │ (API)  │  │       │
+│  │ └──────┘  └────────────┘ └────────┘ └──────────┘ └────────┘ └──────────┘ └────────┘  │       │
+│  │    │           │            │           │           │           │           │        │       │
+│  └────┼───────────┼────────────┼───────────┼───────────┼───────────┼───────────┼────────┘       │
+│       │           │            │           │           │           │           │                │
+│       │      127.0.0.1:8080    │      127.0.0.1:5432  127.0.0.1:9000 127.0.0.1:27017            │
+│       │      (localhost only)  │                                                                │
+│       │           │            │                                                                │
+│       └───────────┴────────────┴────────────────────────────────────────────────────────────────┘
                                              │
                                              │ No External Access
                                              │ (Internal Services)
@@ -63,14 +63,16 @@ The backend implements a **Backend-for-Frontend (BFF)** pattern with server-side
 
 ### 1.2 Service Ports and Exposure
 
-| Service     | Port  | External Access | Purpose                        |
-|-------------|-------|------------------|--------------------------------|
-| Nginx       | 80    | Yes (Public)     | Reverse proxy, entry point    |
-| Backend     | 8000  | No (Internal)   | FastAPI application           |
-| Keycloak    | 8080  | No (Localhost)  | Identity & Access Management  |
-| Redis       | 6379  | No (Localhost)  | Session cache                |
-| Redmine     | 3000  | No (Localhost)  | Project management           |
-| PostgreSQL  | 5432  | No (Internal)  | Database for Keycloak/Redmine |
+| Service     | Port         | External Access | Purpose                        |
+|-------------|--------------|------------------|--------------------------------|
+| Nginx       | 80           | Yes (Public)     | Reverse proxy, entry point    |
+| Backend     | 8000         | No (Internal)   | FastAPI application           |
+| Keycloak    | 8080         | No (Localhost)  | Identity & Access Management  |
+| Redis       | 6379         | No (Localhost)  | Session cache                |
+| Redmine     | 3000         | No (Localhost)  | Project management           |
+| PostgreSQL  | 5432         | No (Internal)   | Database for Keycloak/Redmine |
+| MinIO       | 9000 / 9001  | No (Localhost)  | Object Storage (S3 API)        |
+| MongoDB     | 27017        | No (Localhost)  | NoSQL Metadata Storage        |
 
 ### 1.3 Technology Stack
 
@@ -81,7 +83,9 @@ The backend implements a **Backend-for-Frontend (BFF)** pattern with server-side
 | Language       | Python 3.12                          |
 | Session Store  | Redis 7.4 (async)                  |
 | Identity Provider | Keycloak 26 (Quarkus)            |
-| Database       | PostgreSQL 16                       |
+| Primary DB     | PostgreSQL 16                       |
+| NoSQL DB       | MongoDB 7.0                         |
+| Object Storage | MinIO                               |
 | Project Management | Redmine 5.1                   |
 | Container      | Docker + Docker Compose            |
 
@@ -205,6 +209,43 @@ sequenceDiagram
     Nginx-->>User: 401 + Clear Cookie
 ```
 
+### 2.5 Audio Recording Management Flow
+
+This flow integrates MinIO for binary storage and MongoDB for metadata persistence.
+
+```mermaid
+sequenceDiagram
+    participant User as Browser
+    participant API as FastAPI Backend
+    participant Redmine as Redmine API
+    participant MinIO as MinIO (S3)
+    participant Mongo as MongoDB
+
+    Note over User, Mongo: AUDIO UPLOAD FLOW
+    
+    User->>API: POST /api/recordings/upload<br/>(Audio File + TicketID)
+    
+    opt If TicketID provided
+        API->>Redmine: GET /issues/{id}.json
+        Redmine-->>API: Issue Details (Project, Status, Priority)
+    end
+    
+    API->>MinIO: PUT /recordings/{email}/{uuid}.mp3
+    MinIO-->>API: 200 OK (URL generated)
+    
+    API->>Mongo: insert_one(recording_metadata)<br/>{url, ticket_id, redmine_data, ...}
+    Mongo-->>API: 201 Created (ID returned)
+    
+    API-->>User: 200 OK (Recording Object)
+
+    Note over User, Mongo: RECORDING RETRIEVAL
+    
+    User->>API: GET /api/recordings/my-recordings/{email}
+    API->>Mongo: find({"email": email})
+    Mongo-->>API: List of Metadata (incl. MinIO URLs)
+    API-->>User: List of Recordings
+```
+
 ---
 
 ## 3. Component Details
@@ -266,6 +307,12 @@ server {
 | GET    | /api/me                    | Current user info                |
 | GET    | /api/redmine/issues       | List Redmine issues              |
 | POST   | /api/redmine/issues       | Create issue                    |
+| POST   | /api/recordings/upload    | Upload audio to MinIO + Mongo   |
+| GET    | /api/recordings/my-recordings/{email} | List recordings for user |
+| POST   | /api/recordings/mark-played | Update playback status        |
+| DELETE | /api/recordings/delete-recording | Delete from MinIO + Mongo |
+| POST   | /api/location             | Save user location to Mongo     |
+| GET    | /api/location/{email}     | Get user location from Mongo    |
 
 **Middleware Stack**:
 1. SlowAPI (Rate Limiting)
@@ -315,6 +362,28 @@ server {
 
 **Synced on Signup**: New users created in Keycloak are asynchronously created in Redmine.
 
+### 3.6 MinIO (Object Storage)
+
+**Purpose**: Secure storage for binary assets (audio recordings, attachments).
+
+**Key Features**:
+- S3-compatible API.
+- Files organized by user email prefixes: `recordings/{email}/{uuid}.ext`.
+- Accessible only via backend-generated URLs or internal proxy.
+
+**Internal Endpoint**: `http://minio:9000`
+
+### 3.7 MongoDB (Metadata Storage)
+
+**Purpose**: Flexible storage for complex metadata and feature-specific data.
+
+**Usage**:
+- **Recordings**: Stores recording metadata, Redmine association details, and playback status.
+- **Leaves**: Manages leave applications and history.
+- **Locations**: Stores real-time or last-known user GPS coordinates.
+
+**Internal Endpoint**: `mongodb://mongodb:27017`
+
 ---
 
 ## 4. Security Architecture
@@ -331,14 +400,15 @@ server {
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      VPS / VM                               │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │ Docker Network (infra-network)                       │ │
-│  │                                                     │ │
-│  │   Exposed: Nginx :80                                 │ │
-│  │   Internal: Backend :8000, Keycloak :8080            │ │
-│  │   Internal: Redis :6379, Redmine :3000              │ │
-│  │   Internal: PostgreSQL :5432                       │ │
-│  └─────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ Docker Network (infra-network)                       │    │
+│  │                                                     │    │
+│  │   Exposed: Nginx :80                                 │    │
+│  │   Internal: Backend :8000                            │    │
+│  │   Internal: Keycloak :8080, Redis :6379              │    │
+│  │   Internal: Postgres :5432, MongoDB :27017           │    │
+│  │   Internal: MinIO :9000, Redmine :3000               │    │
+│  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -348,6 +418,8 @@ server {
 |---------------------|-----------------------------------------------------|
 | No Public IdP       | Keycloak bound to 127.0.0.1:8080                   |
 | No Public Cache     | Redis bound to 127.0.0.1:6379                      |
+| No Public DBs       | MongoDB/Postgres not exposed to external traffic   |
+| No Public Storage   | MinIO console/API restricted to internal/localhost |
 | No JWT in Browser  | Sessions stored server-side, only session_id in cookie |
 | HTTP-Only Cookie   | JavaScript cannot access session cookie             |
 | Session Rotation   | New session ID on every refresh                   |
@@ -513,6 +585,101 @@ curl http://localhost/api/me \
 }
 ```
 
+### 6.3 Recording Endpoints (MinIO + MongoDB)
+
+#### POST /api/recordings/upload
+Uploads an audio file to MinIO and stores metadata in MongoDB.
+
+```bash
+curl -X POST http://localhost/api/recordings/upload \
+  -F "email=john@example.com" \
+  -F "ticketId=12345" \
+  -F "audio=@recording.mp3"
+```
+
+**Flow**:
+1.  Validate file type (audio only).
+2.  (Optional) Fetch issue details from Redmine if `ticketId` provided.
+3.  Upload binary to MinIO: `recordings/{email}/{uuid}.mp3`.
+4.  Store metadata + MinIO URL + Redmine info in MongoDB.
+
+**Response**:
+```json
+{
+  "id": "mongo-object-id",
+  "email": "john@example.com",
+  "ticket_id": "12345",
+  "recording_url": "http://minio:9000/recordings/john@example.com/uuid.mp3",
+  "project": "Project Name",
+  "status": "In Progress",
+  "created_at": "2026-05-11T09:23:00Z"
+}
+```
+
+#### GET /api/recordings/my-recordings/{email}
+Retrieves all recordings metadata for a specific user from MongoDB.
+
+**Response**:
+```json
+[
+  {
+    "id": "...",
+    "filename": "meeting.mp3",
+    "recording_url": "...",
+    "is_played": false
+  }
+]
+```
+
+#### DELETE /api/recordings/delete-recording
+Deletes the binary from MinIO and the metadata from MongoDB.
+
+```bash
+curl -X DELETE http://localhost/api/recordings/delete-recording \
+  -d '{"email": "john@example.com", "recordingUrl": "..."}'
+```
+
+### 6.4 Location Endpoints (MongoDB)
+
+#### POST /api/location
+Updates the user's last known location. Uses `upsert` in MongoDB to maintain one record per email.
+**Protection**: Requires valid session cookie. Users can only update their own location unless they have the `admin` role.
+
+```bash
+curl -X POST http://localhost/api/location \
+  -H "Content-Type: application/json" \
+  -H "Cookie: session_id=..." \
+  -d '{
+    "email": "test@gmail.com",
+    "latitude": 28.6139,
+    "longitude": 77.2090
+  }'
+```
+
+**Response**:
+```json
+{
+  "email": "test@gmail.com",
+  "latitude": 28.6139,
+  "longitude": 77.2090,
+  "updated_at": "2026-05-11T10:56:30Z"
+}
+```
+
+#### GET /api/location/{email}
+Retrieves the location data for a specific user.
+**Protection**: Requires valid session cookie.
+
+**Response**:
+```json
+{
+  "email": "test@gmail.com",
+  "latitude": 28.6139,
+  "longitude": 77.2090,
+  "updated_at": "..."
+}
+```
+
 ---
 
 ## 7. Monitoring and Logging
@@ -624,6 +791,12 @@ backend-monorepo/
 | RATE_LIMIT_PER_SECOND   | 100                                  | Requests per second     |
 | REDMINE_URL             | http://redmine:3000                   | Redmine server           |
 | REDMINE_API_KEY         | ...                                  | Redmine API key        |
+| MINIO_URL               | http://minio:9000                    | MinIO server           |
+| MINIO_ACCESS_KEY        | ...                                  | S3 Access Key          |
+| MINIO_SECRET_KEY        | ...                                  | S3 Secret Key          |
+| MINIO_BUCKET_NAME       | recordings                           | S3 Bucket              |
+| MONGO_URL               | mongodb://mongodb:27017              | MongoDB Connection     |
+| MONGO_DB_NAME           | attendance_db                        | MongoDB Database       |
 
 ### 9.2 Shared (.env)
 
@@ -703,6 +876,8 @@ graph TD
     Backend --> Keycloak[Keycloak :8080]
     Keycloak --> Postgres[(Postgres :5432)]
     Backend --> Redmine[Redmine :3000]
+    Backend --> MinIO[MinIO :9000]
+    Backend --> Mongo[(MongoDB :27017)]
     
     style Nginx fill:#f9f,stroke:#333
     style Backend fill:#bbf,stroke:#333
@@ -711,6 +886,8 @@ graph TD
     style Redis fill:#ffd,stroke:#333
     style Postgres fill:#ffd,stroke:#333
     style Redmine fill:#dfd,stroke:#333
+    style MinIO fill:#f96,stroke:#333
+    style Mongo fill:#6f6,stroke:#333
 ```
 
 ### A.2 Request Flow Diagram

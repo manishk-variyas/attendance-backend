@@ -45,6 +45,9 @@ const API_BASE = "https://api.yourdomain.com"; // or http://api.yourdomain.com
 | Refresh Session | `http://192.168.122.101/auth/refresh` | POST |
 | Logout | `http://192.168.122.101/auth/logout` | POST |
 | Get Current User | `http://192.168.122.101/api/me` | GET |
+| Get My Issues | `http://192.168.122.101/api/my-issues` | GET |
+| Save Location | `http://192.168.122.101/api/location` | POST |
+| Get Location | `http://192.168.122.101/api/location/{email}` | GET |
 
 ### Test Commands
 
@@ -328,7 +331,11 @@ GET http://192.168.122.101/health
 
 ---
 
-## Audio & Recording APIs
+---
+
+## Audio & Recording APIs (Protected)
+
+**Security Note:** All recording endpoints require a valid session cookie. Users can only access recordings associated with their own email unless they have the `admin` role.
 
 ---
 
@@ -761,25 +768,93 @@ The backend returns this same ID in the `X-Correlation-ID` response header.
 ```
 API_BASE = http://192.168.122.101
 
-1. User visits app
-   → Check session: GET http://192.168.122.101/api/me (credentials: "include")
-   → 401? Show login page
+### 🌴 Leave Management API
+The leaves API is used to manage employee leave balances, history, and applications.
 
-2. User logs in
-   → POST http://192.168.122.101/auth/login?username=X&password=Y (credentials: "include")
-   → 200? Store user info, redirect to dashboard
-   → 401? Show "wrong credentials" error
-   → 429? Show "too many attempts" error
+| Endpoint | Method | Description | Requires Auth |
+| :--- | :--- | :--- | :--- |
+| `/api/leaves/stats` | `GET` | Get leave statistics (EL, PL, Unpaid, etc.) | Yes |
+| `/api/leaves/history` | `GET` | Get leave application history | Yes |
+| `/api/leaves/holidays` | `GET` | Get list of public holidays | Yes |
+| `/api/leaves/apply` | `POST` | Submit a new leave application | Yes |
 
-3. User navigates app
-   → All API calls use credentials: "include"
-   → Cookie sent automatically by browser
+#### Leave Types (EL, PL, Unpaid)
+*   `EL`: Earned Leave
+*   `PL`: Privileged Leave (Paid)
+*   `UL`: Unpaid Leave
 
-4. Every 4 minutes
-   → POST http://192.168.122.101/auth/refresh (credentials: "include")
-   → 401? Redirect to login
+#### 1. Get Statistics
+**GET** `http://192.168.122.101/api/leaves/stats`
+```json
+{
+  "total_earned": 12.0,
+  "used_earned": 2.0,
+  "total_paid": 5.0,
+  "used_paid": 0.0,
+  "total_unpaid": 0.0,
+  "used_unpaid": 1.0,
+  "pending_applications": 1
+}
+```
 
-5. User clicks logout
-   → POST http://192.168.122.101/auth/logout (credentials: "include")
-   → Redirect to login page
+#### 2. Apply for Leave
+**POST** `http://192.168.122.101/api/leaves/apply`
+```json
+{
+  "leave_type": "EL",
+  "start_date": "2026-06-15",
+  "end_date": "2026-06-16",
+  "reason": "Family function"
+}
+```
+
+---
+
+### 📍 Location Tracking API
+
+Used to save and retrieve user GPS coordinates.
+
+| Endpoint | Method | Description | Requires Auth |
+| :--- | :--- | :--- | :--- |
+| `/api/location` | `POST` | Update current user's location | Yes |
+| `/api/location/{email}` | `GET` | Get last known location for a user | Yes |
+
+#### 1. Save Location
+**POST** `http://192.168.122.101/api/location`
+
+**Request Body**:
+```json
+{
+  "email": "testuser@gmail.com",
+  "latitude": 28.6139,
+  "longitude": 77.2090
+}
+```
+
+**Security**: You can only update the location for the email matching your logged-in session.
+
+#### 2. Get Location
+**GET** `http://192.168.122.101/api/location/testuser@gmail.com`
+
+**Response**:
+```json
+{
+  "email": "testuser@gmail.com",
+  "latitude": 28.6139,
+  "longitude": 77.2090,
+  "updated_at": "2026-05-11T10:56:30Z"
+}
+```
+
+---
+
+### 🚀 Frontend Interaction Flow
+```mermaid
+graph TD
+    A[User visits app] --> B{Logged In?}
+    B -- No --> C[Show Login Page]
+    B -- Yes --> D[Show Dashboard]
+    D --> E[Check Leave Stats]
+    D --> F[View Attendance]
+    E --> G[Apply for Leave]
 ```
