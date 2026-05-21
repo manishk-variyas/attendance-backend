@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import List
 from app.features.auth.dependencies import get_current_user
 from app.features.leaves.schemas.leaves import (
@@ -41,5 +41,51 @@ async def apply_leave(
 ):
     """Submit a new leave application."""
     user_id = current_user.get("sub")
-    leave_id = await leave_service.apply_for_leave(user_id, leave_data)
+    email = current_user.get("email")
+    leave_id = await leave_service.apply_for_leave(user_id, email, leave_data)
     return {"message": "Leave application submitted successfully", "leave_id": leave_id}
+
+@router.get("/pending")
+async def get_pending_leaves(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all pending leave requests.
+    - PM: Gets pending leaves for TRs in their projects.
+    - Admin: Gets all pending leaves.
+    """
+    roles = current_user.get("roles", [])
+    if "admin" not in roles and "Project Manager" not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Project Managers and Administrators can view pending leaves."
+        )
+
+    pending_list = await leave_service.get_pending_leaves(current_user)
+    return pending_list
+
+@router.post("/{leave_id}/approve")
+async def approve_leave(
+    leave_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Approve a leave application.
+    - PM: Can approve leaves for TRs in their projects.
+    - Admin: Full access.
+    """
+    roles = current_user.get("roles", [])
+    if "admin" not in roles and "Project Manager" not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Project Managers and Administrators can approve leaves."
+        )
+
+    success = await leave_service.approve_leave(leave_id, current_user)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Leave application not found or unauthorized."
+        )
+
+    return {"message": "Leave application approved successfully"}

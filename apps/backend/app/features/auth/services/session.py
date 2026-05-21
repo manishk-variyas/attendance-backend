@@ -1,106 +1,59 @@
 """
-Redis session service - manages user sessions stored in Redis.
+In-memory session service - manages user sessions stored in the server's memory.
 
-This module handles all session-related operations using Redis as the backend:
+This module handles all session-related operations using a local dictionary:
 - Creating sessions (after login)
 - Getting session data
 - Deleting sessions (logout)
 - Refreshing sessions
 - Extending session expiry
 
-Session data structure in Redis:
-    Key: "session:{session_id}"
-    Value: JSON string with:
-        - sub: Keycloak user ID
-        - username: user's username
-        - email: user's email
-        - roles: list of user roles
-        - kc_refresh_token: Keycloak refresh token (for refreshing sessions)
-
-Sessions expire automatically after SESSION_EXPIRE_HOURS.
+Note: In-memory sessions are lost when the server restarts.
 """
 import json
 import logging
 import secrets
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, Dict
 
-import redis.asyncio as redis
-
+# Redis imports commented out as requested
+# import redis.asyncio as redis
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Global Redis client (initialized on first use)
-redis_client: Optional[redis.Redis] = None
+# In-memory session store
+# Key: session_id, Value: {data: dict, expires: datetime}
+
+# ===========================================================================================
+# Todo(Pending) - Should be persistent (Fix!!!!!)
+# ===========================================================================================
+_session_store: Dict[str, dict] = {}
+
+# ===========================================================================================
+# ===========================================================================================
+# ===========================================================================================
 
 
-async def get_redis() -> redis.Redis:
-    """
-    Get or create the Redis client.
-    
-    Uses a singleton pattern - creates the client once and reuses it.
-    The client is created with decode_responses=True so we get strings,
-    not bytes, from Redis.
-    """
-    global redis_client
-    if redis_client is None:
-        redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-    return redis_client
+async def get_redis():
+    """Redis is disabled - returning None as per migration request."""
+    return None
 
 
 async def close_redis():
-    """
-    Close the Redis connection.
-    
-    Called during app shutdown to clean up resources.
-    """
-    global redis_client
-    if redis_client:
-        await redis_client.close()
-        redis_client = None
+    """Redis is disabled."""
+    pass
 
 
 def generate_session_id() -> str:
-    """
-    Generate a secure random session ID.
-    
-    Uses secrets.token_urlsafe() which is cryptographically secure
-    and URL-safe (no special characters that need encoding).
-    
-    Returns:
-        str: A 43-character URL-safe random string
-    """
+    """Generate a secure random session ID."""
     return secrets.token_urlsafe(32)
-
-
-def _session_key(session_id: str) -> str:
-    """
-    Convert a session ID to a Redis key.
-    
-    Adds the "session:" prefix to avoid key collisions with other data.
-    """
-    return f"session:{session_id}"
 
 
 async def create_session(
     user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None
 ) -> str:
-    """
-    Create a new session in Redis.
-    
-    How it works:
-    1. Generate a new unique session ID
-    2. Build the session data with user info and refresh token
-    3. Store as JSON in Redis with an expiry time
-    
-    Args:
-        user_data: Dict with sub, username, email, roles
-        keycloak_refresh_token: The Keycloak refresh token (for later refresh)
-        expires_hours: Override the default session expiry
-    
-    Returns:
-        str: The new session ID (to be set as a cookie)
-    """
+    """Create a new session in server memory."""
     session_id = generate_session_id()
     expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
 
@@ -114,85 +67,74 @@ async def create_session(
     if keycloak_refresh_token:
         session_data["kc_refresh_token"] = keycloak_refresh_token
 
-    r = await get_redis()
-    await r.set(
-        _session_key(session_id),
-        json.dumps(session_data),
-        ex=expire_hours * 3600,  # Convert hours to seconds for Redis
-    )
+    # Store in memory with expiry
+    _session_store[session_id] = {
+        "data": session_data,
+        "expires": datetime.now() + timedelta(hours=expire_hours)
+    }
+    
+    logger.info(f"Session created in-memory: {session_id[:8]}...")
     return session_id
 
 
 async def get_session(session_id: str) -> Optional[dict]:
-    """
-    Get session data from Redis.
-    
-    Args:
-        session_id: The session ID from the cookie
-        
-    Returns:
-        dict or None: The session data if found, None if expired/not found
-    """
-    r = await get_redis()
-    data = await r.get(_session_key(session_id))
-    if data:
-        return json.loads(data)
-    return None
+    """Get session data from memory, checking for expiry."""
+    session = _session_store.get(session_id)
+    if not session:
+        return None
+
+    # Check if session has expired
+    if datetime.now() > session["expires"]:
+        logger.info(f"Session expired in-memory: {session_id[:8]}...")
+        del _session_store[session_id]
+        return None
+
+    return session["data"]
 
 
 async def delete_session(session_id: str) -> bool:
-    """
-    Delete a session from Redis (logout).
-    
-    Args:
-        session_id: The session ID to delete
+    """Delete a session from memory (logout)."""
+    if session_id in _session_store:
+        del _session_store[session_id]
+        logger.info(f"Session deleted from memory: {session_id[:8]}...")
+        return True
+    return False
+
+
+async def delete_sessions_by_sub(sub: str) -> int:
+    """Delete all sessions belonging to a specific user (sub)."""
+    deleted = 0
+    keys_to_delete = [
+        sid for sid, info in _session_store.items() 
+        if info.get("data", {}).get("sub") == sub
+    ]
+            
+    for sid in keys_to_delete:
+        del _session_store[sid]
+        deleted += 1
         
-    Returns:
-        bool: True if a session was deleted, False if it didn't exist
-    """
-    r = await get_redis()
-    result = await r.delete(_session_key(session_id))
-    return result > 0
+    if deleted > 0:
+        logger.info(f"Deleted {deleted} in-memory sessions for user sub: {sub}")
+        
+    return deleted
 
 
 async def refresh_session(session_id: str, keycloak_refresh_token: str) -> bool:
-    """
-    Update the refresh token for an existing session.
-    
-    Used internally when refreshing a session - updates just the refresh token
-    without changing other session data.
-    
-    Args:
-        session_id: The session to update
-        keycloak_refresh_token: The new refresh token
-        
-    Returns:
-        bool: True if session was found and updated, False otherwise
-    """
-    r = await get_redis()
-    data = await r.get(_session_key(session_id))
-    if not data:
+    """Update the refresh token for an existing in-memory session."""
+    session = _session_store.get(session_id)
+    if not session:
         return False
 
-    session_data = json.loads(data)
-    session_data["kc_refresh_token"] = keycloak_refresh_token
-    await r.set(_session_key(session_id), json.dumps(session_data))
+    session["data"]["kc_refresh_token"] = keycloak_refresh_token
     return True
 
 
 async def extend_session(session_id: str, hours: int = None) -> bool:
-    """
-    Extend the expiry time of an existing session.
-    
-    Useful for "sliding sessions" that expire after inactivity.
-    
-    Args:
-        session_id: The session to extend
-        hours: New expiry time in hours (uses default if not specified)
-        
-    Returns:
-        bool: True if session was found and extended, False otherwise
-    """
-    r = await get_redis()
+    """Extend the expiry time of an existing in-memory session."""
+    session = _session_store.get(session_id)
+    if not session:
+        return False
+
     expire_hours = hours or settings.SESSION_EXPIRE_HOURS
-    return await r.expire(_session_key(session_id), expire_hours * 3600)
+    session["expires"] = datetime.now() + timedelta(hours=expire_hours)
+    return True

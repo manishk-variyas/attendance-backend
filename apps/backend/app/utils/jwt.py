@@ -35,11 +35,15 @@ def get_user_info_from_token(access_token: str) -> dict:
     try:
         # Decode without verification to get the payload (user info)
         payload = jwt.get_unverified_claims(access_token)
+        # Keycloak stores custom attributes as lists — take the first value
+        raw_tz = payload.get("timezone")
+        timezone = raw_tz[0] if isinstance(raw_tz, list) and raw_tz else (raw_tz or "UTC")
         return {
             "sub": payload.get("sub"),  # Keycloak's unique user ID
             "username": payload.get("preferred_username"),  # The username
             "email": payload.get("email"),  # User's email
             "roles": payload.get("realm_access", {}).get("roles", []),  # User's roles
+            "timezone": timezone,  # IANA timezone, e.g. "Asia/Kolkata"
         }
     except Exception as e:
         logger.error(f"Error extracting user info: {e}")

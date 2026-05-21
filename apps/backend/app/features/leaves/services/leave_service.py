@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from fastapi import HTTPException
 from app.core.mongodb import get_mongodb
 from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveStats, LeaveType
+from app.features.redmine.service import redmine_service
 from bson import ObjectId
 
 class LeaveService:
@@ -19,7 +20,7 @@ class LeaveService:
             raise RuntimeError("MongoDB not initialized. Check if connect_to_mongo was called.")
         return db
 
-    async def apply_for_leave(self, user_id: str, leave_data: LeaveApplyRequest) -> str:
+    async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> str:
         """Submit a new leave application with overlap protection."""
         
         # Check for overlapping leaves (Approved or Pending)
@@ -39,6 +40,7 @@ class LeaveService:
 
         leave_doc = {
             "user_id": user_id,
+            "user_email": email,
             "start_date": leave_data.start_date,
             "end_date": leave_data.end_date,
             "leave_type": leave_data.leave_type,
@@ -106,5 +108,93 @@ class LeaveService:
             "pending_applications": pending_count
         }
         return stats
+
+    async def approve_leave(self, leave_id: str, current_user: dict) -> bool:
+        """Approve a leave application. PMs can only approve leaves of resources in their projects."""
+        try:
+            oid = ObjectId(leave_id)
+        except Exception:
+            return False
+
+        leave = await self.db[self.leaves_collection].find_one({"_id": oid})
+        if not leave:
+            return False
+
+        # If not admin, verify PM permissions
+        roles = current_user.get("roles", [])
+        if "admin" not in roles:
+            # PM check
+            pm_email = current_user.get("email")
+            pm_user = await redmine_service.get_user_by_email(pm_email)
+            if not pm_user:
+                return False
+                
+            pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
+            pm_project_ids = {p.id for p in pm_projects}
+
+            # Get target user (TR) from leave document
+            tr_email = leave.get("user_email")
+            if not tr_email:
+                # Fallback: if user_email not stored, we cannot verify project scope for PM
+                return False
+                
+            tr_user = await redmine_service.get_user_by_email(tr_email)
+            if not tr_user:
+                return False
+                
+            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
+            tr_project_ids = {p.id for p in tr_projects}
+
+            # Check if PM and TR share at least one project
+            if not pm_project_ids.intersection(tr_project_ids):
+                raise HTTPException(status_code=403, detail="You can only approve leaves for resources in your projects.")
+
+        # Update leave status to approved
+        result = await self.db[self.leaves_collection].update_one(
+            {"_id": oid},
+            {"$set": {"status": LeaveStatus.APPROVED, "updated_at": datetime.utcnow()}}
+        )
+        return result.modified_count > 0
+
+    async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
+        """Fetch all pending leaves. PMs only see pending leaves for resources in their projects."""
+        roles = current_user.get("roles", [])
+        
+        # 1. Fetch all pending leaves
+        cursor = self.db[self.leaves_collection].find({"status": LeaveStatus.PENDING}).sort("created_at", -1)
+        all_pending = []
+        async for doc in cursor:
+            doc["id"] = str(doc.pop("_id"))
+            all_pending.append(doc)
+
+        if "admin" in roles:
+            return all_pending
+
+        # PM scoping
+        pm_email = current_user.get("email")
+        pm_user = await redmine_service.get_user_by_email(pm_email)
+        if not pm_user:
+            return []
+
+        pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
+        pm_project_ids = {p.id for p in pm_projects}
+
+        filtered = []
+        for leave in all_pending:
+            tr_email = leave.get("user_email")
+            if not tr_email:
+                continue
+                
+            tr_user = await redmine_service.get_user_by_email(tr_email)
+            if not tr_user:
+                continue
+                
+            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
+            tr_project_ids = {p.id for p in tr_projects}
+
+            if pm_project_ids.intersection(tr_project_ids):
+                filtered.append(leave)
+
+        return filtered
 
 leave_service = LeaveService()

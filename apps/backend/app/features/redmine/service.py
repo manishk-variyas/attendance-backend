@@ -21,10 +21,20 @@ class RedmineService:
             response.raise_for_status()
             return response.json().get("custom_fields", [])
 
-    async def create_user(self, username: str, email: str, firstname: str = "User", lastname: str = "Backend"):
+    async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: Optional[str] = None, lastname: str = ""):
         """
         Creates a user in Redmine. If the user already exists, returns the existing user.
+        Uses the username as the default firstname if none is provided.
         """
+        # --- OLD LOGIC (BACKUP) ---
+        # # Previous signature used generic names
+        # async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: str = "User", lastname: str = "Backend"):
+        # --------------------------
+
+        # Use provided firstname or fall back to username so we can identify them lol
+        fname = firstname or username
+        lname = lastname or "-"
+
         # 1. Check for existing user (Idempotency)
         existing_user = await self.get_user_by_email(email)
         if existing_user:
@@ -37,9 +47,9 @@ class RedmineService:
                 "user": {
                     "login": username,
                     "mail": email,
-                    "firstname": firstname,
-                    "lastname": lastname,
-                    "password": secrets.token_urlsafe(16)
+                    "firstname": fname,
+                    "lastname": lname,
+                    "password": password or secrets.token_urlsafe(16)
                 }
             }
             try:
@@ -53,8 +63,6 @@ class RedmineService:
                 response.raise_for_status()
             except Exception as e:
                 logger.error(f"Failed to sync user to Redmine: {e}")
-                # We don't raise here if called from background task, but we might want to 
-                # if called synchronously.
                 raise
 
     async def get_user_by_email(self, email: str):
@@ -88,26 +96,57 @@ class RedmineService:
             ]
 
     async def get_projects_for_user(self, user_id: int) -> List[ProjectResponse]:
+        """
+        Fetch projects for a specific user. 
+        Strictly filters by the user's memberships to avoid showing all public projects 
+        that the user might have access to but isn't explicitly assigned to.
+        """
         async with httpx.AsyncClient() as client:
-            # We need to get projects where user is a member
-            # Redmine API: GET /projects.json?user_id=123
-            response = await client.get(f"{self.url}/projects.json?user_id={user_id}&include=custom_fields", headers=self.headers)
+            # 1. Fetch user memberships to get the definitive list of assigned projects
+            try:
+                user_resp = await client.get(f"{self.url}/users/{user_id}.json?include=memberships", headers=self.headers)
+                user_resp.raise_for_status()
+                user_data = user_resp.json().get("user", {})
+                memberships = user_data.get("memberships", [])
+                assigned_project_ids = {m["project"]["id"] for m in memberships}
+            except Exception as e:
+                logger.error(f"Failed to fetch memberships for user {user_id}: {e}")
+                return []
+
+            if not assigned_project_ids:
+                return []
+
+            # 2. Fetch projects (filtering by user_id still helps reduce initial set and ensures visibility)
+            # We use a high limit to ensure we get all projects the user might be in.
+            response = await client.get(
+                f"{self.url}/projects.json?user_id={user_id}&include=custom_fields&limit=100", 
+                headers=self.headers
+            )
             response.raise_for_status()
             projects_data = response.json().get("projects", [])
+
+            # --- OLD LOGIC (BACKUP) ---
+            # # Previous logic returned all projects visible to user (including public ones)
+            # response = await client.get(f"{self.url}/projects.json?user_id={user_id}&include=custom_fields", headers=self.headers)
+            # response.raise_for_status()
+            # projects_data = response.json().get("projects", [])
+            # --------------------------
             
             projects = []
             for p in projects_data:
-                custom_values = {cf["name"]: cf.get("value") for cf in p.get("custom_fields", [])}
-                projects.append(ProjectResponse(
-                    id=p["id"],
-                    name=p["name"],
-                    identifier=p["identifier"],
-                    city=custom_values.get("City", ""),
-                    customerName=p["name"], # mapping name to customerName for now
-                    customerOfficeLocation=custom_values.get("Customer Office Location", ""),
-                    projectType=custom_values.get("Project Type", ""),
-                    status="active" if p.get("status") == 1 else "closed" if p.get("status") == 5 else "archived"
-                ))
+                # 3. STRICT FILTER: Only include if the user has an explicit membership
+                if p["id"] in assigned_project_ids:
+                    custom_values = {cf["name"]: cf.get("value") for cf in p.get("custom_fields", [])}
+                    projects.append(ProjectResponse(
+                        id=p["id"],
+                        name=p["name"],
+                        identifier=p["identifier"],
+                        city=custom_values.get("City", ""),
+                        customerName=p["name"], # mapping name to customerName for now
+                        customerOfficeLocation=custom_values.get("Customer Office Location", ""),
+                        projectType=custom_values.get("Project Type", ""),
+                        status="active" if p.get("status") == 1 else "closed" if p.get("status") == 5 else "archived"
+                    ))
             return projects
 
     async def create_or_update_project(self, data: ProjectCreate):

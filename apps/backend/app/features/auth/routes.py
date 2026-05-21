@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, get_redis
+from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub, get_redis
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
 from app.features.auth.dependencies import get_current_user
 from app.utils.jwt import get_user_info_from_token
@@ -85,7 +85,7 @@ async def login(request: Request, username: str, password: str):
         log_login(correlation_id, username, success=False, client_ip=client_ip, extra={"reason": "missing_sub"})
         raise HTTPException(status_code=401, detail="Failed to extract user info")
 
-    # Create a new session in Redis with user data and refresh token
+    # Create a new session in server memory with user data and refresh token
     session_id = await create_session(user_data, tokens.get("refresh_token"))
 
     log_login(correlation_id, username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
@@ -129,7 +129,7 @@ async def refresh_session_endpoint(
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="No session")
 
-    # Look up the session in Redis
+    # Look up the session in Redis/Backend session storage
     session_data = await get_session(old_session_id)
     if not session_data:
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
@@ -233,7 +233,7 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
     1. Keycloak sends a logout token (a special JWT)
     2. We verify it has the backchannel logout event
     3. Extract the user ID (sub) from the token
-    4. Find and delete all sessions for that user in Redis
+    4. Find and delete all sessions for that user in memory
     """
     from jose import jwt
 
@@ -252,18 +252,8 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
         if not sub:
             raise HTTPException(status_code=400, detail="Missing sub claim in logout token")
 
-        # Find all sessions in Redis that belong to this user
-        r = await get_redis()
-        keys = await r.keys("session:*")
-
-        deleted = 0
-        for key in keys:
-            session_data = await r.get(key)
-            if session_data:
-                data = json.loads(session_data)
-                if data.get("sub") == sub:
-                    await r.delete(key)
-                    deleted += 1
+        # Find and delete all in-memory sessions that belong to this user
+        deleted = await delete_sessions_by_sub(sub)
 
         log_backchannel_logout(correlation_id, user_sub=sub, sessions_deleted=deleted)
     except HTTPException:
@@ -299,13 +289,17 @@ async def signup(request: Request, signup_data: SignupRequest, background_tasks:
             extra={"username": signup_data.username, "client_ip": client_ip},
         )
 
-        # BEST PRACTICE: Sync to Redmine in the background
+        # Note: Sync to Redmine in the background
         # This keeps the signup request fast and responsive
+        # Pass the password to Redmine so credentials match Keycloak
         background_tasks.add_task(
             redmine_service.create_user, 
             signup_data.username, 
-            signup_data.email
+            signup_data.email,
+            signup_data.password
         )
+        # Original call (no password passed):
+        # background_tasks.add_task(redmine_service.create_user, signup_data.username, signup_data.email)
 
         return SignupResponse(
             message="User created successfully",

@@ -71,10 +71,20 @@ async def upload_recording(
         except ValueError:
              raise HTTPException(status_code=fastapi_status.HTTP_400_BAD_REQUEST, detail="Invalid Ticket ID format. Must be numeric.")
 
-    # Create a unique filename
+    # Create a unique filename and path
     ext = os.path.splitext(audio.filename)[1] or ".mp3"
-    unique_filename = f"{uuid.uuid4()}{ext}"
-    object_name = f"{email}/{unique_filename}"
+    
+    # OLD APPROACH: Store by email
+    # unique_filename = f"{uuid.uuid4()}{ext}"
+    # object_name = f"{email}/{unique_filename}"
+    
+    # NEW APPROACH: Store by username/date/timestamp_uuid
+    now = datetime.now(timezone.utc)
+    date_folder = now.strftime("%Y-%m-%d")
+    time_prefix = now.strftime("%H%M%S")
+    username = current_user.get("username", email) # Use username from session, fallback to email if missing
+    short_uuid = uuid.uuid4().hex[:8]
+    object_name = f"{username}/{date_folder}/{time_prefix}_{short_uuid}{ext}"
 
     # Read file content
     content = await audio.read()
@@ -192,10 +202,13 @@ async def delete_recording(
     
     # Extract object name from URL
     try:
-        object_name = payload.recordingUrl.split(f"/{payload.email}/")[1]
-        full_object_name = f"{payload.email}/{object_name}"
-        await storage_service.delete_file(full_object_name)
+        # Robust extraction: get everything after the bucket name (recordings)
+        # URL format: http://.../recordings/path/to/file.mp3
+        if "/recordings/" in payload.recordingUrl:
+            full_object_name = payload.recordingUrl.split("/recordings/")[1]
+            await storage_service.delete_file(full_object_name)
     except Exception as e:
+        print(f"Delete error: {e}")
         pass
         
     await db.recordings.delete_one({"_id": recording["_id"]})

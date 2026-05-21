@@ -14,6 +14,7 @@ class ShiftCreate(BaseModel):
     workAddress: Optional[str] = "N/A"
     leaveType: Optional[str] = None
     date: str                       # "YYYY-MM-DD"
+    endDate: Optional[str] = None   # "YYYY-MM-DD"
     shiftStartTime: str             # "HH:MM"
     shiftEndTime: str               # "HH:MM"
     shiftStartUTC: Optional[datetime] = None
@@ -49,6 +50,7 @@ class ShiftUpdate(BaseModel):
     shiftEndUTC: Optional[datetime] = None
     projectId: Optional[int] = None
     projectName: Optional[str] = None
+    endDate: Optional[str] = None
 
 
 class ShiftResponse(BaseModel):
@@ -63,6 +65,7 @@ class ShiftResponse(BaseModel):
     workAddress: Optional[str] = None
     leaveType: Optional[str] = None
     date: str
+    endDate: Optional[str] = None
     shiftStartTime: str
     shiftEndTime: str
     shiftStartUTC: Optional[datetime] = None
@@ -95,6 +98,7 @@ class ShiftHistoryItem(BaseModel):
     workAddress: Optional[str] = None
     leaveType: Optional[str] = None
     date: str
+    endDate: Optional[str] = None
     shiftStartTime: str
     shiftEndTime: str
     createdAt: Optional[datetime] = None

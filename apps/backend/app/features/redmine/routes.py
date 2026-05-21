@@ -16,10 +16,11 @@ async def list_redmine_users(
 ):
     """Return a lightweight list of all active Redmine users (id, name, email).
     Used to populate the employee dropdown on the admin roster page."""
-    if "admin" not in current_user.get("roles", []):
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["admin", "Project Manager", "Project Coordinator"]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
+            detail="Admin, Project Manager, or Project Coordinator access required",
         )
     return await redmine_service.get_all_users()
 
@@ -73,8 +74,12 @@ async def get_user_projects_by_id(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin only (since we can't easily check self by ID here without a lookup)
-    if "admin" not in current_user.get("roles", []):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin, Project Manager, or Project Coordinator access required",
+        )
         
     return await redmine_service.get_projects_for_user(user_id)
 

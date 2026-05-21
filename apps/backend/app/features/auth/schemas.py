@@ -51,6 +51,7 @@ class SignupRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=30, pattern=r"^[a-zA-Z0-9_]+$")
     email: EmailStr
     password: str = Field(...)
+    timezone: str = Field(default="UTC", description="IANA timezone name, e.g. 'Asia/Kolkata'")
 
     @field_validator("username")
     @classmethod
