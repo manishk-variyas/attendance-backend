@@ -18,13 +18,28 @@ class LeaveApplyRequest(BaseModel):
     end_date: datetime
     leave_type: LeaveType
     reason: Optional[str] = None
+    comment: Optional[str] = None
+    is_traveling: Optional[bool] = None
+    contact_number: Optional[str] = None
+    resuming_date: Optional[datetime] = None
+    leave_dates: Optional[List[datetime]] = None
 
 class LeaveHistoryItem(BaseModel):
     id: str
+    user_id: Optional[str] = None
+    user_email: Optional[str] = None
     start_date: datetime
     end_date: datetime
     leave_type: LeaveType
+    reason: Optional[str] = None
+    comment: Optional[str] = None
+    is_traveling: Optional[bool] = None
+    contact_number: Optional[str] = None
+    resuming_date: Optional[datetime] = None
+    leave_dates: Optional[List[datetime]] = None
     status: LeaveStatus
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 class LeaveStats(BaseModel):
     total_earned: float = 0.0
@@ -35,7 +50,15 @@ class LeaveStats(BaseModel):
     used_unpaid: float = 0.0
     pending_applications: int = 0
 
-class HolidayItem(BaseModel):
-    date: datetime
-    name: str
-    description: Optional[str] = None
+class HolidayType(str, Enum):
+    GAZETTED = "GAZETTED"
+    RESTRICTED = "RESTRICTED"
+
+class Holiday(BaseModel):
+    country_code: str
+    region: Optional[str] = None
+    holiday_date: str
+    holiday_name: str
+    holiday_type: HolidayType
+    is_national: bool
+

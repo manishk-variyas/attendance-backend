@@ -120,9 +120,5 @@ app.include_router(location_router, prefix="/api/location", tags=["location"])
 from app.features.shifts.routes import router as shifts_router
 app.include_router(shifts_router, prefix="/api", tags=["shifts"])
 
-# Register Advanced Admin Dashboard (Integrated UI)
-from app.features.admin.routes import router as admin_router
-from fastapi.staticfiles import StaticFiles
-app.include_router(admin_router)
-app.mount("/admin-static", StaticFiles(directory="app/features/admin/static"), name="admin-static")
+# (Admin dashboard module was removed)
 

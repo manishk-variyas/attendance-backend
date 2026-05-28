@@ -25,7 +25,7 @@ from app.core.config import settings
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
 from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub, get_redis
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
-from app.features.auth.dependencies import get_current_user
+from app.features.auth.dependencies import get_current_user, require_admin
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
 from app.features.auth.schemas import SignupRequest, SignupResponse
@@ -268,16 +268,28 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
 
 @router.post("/signup")
 @limiter.limit("5/minute")
-async def signup(request: Request, signup_data: SignupRequest, background_tasks: BackgroundTasks):
+async def signup(
+    request: Request,
+    signup_data: SignupRequest,
+    background_tasks: BackgroundTasks,
+    # Enforce admin-only access — the dependency chain resolves
+    # get_current_user first, then checks for the "admin" realm role.
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
     """
-    Signup endpoint - create a new user in Keycloak.
-    Syncs to Redmine in the background to keep the response fast.
+    Signup endpoint — admin only. Creates a new user in Keycloak
+    and syncs them to Redmine in the background.
+
+    Requires a valid session with the "admin" realm role.
     """
     correlation_id = request.state.correlation_id
     client_ip = request.client.host if request.client else "-"
 
     try:
-        user_id = await create_keycloak_user(signup_data.username, signup_data.email)
+        logger.info(f"Admin {current_user.get('username')} is creating user {signup_data.username}")
+        # Pass timezone so Keycloak embeds it as a user attribute → JWT claim
+        user_id = await create_keycloak_user(signup_data.username, signup_data.email, signup_data.timezone)
         await set_keycloak_password(user_id, signup_data.password)
 
         logger.info(f"User {signup_data.username} created via signup")
@@ -291,12 +303,14 @@ async def signup(request: Request, signup_data: SignupRequest, background_tasks:
 
         # Note: Sync to Redmine in the background
         # This keeps the signup request fast and responsive
-        # Pass the password to Redmine so credentials match Keycloak
+        # Pass the password so Redmine credentials match Keycloak
+        # Pass the timezone so Redmine's user preferences.time_zone is in sync
         background_tasks.add_task(
-            redmine_service.create_user, 
-            signup_data.username, 
-            signup_data.email,
-            signup_data.password
+            redmine_service.create_user,
+            username=signup_data.username,
+            email=signup_data.email,
+            password=signup_data.password,
+            timezone=signup_data.timezone,
         )
         # Original call (no password passed):
         # background_tasks.add_task(redmine_service.create_user, signup_data.username, signup_data.email)

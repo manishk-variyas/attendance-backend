@@ -2,20 +2,20 @@
 Authentication dependencies for protecting routes.
 
 This module provides FastAPI dependencies that can be used to protect
-endpoints by requiring a valid session.
+endpoints by requiring a valid session and optionally specific roles.
 
-The main dependency is `get_current_user` which:
-1. Reads the session_id cookie from the request
-2. Looks up the session in Redis
-3. Returns the user data if session is valid
-4. Raises 401 Unauthorized if session is missing or expired
+Main dependencies:
+- `get_current_user` — validates session, returns user dict (sub, username, email, roles)
+- `require_role(role)` — factory to create a dependency that checks for a specific role
+- `require_admin` — pre-built dependency requiring the "admin" role
 
 Usage:
-    @app.get("/api/me")
-    def get_me(current_user: dict = Depends(get_current_user)):
-        return current_user
+    @app.get("/admin-only")
+    def admin_endpoint(current_user: dict = Depends(get_current_user),
+                       _=Depends(require_admin)):
+        return "secret data"
 """
-from fastapi import Request, HTTPException
+from fastapi import Request, HTTPException, Depends
 from app.features.auth.services.session import get_session
 
 
@@ -25,7 +25,7 @@ async def get_current_user(request: Request) -> dict:
     
     How it works:
     1. Get the session_id from the HTTP cookie
-    2. Look up that session in Redis
+    2. Look up that session in the session store
     3. If found, return the user data (sub, username, email, roles)
     4. If not found or missing, raise 401 Unauthorized
     
@@ -45,3 +45,31 @@ async def get_current_user(request: Request) -> dict:
         "email": session_data.get("email"),
         "roles": session_data.get("roles", []),
     }
+
+
+def require_role(role: str):
+    """
+    Factory: returns a FastAPI dependency that checks the authenticated
+    user has the given realm role.
+
+    Must be used *after* `get_current_user` so that `current_user` is resolved
+    first (FastAPI handles this automatically via the parameter chain).
+
+    Usage:
+        @router.post("/signup")
+        async def signup(..., _: None = Depends(require_role("admin"))):
+            ...
+    """
+    async def _role_checker(current_user: dict = Depends(get_current_user)) -> None:
+        roles = current_user.get("roles", [])
+        if role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Requires '{role}' role",
+            )
+    return _role_checker
+
+
+# Convenience: pre-built admin guard
+# Note: casing must match Keycloak realm role name exactly
+require_admin = require_role("Admin")

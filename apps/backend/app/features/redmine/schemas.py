@@ -36,5 +36,18 @@ class IssueResponse(BaseModel):
     tracker: str
     project_id: int
     project_name: str
+    assigned_to_name: Optional[str] = None
     created_on: str
     updated_on: str
+
+
+class ProjectMember(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    roles: List[str]
+
+class TimeZoneInfo(BaseModel):
+    value: str
+    label: str
+    offset: str

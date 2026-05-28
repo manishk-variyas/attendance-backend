@@ -1,10 +1,22 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from typing import List
-from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse
+from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember
 from .service import redmine_service
+from .constants import REDMINE_TIMEZONES
 from app.features.auth.dependencies import get_current_user
 
 router = APIRouter()
+
+
+# ------------------------------------------------------------------ #
+#  GET /api/redmine/timezones  — Redmine-compatible timezone list    #
+# ------------------------------------------------------------------ #
+@router.get("/redmine/timezones", response_model=List[TimeZoneInfo])
+async def list_timezones():
+    """Return the full list of Redmine-compatible timezones.
+    Mirrors the timezone dropdown from Redmine's user preferences form.
+    Used by the onboarding screen to pick a user's timezone."""
+    return REDMINE_TIMEZONES
 
 
 # ------------------------------------------------------------------ #
@@ -17,7 +29,7 @@ async def list_redmine_users(
     """Return a lightweight list of all active Redmine users (id, name, email).
     Used to populate the employee dropdown on the admin roster page."""
     roles = current_user.get("roles", [])
-    if not any(role in roles for role in ["admin", "Project Manager", "Project Coordinator"]):
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator"]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin, Project Manager, or Project Coordinator access required",
@@ -31,7 +43,7 @@ async def create_project(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin only
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
         
     try:
@@ -46,7 +58,7 @@ async def get_user_projects_by_email_alias(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin or self
-    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     user = await redmine_service.get_user_by_email(email)
@@ -60,7 +72,7 @@ async def get_user_projects_by_email(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin or self
-    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     user = await redmine_service.get_user_by_email(email)
@@ -75,7 +87,7 @@ async def get_user_projects_by_id(
 ):
     # Admin only (since we can't easily check self by ID here without a lookup)
     roles = current_user.get("roles", [])
-    if not any(role in roles for role in ["admin", "Project Manager", "Project Coordinator"]):
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator"]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin, Project Manager, or Project Coordinator access required",
@@ -88,24 +100,51 @@ async def get_all_user_projects(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin only
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
         
     return await redmine_service.get_all_users_with_projects()
 
-@router.get("/user-issues/email/{email}", response_model=List[IssueResponse])
-async def get_user_issues_by_email(
-    email: str,
-    current_user: dict = Depends(get_current_user)
-):
-    # Admin or self
-    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+# @router.get("/user-issues/email/{email}", response_model=List[IssueResponse])
+# async def get_user_issues_by_email(
+#     email: str,
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     # Admin or self
+#     if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
+#         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+#
+#     user = await redmine_service.get_user_by_email(email)
+#     if not user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     return await redmine_service.get_issues_for_user(user["id"])
 
-    user = await redmine_service.get_user_by_email(email)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return await redmine_service.get_issues_for_user(user["id"])
+
+@router.get("/projects/{project_id}/issues", response_model=List[IssueResponse])
+async def get_project_issues(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get issues for a project.
+    - Admin/PM/PC: sees all issues.
+    - TR: sees only issues assigned to them.
+    """
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator", "Technical Resource"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+    is_tr = "Technical Resource" in roles and "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles
+
+    if is_tr:
+        user = await redmine_service.get_user_by_email(current_user.get("email"))
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found in Redmine")
+        return await redmine_service.get_issues_for_project(project_id, assigned_to_id=user["id"])
+
+    return await redmine_service.get_issues_for_project(project_id)
 
 @router.get("/user-issues/id/{user_id}", response_model=List[IssueResponse])
 async def get_user_issues_by_id(
@@ -113,7 +152,7 @@ async def get_user_issues_by_id(
     current_user: dict = Depends(get_current_user)
 ):
     # Admin only
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
         
     return await redmine_service.get_issues_for_user(user_id)
@@ -152,3 +191,12 @@ async def get_my_issues(current_user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=500, detail="Failed to sync user with Redmine")
             
     return await redmine_service.get_issues_for_user(user["id"])
+
+
+@router.get("/project-members/{project_id}", response_model=List[ProjectMember])
+async def get_project_members(
+    project_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all members of a project with their roles."""
+    return await redmine_service.get_project_members(project_id)

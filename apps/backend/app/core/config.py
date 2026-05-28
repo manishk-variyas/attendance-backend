@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # Redmine integration settings
     REDMINE_URL: str = "http://redmine:3000" # Internal Docker network address
-    REDMINE_API_KEY: str = "b0c80f3462ddd722de39456e068441d0e057b37b"
+    REDMINE_API_KEY: str = "c2ffc5526ca3ec90d0359742c48aee46f6ec1688"
     
     # MinIO / S3 Settings
     MINIO_URL: str = "http://minio:9000"

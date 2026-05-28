@@ -14,51 +14,69 @@ class RedmineService:
             "X-Redmine-API-Key": settings.REDMINE_API_KEY,
             "Content-Type": "application/json"
         }
-
     async def get_custom_fields(self):
         async with httpx.AsyncClient() as client:
             response = await client.get(f"{self.url}/custom_fields.json", headers=self.headers)
             response.raise_for_status()
             return response.json().get("custom_fields", [])
 
-    async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: Optional[str] = None, lastname: str = ""):
+    async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: Optional[str] = None, lastname: str = "", timezone: str = "UTC"):
         """
         Creates a user in Redmine. If the user already exists, returns the existing user.
         Uses the username as the default firstname if none is provided.
-        """
-        # --- OLD LOGIC (BACKUP) ---
-        # # Previous signature used generic names
-        # async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: str = "User", lastname: str = "Backend"):
-        # --------------------------
 
-        # Use provided firstname or fall back to username so we can identify them lol
+        timezone: IANA timezone name (e.g. 'Asia/Kolkata') stored in Redmine's
+                  user preferences.time_zone. Must match Keycloak's timezone attribute
+                  so that the value is consistent across both systems.
+        """
+        # Use provided firstname or fall back to username so we can identify them
         fname = firstname or username
         lname = lastname or "-"
 
-        # 1. Check for existing user (Idempotency)
+        # 1. Check for existing user (idempotency — avoid duplicates on retry)
         existing_user = await self.get_user_by_email(email)
         if existing_user:
             logger.info(f"User {email} already exists in Redmine. Sync skipped.")
             return existing_user
 
-        # 2. Create in Redmine
+        # 2. Create in Redmine with timezone in preferences so Redmine's
+        #    timesheet / date displays match the user's configured timezone.
         async with httpx.AsyncClient() as client:
             payload = {
-                "user": {
+                    "user": {
                     "login": username,
                     "mail": email,
                     "firstname": fname,
                     "lastname": lname,
-                    "password": password or secrets.token_urlsafe(16)
-                }
+                    "password": password or secrets.token_urlsafe(16),
+                    },
+               "pref": {
+                    "time_zone": timezone, 
+                },
             }
+            # payload = {
+            #     "user": {
+            #         "login": username,
+            #         "mail": email,
+            #         "firstname": fname,
+            #         "lastname": lname,
+            #         "password": password or secrets.token_urlsafe(16),
+            #         "preferences": {
+            #             "time_zone": timezone,
+            #         },
+            #     }
+            # }
             try:
                 response = await client.post(f"{self.url}/users.json", json=payload, headers=self.headers)
                 if response.status_code == 201:
                     logger.info(f"Successfully synced user {email} to Redmine.")
                     return response.json().get("user")
                 elif response.status_code == 422:
-                    logger.warning(f"Redmine user creation failed (duplicate?): {response.text}")
+                    logger.warning(f"Redmine user creation failed: {response.text}")
+                    existing = await self.get_user_by_login(username)
+                    if existing:
+                        logger.info(f"Found existing Redmine user {username} by login — returning it.")
+                        return existing
                     return await self.get_user_by_email(email)
                 response.raise_for_status()
             except Exception as e:
@@ -67,13 +85,21 @@ class RedmineService:
 
     async def get_user_by_email(self, email: str):
         async with httpx.AsyncClient() as client:
-            # Redmine doesn't have a direct "find by email" endpoint that works reliably with filters in some versions
-            # but we can try filtering users
             response = await client.get(f"{self.url}/users.json?name={email}", headers=self.headers)
             response.raise_for_status()
             users = response.json().get("users", [])
             for user in users:
                 if user.get("mail") == email:
+                    return user
+            return None
+
+    async def get_user_by_login(self, login: str):
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{self.url}/users.json?name={login}", headers=self.headers)
+            response.raise_for_status()
+            users = response.json().get("users", [])
+            for user in users:
+                if user.get("login") == login:
                     return user
             return None
 
@@ -92,8 +118,39 @@ class RedmineService:
                     "name": f"{u['firstname']} {u['lastname']}".strip(),
                     "email": u.get("mail", ""),
                 }
-                for u in users
+                for u in users if not u.get("admin", False)
             ]
+
+    async def get_all_projects(self) -> list:
+        """Fetch all projects from Redmine — lightweight list for dropdowns."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.url}/projects.json?limit=100",
+                headers=self.headers
+            )
+            response.raise_for_status()
+            return response.json().get("projects", [])
+
+    async def get_project_members(self, project_id: int) -> list:
+        """Fetch all members of a project with their roles."""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.url}/projects/{project_id}/memberships.json?include=user,roles",
+                headers=self.headers
+            )
+            response.raise_for_status()
+            memberships = response.json().get("memberships", [])
+            result = []
+            for m in memberships:
+                user = m.get("user", {})
+                roles = [r["name"] for r in m.get("roles", [])]
+                result.append({
+                    "user_id": user.get("id"),
+                    "name": user.get("name", ""),
+                    "email": user.get("mail", ""),
+                    "roles": roles,
+                })
+            return result
 
     async def get_projects_for_user(self, user_id: int) -> List[ProjectResponse]:
         """
@@ -236,6 +293,33 @@ class RedmineService:
                     tracker=i["tracker"]["name"],
                     project_id=i["project"]["id"],
                     project_name=i["project"]["name"],
+                    assigned_to_name=i.get("assigned_to", {}).get("name") if i.get("assigned_to") else None,
+                    created_on=i["created_on"],
+                    updated_on=i["updated_on"]
+                ))
+            return issues
+
+    async def get_issues_for_project(self, project_id: int, assigned_to_id: int = None) -> List[IssueResponse]:
+        async with httpx.AsyncClient() as client:
+            url = f"{self.url}/issues.json?project_id={project_id}"
+            if assigned_to_id is not None:
+                url += f"&assigned_to_id={assigned_to_id}"
+            response = await client.get(url, headers=self.headers)
+            response.raise_for_status()
+            issues_data = response.json().get("issues", [])
+
+            issues = []
+            for i in issues_data:
+                issues.append(IssueResponse(
+                    id=i["id"],
+                    subject=i["subject"],
+                    description=i.get("description"),
+                    status=i["status"]["name"],
+                    priority=i["priority"]["name"],
+                    tracker=i["tracker"]["name"],
+                    project_id=i["project"]["id"],
+                    project_name=i["project"]["name"],
+                    assigned_to_name=i.get("assigned_to", {}).get("name") if i.get("assigned_to") else None,
                     created_on=i["created_on"],
                     updated_on=i["updated_on"]
                 ))

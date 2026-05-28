@@ -87,6 +87,27 @@ class ShiftService:
 
     
 
+    async def get_shifts_by_date(self, db, date_str: str, email: str = None) -> List[dict]:
+        """Fetch shifts for a specific date. If email is provided, filter by user."""
+        query = {"date": date_str}
+        if email:
+            query["userEmail"] = email
+        cursor = db.shifts.find(query).sort("userName", 1)
+        return [_serialize_shift(doc) async for doc in cursor]
+
+    async def get_shifts_by_date_range(self, db, start_date: str, end_date: str, email: str = None) -> List[dict]:
+        """Fetch shifts within a date range. If email is provided, filter by user."""
+        query = {
+            "date": {
+                "$gte": start_date,
+                "$lte": end_date
+            }
+        }
+        if email:
+            query["userEmail"] = email
+        cursor = db.shifts.find(query).sort("date", 1)
+        return [_serialize_shift(doc) async for doc in cursor]
+
     async def get_shift_history_by_email(self, db, email: str, limit: int = 10, skip: int = 0) -> List[dict]:
         """Fetch shift history for a user by email."""
         cursor = db.shifts.find({"userEmail": email}).sort("createdAt", -1).skip(skip).limit(limit)

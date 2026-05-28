@@ -35,7 +35,7 @@ async def upload_recording(
     current_user: dict = Depends(get_current_user)
 ):
     # Security: Only allow users to upload for their own email or if admin
-    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only upload recordings for your own account."
@@ -124,7 +124,7 @@ async def get_user_recordings(
     current_user: dict = Depends(get_current_user)
 ):
     # Security: Only allow users to view their own recordings or if admin
-    if current_user["email"] != email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only view your own recordings."
@@ -143,7 +143,7 @@ async def get_all_recordings(
     current_user: dict = Depends(get_current_user)
 ):
     # Security: Only admins can see all recordings
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="Admin access required."
@@ -163,14 +163,17 @@ async def mark_played(
     current_user: dict = Depends(get_current_user)
 ):
     # Security: Ensure user is marking their own recording or is admin
-    if current_user["email"] != payload.email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != payload.email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only modify your own recordings."
         )
 
+    mark_query = {"recording_url": payload.recordingUrl}
+    if "Admin" not in current_user.get("roles", []):
+        mark_query["email"] = payload.email
     result = await db.recordings.update_one(
-        {"email": payload.email, "recording_url": payload.recordingUrl},
+        mark_query,
         {"$set": {"is_played": True}}
     )
     
@@ -186,16 +189,16 @@ async def delete_recording(
     current_user: dict = Depends(get_current_user)
 ):
     # Security: Ensure user is deleting their own recording or is admin
-    if current_user["email"] != payload.email and "admin" not in current_user.get("roles", []):
+    if current_user["email"] != payload.email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only delete your own recordings."
         )
 
-    recording = await db.recordings.find_one({
-        "email": payload.email,
-        "recording_url": payload.recordingUrl
-    })
+    query = {"recording_url": payload.recordingUrl}
+    if "Admin" not in current_user.get("roles", []):
+        query["email"] = payload.email
+    recording = await db.recordings.find_one(query)
     
     if not recording:
         raise HTTPException(status_code=404, detail="Recording not found")

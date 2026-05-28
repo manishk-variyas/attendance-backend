@@ -20,7 +20,7 @@ async def authorize_shift_access(current_user: dict, target_email: str = None, t
     roles = current_user.get("roles", [])
     email = current_user.get("email")
 
-    if "admin" in roles:
+    if "Admin" in roles:
         return True
         
     # If PM or PC, they can act on behalf of others within their projects
@@ -216,7 +216,7 @@ async def get_shift_stats(
     current_user: dict = Depends(get_current_user),
 ):
     """Return aggregate statistics across all shifts. Admin only."""
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required.",
@@ -236,7 +236,7 @@ async def get_current_shift(
     """Get the most recent shift for a user by ID."""
     # First, look up the target user's email to authorize
     target_user = None
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         users = await redmine_service.get_all_users()
         target_user = next((u for u in users if u["id"] == user_id), None)
         if not target_user:
@@ -265,7 +265,7 @@ async def get_active_shift(
     current_user: dict = Depends(get_current_user),
 ):
     """Get the currently active shift for a user (if any)."""
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required.",
@@ -286,7 +286,7 @@ async def get_shifts_by_user_id(
     current_user: dict = Depends(get_current_user),
 ):
     """Get all shifts for a user by their numeric ID. Admin only."""
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required.",
@@ -310,7 +310,7 @@ async def get_shifts_by_email(
     """
     if (
         current_user["email"] != email
-        and "admin" not in current_user.get("roles", [])
+        and "Admin" not in current_user.get("roles", [])
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -320,8 +320,59 @@ async def get_shifts_by_email(
 
 
 # ------------------------------------------------------------------ #
+#  GET /api/shifts/range  — Get shifts for a date range              #
+# ------------------------------------------------------------------ #
+@router.get("/range")
+async def get_shifts_by_range(
+    start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get shifts for a specific date range.
+    For now, returns only the current user's shifts.
+    """
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+        
+    # Temporary check: Only allow Technical Resources for now
+    roles = current_user.get("roles", [])
+    if "Technical Resource" not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Currently, this feature is only available for Technical Resources.",
+        )
+    
+    return await shift_service.get_shifts_by_date_range(
+        db, 
+        start_date=start_date, 
+        end_date=end_date, 
+        email=email
+    )
+
+# ------------------------------------------------------------------ #
 #  GET /api/shifts/history  — Get shift history (last 10)            #
 # ------------------------------------------------------------------ #
+@router.get("/date/{date_str}")
+async def get_shifts_by_date(
+    date_str: str,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get shifts for a specific date.
+    - Admin/PM: returns all shifts for that date.
+    - Regular users: returns only their own shifts for that date.
+    """
+    roles = current_user.get("roles", [])
+    if "Admin" in roles or "Project Manager" in roles:
+        return await shift_service.get_shifts_by_date(db, date_str)
+
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+    return await shift_service.get_shifts_by_date(db, date_str, email=email)
+
 @router.get("/history", response_model=List[ShiftHistoryItem])
 async def get_shift_history(
     limit: int = Query(10, ge=1, le=100),
@@ -392,7 +443,7 @@ async def delete_shift(
     current_user: dict = Depends(get_current_user),
 ):
     """Delete a shift by ID. Admin only."""
-    if "admin" not in current_user.get("roles", []):
+    if "Admin" not in current_user.get("roles", []):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required.",
