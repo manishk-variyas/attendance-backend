@@ -120,5 +120,9 @@ app.include_router(location_router, prefix="/api/location", tags=["location"])
 from app.features.shifts.routes import router as shifts_router
 app.include_router(shifts_router, prefix="/api", tags=["shifts"])
 
+# Register Company Settings routes
+from app.features.settings.routes import router as settings_router
+app.include_router(settings_router, prefix="/api", tags=["settings"])
+
 # (Admin dashboard module was removed)
 

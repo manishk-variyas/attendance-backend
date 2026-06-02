@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status as fastapi_status
+from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import uuid
 import os
 from datetime import datetime, timezone
+from bson import ObjectId
 
 from app.core.mongodb import get_mongodb
 from app.features.recordings.schemas.recording import RecordingResponse, MarkPlayedRequest, DeleteRecordingRequest
@@ -22,6 +24,57 @@ ALLOWED_AUDIO_TYPES = [
     "audio/aac",     # .aac
     "audio/mp4",     # .m4a
 ]
+
+# ------------------------------------------------------------------ #
+#  GET /api/recordings/{recording_id}/play  — Proxy audio stream     #
+# ------------------------------------------------------------------ #
+# Browser cannot resolve internal MinIO hostname (minio:9000).
+# This endpoint reads the file from MinIO server-side and streams it
+# back to the browser, so no infra/DNS changes are needed.
+# ------------------------------------------------------------------ #
+@router.get("/recordings/{recording_id}/play")
+async def play_recording(
+    recording_id: str,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        recording = await db.recordings.find_one({"_id": ObjectId(recording_id)})
+    except Exception:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    if not recording:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    # Auth: user must own the recording or be an Admin
+    if current_user["email"] != recording["email"] and "Admin" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=fastapi_status.HTTP_403_FORBIDDEN,
+            detail="You can only access your own recordings.",
+        )
+
+    # Extract object name from stored URL
+    # URL format: http://minio:9000/recordings/<object_name>
+    recording_url = recording.get("recording_url", "")
+    if "/recordings/" not in recording_url:
+        raise HTTPException(status_code=500, detail="Invalid recording URL stored")
+    object_name = recording_url.split("/recordings/", 1)[1]
+
+    # Fetch file from MinIO
+    try:
+        file_content, content_type = await storage_service.get_file(object_name)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read recording from storage: {str(e)}",
+        )
+
+    return StreamingResponse(
+        iter([file_content]),
+        media_type=content_type or "audio/mpeg",
+        headers={"Content-Disposition": f'inline; filename="{recording.get("filename", "recording")}"'},
+    )
+
 
 @router.post("/upload", response_model=RecordingResponse)
 async def upload_recording(

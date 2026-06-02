@@ -115,6 +115,7 @@ class RedmineService:
             return [
                 {
                     "id": u["id"],
+                    "login": u.get("login", ""),
                     "name": f"{u['firstname']} {u['lastname']}".strip(),
                     "email": u.get("mail", ""),
                 }
@@ -336,6 +337,50 @@ class RedmineService:
             except Exception as e:
                 logger.error(f"Error fetching issue {issue_id} from Redmine: {e}")
                 return None
+
+    async def search_projects(self, query: str, limit: int = 5) -> list:
+        all_projects = await self.get_all_projects()
+        q = query.lower()
+        matched = [p for p in all_projects if q in p.get("name", "").lower()]
+        matched = matched[:limit]
+
+        result = []
+        for p in matched:
+            cf = {c["name"]: c.get("value", "") for c in p.get("custom_fields", []) if c.get("name") in ("Project Type",)}
+            members = await self.get_project_members(p["id"])
+            result.append({
+                "id": str(p["id"]),
+                "name": p["name"],
+                "identifier": p.get("identifier", ""),
+                "type": cf.get("Project Type", ""),
+                "status": "active" if p.get("status") == 1 else "closed",
+                "memberCount": len(members),
+            })
+        return result
+
+    async def search_people(self, project_ids: list, limit: int = 5) -> list:
+        seen = set()
+        result = []
+        all_projects = await self.get_all_projects()
+        project_map = {p["id"]: p["name"] for p in all_projects}
+
+        for pid in project_ids:
+            members = await self.get_project_members(pid)
+            project_name = project_map.get(pid, "")
+            for m in members:
+                if m["user_id"] in seen:
+                    continue
+                seen.add(m["user_id"])
+                result.append({
+                    "id": str(m["user_id"]),
+                    "name": m["name"],
+                    "role": ", ".join(m["roles"]),
+                    "projectName": project_name,
+                })
+                if len(result) >= limit:
+                    return result
+        return result
+
 
 redmine_service = RedmineService()
 

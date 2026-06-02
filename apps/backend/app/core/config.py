@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     MINIO_ACCESS_KEY: str = "minioadmin"
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_BUCKET_NAME: str = "recordings"
+    MINIO_ASSETS_BUCKET: str = "company-assets"
     MINIO_REGION: str = "us-east-1"
 
     # MongoDB Settings

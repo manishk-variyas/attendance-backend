@@ -1,4 +1,5 @@
 """
+
 JWT (JSON Web Token) utility functions.
 
 This module provides helper functions for working with JWT tokens

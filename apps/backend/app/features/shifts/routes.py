@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from datetime import datetime, timezone, date, timedelta, time
-from typing import List
+from typing import List, Optional
 
 from app.core.mongodb import get_mongodb
 from app.features.auth.dependencies import get_current_user
-from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftResponse, ShiftStats, ShiftHistoryItem
+from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftResponse, ShiftStats, ShiftHistoryItem, ShiftDefinitionCreate, ShiftDefinitionResponse
 from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
 
@@ -326,29 +326,55 @@ async def get_shifts_by_email(
 async def get_shifts_by_range(
     start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
+    user_id: Optional[int] = Query(None, description="User ID to view schedule for (PM/Admin only)"),
     db=Depends(get_mongodb),
     current_user: dict = Depends(get_current_user),
 ):
     """Get shifts for a specific date range.
-    For now, returns only the current user's shifts.
+    - TR: own shifts only
+    - PM: own shifts or any TR sharing a project
+    - Admin: any user
     """
-    email = current_user.get("email")
-    if not email:
-        raise HTTPException(status_code=400, detail="User email not found.")
-        
-    # Temporary check: Only allow Technical Resources for now
     roles = current_user.get("roles", [])
-    if "Technical Resource" not in roles:
+    current_email = current_user.get("email")
+    if not current_email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+
+    allowed_roles = ["Technical Resource", "Project Manager", "Admin"]
+    if not any(role in roles for role in allowed_roles):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Currently, this feature is only available for Technical Resources.",
+            detail="You are not authorized to access this feature.",
         )
-    
+
+    current_rm_user = await redmine_service.get_user_by_email(current_email)
+    if not current_rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    current_rm_id = current_rm_user["id"]
+
+    target_user_id = user_id or current_rm_id
+
+    if target_user_id != current_rm_id:
+        if "Admin" in roles:
+            pass
+        elif "Project Manager" in roles:
+            pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
+            tr_projects = await redmine_service.get_projects_for_user(target_user_id)
+            pm_project_ids = {p.id for p in pm_projects}
+            tr_project_ids = {p.id for p in tr_projects}
+            if not pm_project_ids.intersection(tr_project_ids):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only view shifts for users in your projects."
+                )
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to view other users' shifts.")
+
     return await shift_service.get_shifts_by_date_range(
-        db, 
-        start_date=start_date, 
-        end_date=end_date, 
-        email=email
+        db,
+        start_date=start_date,
+        end_date=end_date,
+        user_id=target_user_id
     )
 
 # ------------------------------------------------------------------ #
@@ -377,12 +403,53 @@ async def get_shifts_by_date(
 async def get_shift_history(
     limit: int = Query(10, ge=1, le=100),
     skip: int = Query(0, ge=0),
+    user_id: Optional[int] = Query(None, description="Admin/PM: view another user's shift history"),
     db=Depends(get_mongodb),
     current_user: dict = Depends(get_current_user),
 ):
-    """Get paginated shift history for the current user."""
+    """Get paginated shift history.
+    - No user_id: current user's own history
+    - user_id matches current user: own history
+    - user_id differs: Admin/PM only (PM must share a project with target user)
+    """
     email = current_user.get("email")
-    return await shift_service.get_shift_history_by_email(db, email, limit, skip)
+    roles = current_user.get("roles", [])
+
+    if user_id is None:
+        return await shift_service.get_shift_history_by_email(db, email, limit, skip)
+
+    current_rm_user = await redmine_service.get_user_by_email(email)
+    if not current_rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    current_rm_id = current_rm_user["id"]
+
+    if user_id == current_rm_id:
+        return await shift_service.get_shift_history_by_email(db, email, limit, skip)
+
+    if "Admin" in roles:
+        pass
+    elif "Project Manager" in roles:
+        pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
+        tr_projects = await redmine_service.get_projects_for_user(user_id)
+        pm_project_ids = {p.id for p in pm_projects}
+        tr_project_ids = {p.id for p in tr_projects}
+        if not pm_project_ids.intersection(tr_project_ids):
+            raise HTTPException(
+                status_code=403,
+                detail="You can only view shifts for users in your projects."
+            )
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to view other users' shift history."
+        )
+
+    all_users = await redmine_service.get_all_users()
+    target_user = next((u for u in all_users if u["id"] == user_id), None)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    return await shift_service.get_shift_history_by_email(db, target_user["email"], limit, skip)
 
 
 # ------------------------------------------------------------------ #
@@ -451,3 +518,84 @@ async def delete_shift(
     deleted = await shift_service.delete_shift(db, shift_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Shift not found.")
+
+
+# ------------------------------------------------------------------ #
+#  SHIFT DEFINITIONS — Admin creates, PM/PC/TR reads                 #
+# ------------------------------------------------------------------ #
+
+@router.post("/definitions", status_code=status.HTTP_201_CREATED)
+async def create_shift_definition(
+    payload: ShiftDefinitionCreate,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a shift definition (M1, A1, N, etc). Admin only."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    return await shift_service.create_shift_definition(db, payload.model_dump())
+
+
+@router.get("/definitions", response_model=List[ShiftDefinitionResponse])
+async def get_all_shift_definitions(
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all shift definitions. Accessible to all authenticated users (for dropdown)."""
+    return await shift_service.get_all_shift_definitions(db)
+
+
+@router.get("/definitions/by-code/{shift_code}", response_model=ShiftDefinitionResponse)
+async def get_shift_definition_by_code(
+    shift_code: str,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get a single shift definition by shift code (e.g. M1, GN). Accessible to all authenticated users."""
+    definition = await shift_service.get_shift_definition_by_code(db, shift_code)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Shift definition not found.")
+    return definition
+
+
+@router.get("/definitions/{shift_id}", response_model=ShiftDefinitionResponse)
+async def get_shift_definition(
+    shift_id: str,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get a single shift definition by ID."""
+    definition = await shift_service.get_shift_definition(db, shift_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Shift definition not found.")
+    return definition
+
+
+@router.put("/definitions/{shift_id}")
+async def update_shift_definition(
+    shift_id: str,
+    payload: ShiftDefinitionCreate,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update a shift definition. Admin only."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    updated = await shift_service.update_shift_definition(db, shift_id, payload.model_dump())
+    if not updated:
+        raise HTTPException(status_code=404, detail="Shift definition not found.")
+    return updated
+
+
+@router.delete("/definitions/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_shift_definition(
+    shift_id: str,
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a shift definition. Admin only."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    deleted = await shift_service.delete_shift_definition(db, shift_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Shift definition not found.")

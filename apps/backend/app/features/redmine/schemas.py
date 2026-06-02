@@ -51,3 +51,40 @@ class TimeZoneInfo(BaseModel):
     value: str
     label: str
     offset: str
+
+
+class ProjectSearchItem(BaseModel):
+    id: str
+    name: str
+    identifier: str
+    type: str
+    status: str
+    memberCount: int
+
+
+class PersonSearchItem(BaseModel):
+    id: str
+    name: str
+    role: str
+    projectName: str
+
+
+class ShiftSearchItem(BaseModel):
+    id: str
+    date: str
+    startTime: str
+    endTime: str
+    status: str
+    projectName: str
+    employeeName: str
+
+
+class SearchResults(BaseModel):
+    projects: List[ProjectSearchItem] = []
+    people: List[PersonSearchItem] = []
+    shifts: List[ShiftSearchItem] = []
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: SearchResults

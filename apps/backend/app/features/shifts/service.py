@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 from bson import ObjectId
+from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
 
@@ -95,16 +96,16 @@ class ShiftService:
         cursor = db.shifts.find(query).sort("userName", 1)
         return [_serialize_shift(doc) async for doc in cursor]
 
-    async def get_shifts_by_date_range(self, db, start_date: str, end_date: str, email: str = None) -> List[dict]:
-        """Fetch shifts within a date range. If email is provided, filter by user."""
+    async def get_shifts_by_date_range(self, db, start_date: str, end_date: str, user_id: int = None) -> List[dict]:
+        """Fetch shifts within a date range. If user_id is provided, filter by user."""
         query = {
             "date": {
                 "$gte": start_date,
                 "$lte": end_date
             }
         }
-        if email:
-            query["userEmail"] = email
+        if user_id is not None:
+            query["userId"] = user_id
         cursor = db.shifts.find(query).sort("date", 1)
         return [_serialize_shift(doc) async for doc in cursor]
 
@@ -145,6 +146,96 @@ class ShiftService:
         except Exception as e:
             logger.error(f"delete_shift error: {e}")
             return False
+
+    #ShiftCreator -- ADMIN(ONLY)
+
+    async def create_shift_definition(self, db, data: dict) -> dict:
+        existing = await db.shift_definitions.find_one({"shiftCode": data["shiftCode"]})
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Shift code '{data['shiftCode']}' already exists.",
+            )
+        now = datetime.now(timezone.utc)
+        data["createdAt"] = now
+        data["updatedAt"] = now
+        result = await db.shift_definitions.insert_one(data)
+        created = await db.shift_definitions.find_one({"_id": result.inserted_id})
+        return _serialize_shift(created)
+
+    async def get_all_shift_definitions(self, db) -> List[dict]:
+        cursor = db.shift_definitions.find().sort("shiftCode", 1)
+        return [_serialize_shift(doc) async for doc in cursor]
+
+    async def get_shift_definition_by_code(self, db, shift_code: str) -> Optional[dict]:
+        doc = await db.shift_definitions.find_one({"shiftCode": shift_code})
+        return _serialize_shift(doc)
+
+    async def get_shift_definition(self, db, shift_id: str) -> Optional[dict]:
+        try:
+            doc = await db.shift_definitions.find_one({"_id": ObjectId(shift_id)})
+            return _serialize_shift(doc)
+        except Exception:
+            return None
+
+    async def update_shift_definition(self, db, shift_id: str, data: dict) -> Optional[dict]:
+        try:
+            existing = await db.shift_definitions.find_one({"_id": ObjectId(shift_id)})
+            if not existing:
+                return None
+            if data.get("shiftCode") and data["shiftCode"] != existing["shiftCode"]:
+                dup = await db.shift_definitions.find_one({"shiftCode": data["shiftCode"]})
+                if dup:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Shift code '{data['shiftCode']}' already exists.",
+                    )
+            data["updatedAt"] = datetime.now(timezone.utc)
+            await db.shift_definitions.update_one(
+                {"_id": ObjectId(shift_id)},
+                {"$set": data},
+            )
+            return await self.get_shift_definition(db, shift_id)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"update_shift_definition error: {e}")
+            return None
+
+    async def delete_shift_definition(self, db, shift_id: str) -> bool:
+        try:
+            result = await db.shift_definitions.delete_one({"_id": ObjectId(shift_id)})
+            return result.deleted_count == 1
+        except Exception as e:
+            logger.error(f"delete_shift_definition error: {e}")
+            return False
+
+
+    #shift creator -- ADMIN ONLY
+    async def search_shifts(self, db, query: str, limit: int = 5) -> List[dict]:
+        q = query.lower()
+        cursor = db.shifts.find(
+            {"projectName": {"$regex": q, "$options": "i"}}
+        ).sort("date", -1).limit(limit)
+        result = []
+        async for doc in cursor:
+            shift = _serialize_shift(doc)
+            status_map = {
+                "OFFICE": "YET_TO_START",
+                "WFH": "WFH",
+                "ACTIVE": "ACTIVE",
+                "LEAVE": "LEAVE",
+            }
+            result.append({
+                "id": f"shift_{shift['_id']}",
+                "date": shift.get("date", ""),
+                "startTime": shift.get("shiftStartTime", ""),
+                "endTime": shift.get("shiftEndTime", ""),
+                "status": status_map.get(shift.get("workStatus", ""), "YET_TO_START"),
+                "projectName": shift.get("projectName", ""),
+                "employeeName": shift.get("userName", ""),
+            })
+        return result
 
 
 shift_service = ShiftService()

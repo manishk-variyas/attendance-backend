@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException, Depends, status
-from typing import List
-from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember
+from fastapi import APIRouter, HTTPException, Depends, status, Query
+from typing import List, Optional
+from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .constants import REDMINE_TIMEZONES
 from app.features.auth.dependencies import get_current_user
+from app.core.mongodb import get_mongodb
+from app.features.shifts.service import shift_service
 
 router = APIRouter()
 
@@ -158,22 +160,35 @@ async def get_user_issues_by_id(
     return await redmine_service.get_issues_for_user(user_id)
 
 @router.get("/my-projects", response_model=List[ProjectResponse])
-async def get_my_projects(current_user: dict = Depends(get_current_user)):
-    """Get projects for the currently logged-in user, auto-creating them in Redmine if missing."""
+async def get_my_projects(
+    user_id: Optional[int] = Query(None, description="Admin/PM/PC: view another user's projects"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get projects for a user.
+    - No user_id: currently logged-in user (auto-creates in Redmine if missing)
+    - user_id provided: Admin/PM/PC can view any user's projects
+    """
     email = current_user.get("email")
     username = current_user.get("username")
-    
-    if not email:
-        raise HTTPException(status_code=400, detail="User email not found in session")
-        
-    user = await redmine_service.get_user_by_email(email)
-    if not user:
-        # Auto-sync: Create user in Redmine if they exist in Keycloak but not Redmine
-        user = await redmine_service.create_user(username, email)
+    roles = current_user.get("roles", [])
+
+    if user_id is None:
+        if not email:
+            raise HTTPException(status_code=400, detail="User email not found in session")
+        user = await redmine_service.get_user_by_email(email)
         if not user:
-            raise HTTPException(status_code=500, detail="Failed to sync user with Redmine")
-            
-    return await redmine_service.get_projects_for_user(user["id"])
+            user = await redmine_service.create_user(username, email)
+            if not user:
+                raise HTTPException(status_code=500, detail="Failed to sync user with Redmine")
+        return await redmine_service.get_projects_for_user(user["id"])
+
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin, Project Manager, or Project Coordinator access required",
+        )
+
+    return await redmine_service.get_projects_for_user(user_id)
 
 @router.get("/my-issues", response_model=List[IssueResponse])
 async def get_my_issues(current_user: dict = Depends(get_current_user)):
@@ -200,3 +215,26 @@ async def get_project_members(
 ):
     """Get all members of a project with their roles."""
     return await redmine_service.get_project_members(project_id)
+
+
+@router.get("/search", response_model=SearchResponse)
+async def global_search(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(5, ge=1, le=50, description="Max results per section"),
+    db=Depends(get_mongodb),
+    current_user: dict = Depends(get_current_user),
+):
+    """Global search across projects, people, and shifts."""
+    projects = await redmine_service.search_projects(q, limit)
+    project_ids = [int(p["id"]) for p in projects]
+    people = await redmine_service.search_people(project_ids, limit) if project_ids else []
+    shifts = await shift_service.search_shifts(db, q, limit)
+
+    return SearchResponse(
+        query=q,
+        results=SearchResults(
+            projects=[ProjectSearchItem(**p) for p in projects],
+            people=[PersonSearchItem(**p) for p in people],
+            shifts=[ShiftSearchItem(**s) for s in shifts],
+        ),
+    )

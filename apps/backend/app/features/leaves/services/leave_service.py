@@ -54,6 +54,7 @@ class LeaveService:
             "contact_number": leave_data.contact_number,
             "resuming_date": leave_data.resuming_date,
             "leave_dates": leave_data.leave_dates,
+            "approver_id": leave_data.approver_id,
             "status": LeaveStatus.PENDING,
             "created_at": datetime.utcnow()
         }
@@ -320,9 +321,13 @@ class LeaveService:
                 raise HTTPException(status_code=403, detail="You can only approve leaves for resources in your projects.")
 
         # Update leave status to approved
+        now = datetime.utcnow()
+        actor_email = current_user.get("email")
+        actor_roles = current_user.get("roles", [])
+        actor_role = "Admin" if "Admin" in actor_roles else "Project Manager"
         result = await self.db[self.leaves_collection].update_one(
             {"_id": oid},
-            {"$set": {"status": LeaveStatus.APPROVED, "updated_at": datetime.utcnow()}}
+            {"$set": {"status": LeaveStatus.APPROVED, "updated_at": now, "approved_at": now, "approved_by": actor_email, "approved_by_role": actor_role}}
         )
         return result.modified_count > 0
 
@@ -363,50 +368,42 @@ class LeaveService:
                 raise HTTPException(status_code=403, detail="You can only reject leaves for resources in your projects.")
 
         # Update leave status to rejected
+        now = datetime.utcnow()
+        actor_email = current_user.get("email")
+        actor_roles = current_user.get("roles", [])
+        actor_role = "Admin" if "Admin" in actor_roles else "Project Manager"
         result = await self.db[self.leaves_collection].update_one(
             {"_id": oid},
-            {"$set": {"status": LeaveStatus.REJECTED, "updated_at": datetime.utcnow()}}
+            {"$set": {"status": LeaveStatus.REJECTED, "updated_at": now, "rejected_at": now, "rejected_by": actor_email, "rejected_by_role": actor_role}}
         )
         return result.modified_count > 0
 
     async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
-        """Fetch all pending leaves. PMs only see pending leaves for resources in their projects."""
+        """Fetch all pending leaves. PMs see only leaves assigned to them via approver_id."""
         roles = current_user.get("roles", [])
-        
-        # 1. Fetch all pending leaves
-        cursor = self.db[self.leaves_collection].find({"status": LeaveStatus.PENDING}).sort("created_at", -1)
-        all_pending = []
-        async for doc in cursor:
-            doc["id"] = str(doc.pop("_id"))
-            all_pending.append(doc)
 
         if "Admin" in roles:
+            cursor = self.db[self.leaves_collection].find({"status": LeaveStatus.PENDING}).sort("created_at", -1)
+            all_pending = []
+            async for doc in cursor:
+                doc["id"] = str(doc.pop("_id"))
+                all_pending.append(doc)
             return all_pending
 
-        # PM scoping
-        pm_email = current_user.get("email")
-        pm_user = await redmine_service.get_user_by_email(pm_email)
+        # PM scoping by approver_id
+        pm_user = await redmine_service.get_user_by_email(current_user.get("email"))
         if not pm_user:
             return []
 
-        pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
-        pm_project_ids = {p.id for p in pm_projects}
+        cursor = self.db[self.leaves_collection].find({
+            "status": LeaveStatus.PENDING,
+            "approver_id": pm_user["id"]
+        }).sort("created_at", -1)
 
         filtered = []
-        for leave in all_pending:
-            tr_email = leave.get("user_email")
-            if not tr_email:
-                continue
-                
-            tr_user = await redmine_service.get_user_by_email(tr_email)
-            if not tr_user:
-                continue
-                
-            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
-            tr_project_ids = {p.id for p in tr_projects}
-
-            if pm_project_ids.intersection(tr_project_ids):
-                filtered.append(leave)
+        async for doc in cursor:
+            doc["id"] = str(doc.pop("_id"))
+            filtered.append(doc)
 
         return filtered
 

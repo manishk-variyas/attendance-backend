@@ -19,6 +19,9 @@ class ShiftCreate(BaseModel):
     shiftEndTime: str               # "HH:MM"
     shiftStartUTC: Optional[datetime] = None
     shiftEndUTC: Optional[datetime] = None
+    shiftName: str
+    timezone: str = "Asia/Kolkata"
+    country: str = ""
 
 
 class ShiftBulkCreate(BaseModel):
@@ -102,3 +105,26 @@ class ShiftHistoryItem(BaseModel):
     shiftStartTime: str
     shiftEndTime: str
     createdAt: Optional[datetime] = None
+
+
+class ShiftDefinitionCreate(BaseModel):
+    shiftCode: str
+    shiftName: str
+    startTime: str
+    endTime: str
+    timezone: str = "Asia/Kolkata"
+    country: str = ""
+
+
+class ShiftDefinitionResponse(BaseModel):
+    id: str = Field(alias="_id")
+    shiftCode: str
+    shiftName: str
+    startTime: str
+    endTime: str
+    timezone: str
+    country: str
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+
+   

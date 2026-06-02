@@ -23,6 +23,7 @@ class LeaveApplyRequest(BaseModel):
     contact_number: Optional[str] = None
     resuming_date: Optional[datetime] = None
     leave_dates: Optional[List[datetime]] = None
+    approver_id: Optional[int] = None
 
 class LeaveHistoryItem(BaseModel):
     id: str
@@ -38,8 +39,15 @@ class LeaveHistoryItem(BaseModel):
     resuming_date: Optional[datetime] = None
     leave_dates: Optional[List[datetime]] = None
     status: LeaveStatus
+    approver_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    approved_at: Optional[datetime] = None
+    rejected_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    rejected_by: Optional[str] = None
+    approved_by_role: Optional[str] = None
+    rejected_by_role: Optional[str] = None
 
 class LeaveStats(BaseModel):
     total_earned: float = 0.0
