@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from typing import List
+from bson import ObjectId
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
@@ -8,7 +9,9 @@ from app.features.leaves.schemas.leaves import (
     Holiday
 )
 from app.features.leaves.services.leave_service import leave_service
+from app.features.notifications.services.notification_service import notification_service
 from app.features.redmine.service import redmine_service
+from app.core.mongodb import get_mongodb
 import logging
 
 logger = logging.getLogger(__name__)
@@ -144,6 +147,27 @@ async def apply_leave(
     user_id = current_user.get("sub")
     email = current_user.get("email")
     leave_id = await leave_service.apply_for_leave(user_id, email, leave_data)
+
+    # Notify the approver
+    if leave_data.approver_id:
+        try:
+            all_users = await redmine_service.get_all_users()
+            approver = next(
+                (u for u in all_users if str(u["id"]) == str(leave_data.approver_id)),
+                None,
+            )
+            if approver:
+                user_name = current_user.get("username") or email
+                await notification_service.create_notification(
+                    user_id=approver["email"],
+                    type="leave_applied",
+                    message=f"{user_name} applied for {leave_data.leave_type} leave",
+                    from_user=email,
+                    reference_id=leave_id,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to create notification: {e}")
+
     return {"message": "Leave application submitted successfully", "leave_id": leave_id}
 
 @router.get("/pending")
@@ -189,6 +213,22 @@ async def approve_leave(
             detail="Leave application not found or unauthorized."
         )
 
+    # Notify the applicant
+    try:
+        db = get_mongodb()
+        leave_doc = await db["leaves"].find_one({"_id": ObjectId(leave_id)})
+        if leave_doc:
+            actor_name = current_user.get("username") or current_user.get("email")
+            await notification_service.create_notification(
+                user_id=leave_doc["user_email"],
+                type="leave_approved",
+                message=f"Your leave has been approved by {actor_name}",
+                from_user=current_user["email"],
+                reference_id=leave_id,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to create notification: {e}")
+
     return {"message": "Leave application approved successfully"}
 
 
@@ -215,5 +255,21 @@ async def reject_leave(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Leave application not found or unauthorized."
         )
+
+    # Notify the applicant
+    try:
+        db = get_mongodb()
+        leave_doc = await db["leaves"].find_one({"_id": ObjectId(leave_id)})
+        if leave_doc:
+            actor_name = current_user.get("username") or current_user.get("email")
+            await notification_service.create_notification(
+                user_id=leave_doc["user_email"],
+                type="leave_rejected",
+                message=f"Your leave has been rejected by {actor_name}",
+                from_user=current_user["email"],
+                reference_id=leave_id,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to create notification: {e}")
 
     return {"message": "Leave application rejected successfully"}

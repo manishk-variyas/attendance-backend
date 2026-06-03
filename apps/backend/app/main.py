@@ -112,6 +112,10 @@ app.include_router(recordings_router, prefix="/api", tags=["recordings"])
 from app.features.leaves.routes import router as leaves_router
 app.include_router(leaves_router, prefix="/api", tags=["leaves"])
 
+# Register Notification routes
+from app.features.notifications.routes import router as notifications_router
+app.include_router(notifications_router, prefix="/api", tags=["notifications"])
+
 # Register Location Tracking routes
 from app.features.location.routes import router as location_router
 app.include_router(location_router, prefix="/api/location", tags=["location"])

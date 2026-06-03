@@ -27,12 +27,27 @@ class LeaveService:
     async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> str:
         """Submit a new leave application with overlap protection."""
         
-        # Check for overlapping leaves (Approved or Pending)
+        # Normalise dates to start-of-day (00:00:00) so time components dont
+        # cause false negatives when comparing same calendar dates.
+        start = leave_data.start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = leave_data.end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        # OLD approach — used raw user-supplied datetimes which could
+        # contain non-midnight time components, allowing duplicate
+        # applications for the same day.
+        #
+        # overlap_query = {
+        #     "user_id": user_id,
+        #     "status": {"$in": [LeaveStatus.APPROVED, LeaveStatus.PENDING]},
+        #     "start_date": {"$lte": leave_data.end_date},
+        #     "end_date": {"$gte": leave_data.start_date}
+        # }
+
         overlap_query = {
             "user_id": user_id,
             "status": {"$in": [LeaveStatus.APPROVED, LeaveStatus.PENDING]},
-            "start_date": {"$lte": leave_data.end_date},
-            "end_date": {"$gte": leave_data.start_date}
+            "start_date": {"$lte": end},
+            "end_date": {"$gte": start}
         }
         
         existing_overlap = await self.db[self.leaves_collection].find_one(overlap_query)
