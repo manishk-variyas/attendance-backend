@@ -4,63 +4,52 @@ from typing import List, Optional
 import uuid
 import os
 from datetime import datetime, timezone
-from bson import ObjectId
+from sqlalchemy.orm import Session
 
-from app.core.mongodb import get_mongodb
+from app.core.database import get_db
 from app.features.recordings.schemas.recording import RecordingResponse, MarkPlayedRequest, DeleteRecordingRequest
 from app.utils.storage import storage_service
 from app.features.redmine.service import redmine_service
 from app.features.auth.dependencies import get_current_user
+from app.services.database.recording_service import RecordingService
+from app.models.recording import Recording
 
 router = APIRouter()
 
 
 ALLOWED_AUDIO_TYPES = [
-    "audio/mpeg",    # .mp3
-    "audio/wav",     # .wav
-    "audio/x-wav",   # .wav
-    "audio/ogg",     # .ogg
-    "audio/webm",    # .webm
-    "audio/aac",     # .aac
-    "audio/mp4",     # .m4a
+    "audio/mpeg",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/webm",
+    "audio/aac",
+    "audio/mp4",
 ]
 
-# ------------------------------------------------------------------ #
-#  GET /api/recordings/{recording_id}/play  — Proxy audio stream     #
-# ------------------------------------------------------------------ #
-# Browser cannot resolve internal MinIO hostname (minio:9000).
-# This endpoint reads the file from MinIO server-side and streams it
-# back to the browser, so no infra/DNS changes are needed.
-# ------------------------------------------------------------------ #
+
 @router.get("/recordings/{recording_id}/play")
 async def play_recording(
     recording_id: str,
-    db=Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    try:
-        recording = await db.recordings.find_one({"_id": ObjectId(recording_id)})
-    except Exception:
-        raise HTTPException(status_code=404, detail="Recording not found")
-
+    svc = RecordingService(db)
+    recording = svc.fetch_one(Recording, id=recording_id)
     if not recording:
         raise HTTPException(status_code=404, detail="Recording not found")
 
-    # Auth: user must own the recording or be an Admin
-    if current_user["email"] != recording["email"] and "Admin" not in current_user.get("roles", []):
+    if current_user["email"] != recording.user_email and "Admin" not in current_user.get("roles", []):
         raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only access your own recordings.",
         )
 
-    # Extract object name from stored URL
-    # URL format: http://minio:9000/recordings/<object_name>
-    recording_url = recording.get("recording_url", "")
+    recording_url = recording.recording_url or ""
     if "/recordings/" not in recording_url:
         raise HTTPException(status_code=500, detail="Invalid recording URL stored")
     object_name = recording_url.split("/recordings/", 1)[1]
 
-    # Fetch file from MinIO
     try:
         file_content, content_type = await storage_service.get_file(object_name)
     except Exception as e:
@@ -72,7 +61,7 @@ async def play_recording(
     return StreamingResponse(
         iter([file_content]),
         media_type=content_type or "audio/mpeg",
-        headers={"Content-Disposition": f'inline; filename="{recording.get("filename", "recording")}"'},
+        headers={"Content-Disposition": f'inline; filename="{recording.filename}"'},
     )
 
 
@@ -84,65 +73,46 @@ async def upload_recording(
     priority: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
     audio: UploadFile = File(...),
-    db = Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Security: Only allow users to upload for their own email or if admin
     if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only upload recordings for your own account."
         )
 
-    # Validate MIME type
     if audio.content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(
             status_code=fastapi_status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid file type: {audio.content_type}. Only audio files are allowed."
         )
 
-    # Redmine Enrichment: Fetch official data if ticketId is provided
-    redmine_data = {}
+    ticket_id_int = None
     if ticketId:
         try:
             issue = await redmine_service.get_issue_by_id(int(ticketId))
             if not issue:
                 raise HTTPException(
                     status_code=fastapi_status.HTTP_404_NOT_FOUND,
-                    detail=f"Redmine Ticket ID {ticketId} not found. Cannot associate recording."
+                    detail=f"Redmine Ticket ID {ticketId} not found."
                 )
-            # Override provided fields with official Redmine data
             project = issue["project"]["name"]
             priority = issue["priority"]["name"]
             status = issue["status"]["name"]
-            redmine_data = {
-                "redmine_project_id": issue["project"]["id"],
-                "redmine_status_id": issue["status"]["id"],
-                "redmine_priority_id": issue["priority"]["id"],
-                "subject": issue["subject"]
-            }
+            ticket_id_int = int(ticketId)
         except ValueError:
              raise HTTPException(status_code=fastapi_status.HTTP_400_BAD_REQUEST, detail="Invalid Ticket ID format. Must be numeric.")
 
-    # Create a unique filename and path
     ext = os.path.splitext(audio.filename)[1] or ".mp3"
-    
-    # OLD APPROACH: Store by email
-    # unique_filename = f"{uuid.uuid4()}{ext}"
-    # object_name = f"{email}/{unique_filename}"
-    
-    # NEW APPROACH: Store by username/date/timestamp_uuid
     now = datetime.now(timezone.utc)
     date_folder = now.strftime("%Y-%m-%d")
     time_prefix = now.strftime("%H%M%S")
-    username = current_user.get("username", email) # Use username from session, fallback to email if missing
+    username = current_user.get("username", email)
     short_uuid = uuid.uuid4().hex[:8]
     object_name = f"{username}/{date_folder}/{time_prefix}_{short_uuid}{ext}"
-
-    # Read file content
     content = await audio.read()
-    
-    # Upload to MinIO
+
     try:
         recording_url = await storage_service.upload_file(content, object_name)
     except Exception as e:
@@ -151,8 +121,21 @@ async def upload_recording(
             detail=f"Failed to upload to storage: {str(e)}"
         )
 
-    # Save metadata to MongoDB
-    recording_data = {
+    svc = RecordingService(db)
+    keycloak_user_id = current_user.get("sub", "")
+    rec = svc.create(Recording,
+        keycloak_user_id=keycloak_user_id,
+        user_email=email,
+        ticket_id=ticket_id_int,
+        project=project,
+        priority=priority,
+        status=status,
+        filename=audio.filename,
+        recording_url=recording_url,
+    )
+
+    return {
+        "id": str(rec.id),
         "email": email,
         "ticket_id": ticketId,
         "project": project,
@@ -161,111 +144,119 @@ async def upload_recording(
         "filename": audio.filename,
         "recording_url": recording_url,
         "is_played": False,
-        "created_at": datetime.now(timezone.utc),
-        "redmine_details": redmine_data
+        "created_at": rec.created_at,
     }
-    
-    result = await db.recordings.insert_one(recording_data)
-    recording_data["id"] = str(result.inserted_id) # Schema expects 'id'
-    
-    return recording_data
+
 
 @router.get("/my-recordings/{email}", response_model=List[RecordingResponse])
 async def get_user_recordings(
-    email: str, 
-    db = Depends(get_mongodb),
+    email: str,
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Security: Only allow users to view their own recordings or if admin
     if current_user["email"] != email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only view your own recordings."
         )
 
-    cursor = db.recordings.find({"email": email})
-    recordings = []
-    async for doc in cursor:
-        doc["id"] = str(doc["_id"])
-        recordings.append(doc)
-    return recordings
+    svc = RecordingService(db)
+    recordings = svc.fetch_by_email(email)
+    return [
+        {
+            "id": str(r.id),
+            "email": r.user_email,
+            "ticket_id": str(r.ticket_id) if r.ticket_id else None,
+            "project": r.project,
+            "priority": r.priority,
+            "status": r.status,
+            "filename": r.filename,
+            "recording_url": r.recording_url,
+            "is_played": r.is_played,
+            "created_at": r.created_at,
+        }
+        for r in recordings
+    ]
+
 
 @router.get("/all-recordings", response_model=List[RecordingResponse])
 async def get_all_recordings(
-    db = Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Security: Only admins can see all recordings
     if "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="Admin access required."
         )
 
-    cursor = db.recordings.find({})
-    recordings = []
-    async for doc in cursor:
-        doc["id"] = str(doc["_id"])
-        recordings.append(doc)
-    return recordings
+    svc = RecordingService(db)
+    recordings = svc.fetch_all()
+    return [
+        {
+            "id": str(r.id),
+            "email": r.user_email,
+            "ticket_id": str(r.ticket_id) if r.ticket_id else None,
+            "project": r.project,
+            "priority": r.priority,
+            "status": r.status,
+            "filename": r.filename,
+            "recording_url": r.recording_url,
+            "is_played": r.is_played,
+            "created_at": r.created_at,
+        }
+        for r in recordings
+    ]
+
 
 @router.post("/mark-played")
 async def mark_played(
-    payload: MarkPlayedRequest, 
-    db = Depends(get_mongodb),
+    payload: MarkPlayedRequest,
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Security: Ensure user is marking their own recording or is admin
     if current_user["email"] != payload.email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only modify your own recordings."
         )
 
-    mark_query = {"recording_url": payload.recordingUrl}
-    if "Admin" not in current_user.get("roles", []):
-        mark_query["email"] = payload.email
-    result = await db.recordings.update_one(
-        mark_query,
-        {"$set": {"is_played": True}}
-    )
-    
-    if result.matched_count == 0:
+    svc = RecordingService(db)
+    rec = svc.fetch_by_url(payload.recordingUrl)
+    if not rec:
         raise HTTPException(status_code=404, detail="Recording not found")
-        
+    if "Admin" not in current_user.get("roles", []) and rec.user_email != payload.email:
+        raise HTTPException(status_code=403, detail="You can only modify your own recordings.")
+
+    svc.mark_played(rec.id)
     return {"message": "Recording marked as played"}
+
 
 @router.delete("/delete-recording")
 async def delete_recording(
-    payload: DeleteRecordingRequest, 
-    db = Depends(get_mongodb),
+    payload: DeleteRecordingRequest,
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    # Security: Ensure user is deleting their own recording or is admin
     if current_user["email"] != payload.email and "Admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=fastapi_status.HTTP_403_FORBIDDEN,
             detail="You can only delete your own recordings."
         )
 
-    query = {"recording_url": payload.recordingUrl}
-    if "Admin" not in current_user.get("roles", []):
-        query["email"] = payload.email
-    recording = await db.recordings.find_one(query)
-    
-    if not recording:
+    svc = RecordingService(db)
+    rec = svc.fetch_by_url(payload.recordingUrl)
+    if not rec:
         raise HTTPException(status_code=404, detail="Recording not found")
-    
-    # Extract object name from URL
-    try:
-        # Robust extraction: get everything after the bucket name (recordings)
-        # URL format: http://.../recordings/path/to/file.mp3
-        if "/recordings/" in payload.recordingUrl:
-            full_object_name = payload.recordingUrl.split("/recordings/")[1]
+    if "Admin" not in current_user.get("roles", []) and rec.user_email != payload.email:
+        raise HTTPException(status_code=403, detail="You can only delete your own recordings.")
+
+    if "/recordings/" in payload.recordingUrl:
+        full_object_name = payload.recordingUrl.split("/recordings/")[1]
+        try:
             await storage_service.delete_file(full_object_name)
-    except Exception as e:
-        print(f"Delete error: {e}")
-        pass
-        
-    await db.recordings.delete_one({"_id": recording["_id"]})
+        except Exception as e:
+            print(f"Delete error: {e}")
+
+    svc.delete(Recording, rec.id)
     return {"message": "Recording deleted successfully"}

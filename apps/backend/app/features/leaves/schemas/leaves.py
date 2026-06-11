@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Optional
 from enum import Enum
 
@@ -65,8 +65,43 @@ class HolidayType(str, Enum):
 class Holiday(BaseModel):
     country_code: str
     region: Optional[str] = None
-    holiday_date: str
+    holiday_date: date
     holiday_name: str
     holiday_type: HolidayType
     is_national: bool
+
+
+class LeaveBalanceCreate(BaseModel):
+    user_email: str = Field(..., description="Employee's email — resolves to their keycloak_user_id")
+    year: int = Field(default_factory=lambda: datetime.now().year)
+    total_earned: float = 12.0
+    used_earned: float = 0.0
+    accrued_compoff: float = 0.0
+    consumed_compoff: float = 0.0
+    unpaid: float = 0.0
+
+
+class LeaveBalanceUpdate(BaseModel):
+    year: Optional[int] = None
+    total_earned: Optional[float] = None
+    used_earned: Optional[float] = None
+    accrued_compoff: Optional[float] = None
+    consumed_compoff: Optional[float] = None
+    unpaid: Optional[float] = None
+
+
+class LeaveBalanceResponse(BaseModel):
+    id: str
+    keycloak_user_id: str
+    year: int
+    total_earned: float
+    used_earned: float
+    accrued_compoff: float
+    consumed_compoff: float
+    unpaid: float
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
 

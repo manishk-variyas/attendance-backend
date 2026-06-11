@@ -17,6 +17,6 @@ include:
   - nginx/docker-compose.yml
   - redmine/docker-compose.yml
   - minio/docker-compose.yml
-  - mongodb/docker-compose.yml
+  - postgres/docker-compose.yml
 
 

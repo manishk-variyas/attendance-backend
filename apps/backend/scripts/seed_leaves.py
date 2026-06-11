@@ -3,37 +3,38 @@ import sys
 import os
 from datetime import datetime, timedelta
 
-# Add the app directory to sys.path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from app.core.mongodb import connect_to_mongo, close_mongo_connection, get_mongodb
-from app.core.config import settings
+from app.core.database import SessionLocal, init_db
+from app.models.holiday import Holiday
+from app.services.database.holiday_service import HolidayService
+
 
 async def seed_data():
-    await connect_to_mongo()
-    db = get_mongodb()
+    print("Initializing tables...")
+    init_db()
 
-    print("Seeding Holidays...")
-    holidays_collection = db["holidays"]
-    await holidays_collection.delete_many({}) # Clear existing
-    
-    current_year = datetime.now().year
-    holidays = [
-        {"date": datetime(current_year, 1, 1), "name": "New Year's Day", "description": "Public Holiday"},
-        {"date": datetime(current_year, 1, 26), "name": "Republic Day", "description": "National Holiday"},
-        {"date": datetime(current_year, 8, 15), "name": "Independence Day", "description": "National Holiday"},
-        {"date": datetime(current_year, 10, 2), "name": "Gandhi Jayanti", "description": "National Holiday"},
-        {"date": datetime(current_year, 12, 25), "name": "Christmas", "description": "Public Holiday"},
-    ]
-    await holidays_collection.insert_many(holidays)
-    print(f"Inserted {len(holidays)} holidays.")
+    db = SessionLocal()
+    try:
+        svc = HolidayService(db)
+        print("Seeding Holidays...")
+        for h in svc.fetch_all(Holiday):
+            svc.delete(Holiday, h.id)
 
-    print("Seeding example Leave Balances...")
-    # Note: In a real app, you'd seed this for all users or on user creation
-    # For now, we'll leave it empty or add a placeholder for a specific user ID if known
-    # but the API handles the missing doc gracefully.
-    
-    await close_mongo_connection()
+        current_year = datetime.now().year
+        holidays = [
+            {"country_code": "IN", "holiday_date": datetime(current_year, 1, 1).date(), "holiday_name": "New Year's Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "holiday_date": datetime(current_year, 1, 26).date(), "holiday_name": "Republic Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "holiday_date": datetime(current_year, 8, 15).date(), "holiday_name": "Independence Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "holiday_date": datetime(current_year, 10, 2).date(), "holiday_name": "Gandhi Jayanti", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "holiday_date": datetime(current_year, 12, 25).date(), "holiday_name": "Christmas", "holiday_type": "GAZETTED", "is_national": False},
+        ]
+        for h in holidays:
+            svc.create(Holiday, **h)
+        print(f"Inserted {len(holidays)} holidays.")
+        print("Done!")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     asyncio.run(seed_data())

@@ -63,9 +63,7 @@ class Settings(BaseSettings):
     MINIO_ASSETS_BUCKET: str = "company-assets"
     MINIO_REGION: str = "us-east-1"
 
-    # MongoDB Settings
-    MONGO_URL: str = "mongodb://admin:adminpassword@mongodb:27017"
-    MONGO_DB_NAME: str = "attendance_db"
+
 
 
 

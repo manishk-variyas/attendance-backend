@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: backend_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${BACKEND_POSTGRES_DB:-attendance}
+      POSTGRES_USER: ${BACKEND_POSTGRES_USER:-backend_user}
+      POSTGRES_PASSWORD: ${BACKEND_POSTGRES_PASSWORD:-backend_password}
+    volumes:
+      - backend_postgres_data:/var/lib/postgresql/data
+    ports:
+      # - "127.0.0.1:5432:5432"
+      - "5432:5432"
+    networks:
+      - infra-network
+
+volumes:
+  backend_postgres_data:
+
+networks:
+  infra-network:
+    driver: bridge

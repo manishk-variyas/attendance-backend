@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from typing import List
-from bson import ObjectId
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
@@ -8,10 +7,10 @@ from app.features.leaves.schemas.leaves import (
     LeaveStats, 
     Holiday
 )
-from app.features.leaves.services.leave_service import leave_service
+from app.features.leaves.services.leave_service import LeaveBusinessService
+from app.services.database.dependencies import get_leave_business_service
 from app.features.notifications.services.notification_service import notification_service
 from app.features.redmine.service import redmine_service
-from app.core.mongodb import get_mongodb
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,7 +18,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/leaves", tags=["leaves"])
 
 @router.get("/stats", response_model=LeaveStats)
-async def get_stats(current_user: dict = Depends(get_current_user)):
+async def get_stats(
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
     """Get summarized leave stats for the dashboard cards."""
     user_id = current_user.get("sub")
     stats = await leave_service.get_leave_stats(user_id)
@@ -30,7 +32,8 @@ async def get_user_leave_history(
     email: str,
     limit: int = Query(10, ge=1),
     skip: int = Query(0, ge=0),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Get leave history for a specific user.
     - Admin: Any user.
@@ -47,7 +50,8 @@ async def get_user_leave_history(
 
 @router.get("/users")
 async def list_leave_users(
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Get list of users whose leaves can be viewed.
     - Admin: All Redmine users.
@@ -65,7 +69,8 @@ async def list_leave_users(
 async def get_history(
     limit: int = Query(10, ge=1),
     skip: int = Query(0, ge=0),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Get paginated leave application history."""
     user_id = current_user.get("sub")
@@ -76,7 +81,8 @@ async def get_history(
 async def get_holidays(
     limit: int = Query(10, ge=1, le=100),
     skip: int = Query(0, ge=0),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Get the holiday calendar with pagination."""
     return await leave_service.get_holidays(limit, skip)
@@ -88,7 +94,8 @@ async def upload_holidays(
     request: Request,
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
-    _:None = Depends(require_admin)
+    _:None = Depends(require_admin),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Upload Excel file to sync holidays. (Admins only)"""
     #roles = current_user.get("roles", [])
@@ -141,7 +148,8 @@ async def upload_holidays(
 @router.post("/apply")
 async def apply_leave(
     leave_data: LeaveApplyRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Submit a new leave application."""
     user_id = current_user.get("sub")
@@ -172,7 +180,8 @@ async def apply_leave(
 
 @router.get("/pending")
 async def get_pending_leaves(
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """
     Get all pending leave requests.
@@ -192,7 +201,8 @@ async def get_pending_leaves(
 @router.post("/{leave_id}/approve")
 async def approve_leave(
     leave_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """
     Approve a leave application.
@@ -215,12 +225,12 @@ async def approve_leave(
 
     # Notify the applicant
     try:
-        db = get_mongodb()
-        leave_doc = await db["leaves"].find_one({"_id": ObjectId(leave_id)})
+        from app.models.leave import Leave
+        leave_doc = leave_service.leave_db.fetch_one(Leave, id=leave_id)
         if leave_doc:
             actor_name = current_user.get("username") or current_user.get("email")
             await notification_service.create_notification(
-                user_id=leave_doc["user_email"],
+                user_id=leave_doc.user_email,
                 type="leave_approved",
                 message=f"Your leave has been approved by {actor_name}",
                 from_user=current_user["email"],
@@ -235,7 +245,8 @@ async def approve_leave(
 @router.post("/{leave_id}/reject")
 async def reject_leave(
     leave_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """
     Reject a leave application.
@@ -258,12 +269,12 @@ async def reject_leave(
 
     # Notify the applicant
     try:
-        db = get_mongodb()
-        leave_doc = await db["leaves"].find_one({"_id": ObjectId(leave_id)})
+        from app.models.leave import Leave
+        leave_doc = leave_service.leave_db.fetch_one(Leave, id=leave_id)
         if leave_doc:
             actor_name = current_user.get("username") or current_user.get("email")
             await notification_service.create_notification(
-                user_id=leave_doc["user_email"],
+                user_id=leave_doc.user_email,
                 type="leave_rejected",
                 message=f"Your leave has been rejected by {actor_name}",
                 from_user=current_user["email"],

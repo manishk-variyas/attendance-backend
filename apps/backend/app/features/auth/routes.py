@@ -28,7 +28,7 @@ from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_k
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
-from app.features.auth.schemas import SignupRequest, SignupResponse
+from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse
 from app.features.redmine.service import redmine_service
 
 logger = logging.getLogger(__name__)
@@ -37,12 +37,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login")
 @limiter.limit(LOGIN_RATE_LIMIT)
-async def login(request: Request, username: str, password: str):
+async def login(request: Request, payload: LoginRequest):
     """
     Login endpoint - authenticates user with Keycloak and creates a server-side session.
     
     How it works:
-    1. Receives username and password from the request
+    1. Receives username and password from the request body
     2. Sends these to Keycloak's token endpoint (with client credentials)
     3. If valid, Keycloak returns access_token, refresh_token, etc.
     4. Extracts user info from the access token
@@ -62,8 +62,8 @@ async def login(request: Request, username: str, password: str):
                 "grant_type": "password",
                 "client_id": settings.KEYCLOAK_CLIENT_ID,
                 "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
-                "username": username,
-                "password": password,
+                "username": payload.username,
+                "password": payload.password,
                 "scope": "openid profile email offline_access",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -71,8 +71,8 @@ async def login(request: Request, username: str, password: str):
 
     # If Keycloak says no, log the failure and return 401
     if response.status_code != 200:
-        logger.warning(f"Login failed for user: {username}")
-        log_login(correlation_id, username, success=False, client_ip=client_ip)
+        logger.warning(f"Login failed for user: {payload.username}")
+        log_login(correlation_id, payload.username, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     # Extract tokens from Keycloak's response
@@ -82,13 +82,13 @@ async def login(request: Request, username: str, password: str):
 
     # Make sure we got a valid user ID from the token
     if not user_data.get("sub"):
-        log_login(correlation_id, username, success=False, client_ip=client_ip, extra={"reason": "missing_sub"})
+        log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "missing_sub"})
         raise HTTPException(status_code=401, detail="Failed to extract user info")
 
     # Create a new session in server memory with user data and refresh token
     session_id = await create_session(user_data, tokens.get("refresh_token"))
 
-    log_login(correlation_id, username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
+    log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
 
     # Send response with session cookie
     response = JSONResponse({"message": "Login successful", "user": user_data})

@@ -4,7 +4,8 @@ from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResp
 from .service import redmine_service
 from .constants import REDMINE_TIMEZONES
 from app.features.auth.dependencies import get_current_user
-from app.core.mongodb import get_mongodb
+from sqlalchemy.orm import Session
+from app.core.database import get_db
 from app.features.shifts.service import shift_service
 
 router = APIRouter()
@@ -221,7 +222,7 @@ async def get_project_members(
 async def global_search(
     q: str = Query(..., min_length=1, description="Search query"),
     limit: int = Query(5, ge=1, le=50, description="Max results per section"),
-    db=Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     """Global search across projects, people, and shifts."""

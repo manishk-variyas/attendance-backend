@@ -11,7 +11,7 @@ It provides:
 Note: Currently the database is mainly used by Keycloak (user data).
 This backend stores sessions in Redis, not PostgreSQL.
 """
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from app.core.config import settings
 from app.core.models import Base
@@ -28,6 +28,30 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Create all database tables based on SQLAlchemy models."""
     Base.metadata.create_all(bind=engine)
+    _run_migrations()
+
+
+def _run_migrations():
+    """Run any pending schema migrations."""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='shifts' AND column_name='project_id'
+                ) THEN
+                    ALTER TABLE shifts ADD COLUMN project_id INTEGER;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='shifts' AND column_name='project_name'
+                ) THEN
+                    ALTER TABLE shifts ADD COLUMN project_name VARCHAR(255);
+                END IF;
+            END $$;
+        """))
+        conn.commit()
 
 
 def get_db():

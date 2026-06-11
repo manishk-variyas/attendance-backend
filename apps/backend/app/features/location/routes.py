@@ -1,66 +1,55 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from datetime import datetime, timezone
-from app.core.mongodb import get_mongodb
+from sqlalchemy.orm import Session
+from app.core.database import get_db
 from app.features.location.schemas.location import LocationSaveRequest, LocationResponse
 from app.features.auth.dependencies import get_current_user
+from app.services.database.location_service import LocationService
 
 router = APIRouter()
 
 @router.post("", response_model=LocationResponse)
 async def save_location(
     payload: LocationSaveRequest,
-    db = Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Save or update user location metadata in MongoDB.
-    Requires a valid session.
-    """
-    # Security: Ensure the user is updating their own location or is an admin
     if current_user["email"] != payload.email and "admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only update your own location."
         )
 
-    location_data = {
-        "email": payload.email,
-        "latitude": payload.latitude,
-        "longitude": payload.longitude,
-        "updated_at": datetime.now(timezone.utc)
+    svc = LocationService(db)
+    loc = svc.upsert(email=payload.email, latitude=payload.latitude, longitude=payload.longitude)
+    return {
+        "email": loc.email,
+        "latitude": loc.latitude,
+        "longitude": loc.longitude,
+        "updated_at": loc.updated_at,
     }
-    
-    # Update if exists, else insert
-    await db.locations.update_one(
-        {"email": payload.email},
-        {"$set": location_data},
-        upsert=True
-    )
-    
-    return location_data
 
 @router.get("/{email}", response_model=LocationResponse)
 async def get_location(
     email: str,
-    db = Depends(get_mongodb),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Retrieve user location from MongoDB.
-    Requires a valid session.
-    """
-    # Security: Ensure the user is viewing their own location or is an admin
     if current_user["email"] != email and "admin" not in current_user.get("roles", []):
          raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only view your own location."
         )
-    location = await db.locations.find_one({"email": email})
-    
-    if not location:
+    svc = LocationService(db)
+    loc = svc.fetch_by_email(email)
+    if not loc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Location not found for email: {email}"
         )
-        
-    return location
+    return {
+        "email": loc.email,
+        "latitude": loc.latitude,
+        "longitude": loc.longitude,
+        "updated_at": loc.updated_at,
+    }

@@ -1,378 +1,264 @@
-# Database Tables / Collections & Relationships
+# Database Tables & Relationships (PostgreSQL)
 
 ## Overview
 
-This application uses a **polyglot persistence** architecture with multiple storage systems:
+This document describes the **target PostgreSQL schema** defined via SQLAlchemy models in `app/models/`. The application is currently migrating from MongoDB to PostgreSQL.
 
-| System | Purpose |
-|--------|---------|
-| **MongoDB** | Primary application data (shifts, leaves, notifications, recordings, locations, settings) |
-| **Keycloak (PostgreSQL)** | User identity, authentication, roles (managed by Keycloak, not this backend) |
-| **Redmine (PostgreSQL)** | Project management (users, projects, memberships, issues — accessed via REST API) |
-| **MinIO (S3)** | Object storage (audio recordings, company logo) |
-| **In-memory** | User sessions (session_id → user data, temporary) |
+| Data Layer | Status |
+|------------|--------|
+| **PostgreSQL (App)** — `attendance_app` | Target — models defined in `app/models/` |
+| **PostgreSQL (Keycloak)** — `keycloak` | External — managed by Keycloak |
+| **Redmine (PostgreSQL)** | External — accessed via REST API |
+| **MinIO (S3)** | Object storage — no change |
+| **MongoDB** — `attendance_db` | Legacy — being migrated from |
 
 ---
 
-## MongoDB Collections (`attendance_db`)
+## Application PostgreSQL Tables
 
 ### 1. `shifts`
 Employee shift records.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `userId` | int | Redmine user ID |
-| `userName` | string | Display name |
-| `userEmail` | string | Email (links to Redmine user) |
-| `projectId` | int | Redmine project ID |
-| `projectName` | string | Project name |
-| `shift` | string | Shift type code (e.g. "general", "morning", "night") |
-| `workStatus` | string | OFFICE, WFH, ACTIVE, LEAVE, PRESENT, CUSTOMER_SITE |
-| `workAddress` | string | Work location address |
-| `leaveType` | string | Leave type if status=LEAVE |
-| `date` | string | Shift date (YYYY-MM-DD) |
-| `endDate` | string | End date for multi-day shifts |
-| `shiftStartTime` | string | Start time (HH:MM) |
-| `shiftEndTime` | string | End time (HH:MM) |
-| `shiftStartUTC` | datetime | UTC start timestamp |
-| `shiftEndUTC` | datetime | UTC end timestamp |
-| `shiftName` | string | Shift definition name |
-| `timezone` | string | IANA timezone |
-| `country` | string | Country code |
-| `createdAt` | datetime | Creation timestamp |
-| `updatedAt` | datetime | Last update timestamp |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK, default `uuid4` | Primary key (replaces ObjectId) |
+| `user_id` | `INTEGER` | NOT NULL, INDEX | Redmine user ID |
+| `user_name` | `VARCHAR(255)` | NOT NULL | Display name |
+| `user_email` | `VARCHAR(255)` | NOT NULL, INDEX | Email (links to Redmine user) |
+| `project_id` | `INTEGER` | NOT NULL, INDEX | Redmine project ID |
+| `project_name` | `VARCHAR(255)` | NOT NULL | Project name |
+| `shift` | `VARCHAR(50)` | NOT NULL | Shift type code |
+| `work_status` | `VARCHAR(50)` | NOT NULL | OFFICE, WFH, ACTIVE, LEAVE, etc. |
+| `work_address` | `VARCHAR(500)` | DEFAULT 'N/A' | Work location |
+| `leave_type` | `VARCHAR(50)` | NULLABLE | Leave type if status=LEAVE |
+| `date` | `VARCHAR(10)` | NOT NULL, INDEX | YYYY-MM-DD |
+| `end_date` | `VARCHAR(10)` | NULLABLE | End date for multi-day |
+| `shift_start_time` | `VARCHAR(5)` | NOT NULL | HH:MM |
+| `shift_end_time` | `VARCHAR(5)` | NOT NULL | HH:MM |
+| `shift_start_utc` | `TIMESTAMPTZ` | NULLABLE | UTC start |
+| `shift_end_utc` | `TIMESTAMPTZ` | NULLABLE | UTC end |
+| `shift_name` | `VARCHAR(100)` | NOT NULL | Shift definition name |
+| `timezone` | `VARCHAR(50)` | DEFAULT 'Asia/Kolkata' | IANA timezone |
+| `country` | `VARCHAR(10)` | DEFAULT '' | Country code |
+| `created_at` | `TIMESTAMPTZ` | DEFAULT now() | |
+| `updated_at` | `TIMESTAMPTZ` | DEFAULT now(), on update | |
 
 **Relationships:**
-- `userEmail` ↔ Redmine `users.mail`
-- `projectId` ↔ Redmine `projects.id`
-- One shift per `(userId, date)` — enforced by duplicate guard
+- `user_email` ↔ Redmine `users.mail`
+- `project_id` ↔ Redmine `projects.id`
 
 ---
 
 ### 2. `shift_definitions`
-Shift type definitions (templates).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `shiftCode` | string | Unique code (e.g. "M1", "A1", "GN", "N") |
-| `shiftName` | string | Display name |
-| `startTime` | string | HH:MM |
-| `endTime` | string | HH:MM |
-| `timezone` | string | IANA timezone |
-| `country` | string | Country code |
-| `createdAt` | datetime | |
-| `updatedAt` | datetime | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `shift_code` | `VARCHAR(50)` | NOT NULL, UNIQUE, INDEX | e.g. "M1", "GN", "N" |
+| `shift_name` | `VARCHAR(255)` | NOT NULL | |
+| `start_time` | `VARCHAR(5)` | NOT NULL | HH:MM |
+| `end_time` | `VARCHAR(5)` | NOT NULL | HH:MM |
+| `timezone` | `VARCHAR(50)` | DEFAULT 'Asia/Kolkata' | |
+| `country` | `VARCHAR(10)` | DEFAULT '' | |
+| `created_at` | `TIMESTAMPTZ` | | |
+| `updated_at` | `TIMESTAMPTZ` | | |
 
-**Relationships:** Referenced by `shifts.shiftName`
+**Constraints:** `UNIQUE(shift_code)` — `uq_shift_definition_code`
 
 ---
 
 ### 3. `leaves`
-Leave applications.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `user_id` | string | Keycloak user sub (UUID) |
-| `user_email` | string | Email (links to Redmine user) |
-| `start_date` | datetime | Leave start |
-| `end_date` | datetime | Leave end |
-| `leave_type` | string | EL (Earned), PL (Paid), UPL (Unpaid) |
-| `reason` | string | Reason for leave |
-| `comment` | string | Additional comment |
-| `is_traveling` | bool | |
-| `contact_number` | string | |
-| `resuming_date` | datetime | |
-| `leave_dates` | datetime[] | Specific dates |
-| `approver_id` | int | Redmine user ID of approver (PM) |
-| `status` | string | pending, approved, rejected |
-| `created_at` | datetime | |
-| `updated_at` | datetime | |
-| `approved_at` | datetime | |
-| `approved_by` | string | Email of approver |
-| `approved_by_role` | string | Admin or Project Manager |
-| `rejected_at` | datetime | |
-| `rejected_by` | string | |
-| `rejected_by_role` | string | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `user_id` | `VARCHAR(255)` | NOT NULL, INDEX | Keycloak sub (UUID) |
+| `user_email` | `VARCHAR(255)` | NOT NULL, INDEX | |
+| `start_date` | `TIMESTAMPTZ` | NOT NULL | |
+| `end_date` | `TIMESTAMPTZ` | NOT NULL | |
+| `leave_type` | `ENUM` | NOT NULL | EL, PL, UPL |
+| `reason` | `VARCHAR(1000)` | NULLABLE | |
+| `comment` | `VARCHAR(1000)` | NULLABLE | |
+| `is_traveling` | `BOOLEAN` | NULLABLE | |
+| `contact_number` | `VARCHAR(50)` | NULLABLE | |
+| `resuming_date` | `TIMESTAMPTZ` | NULLABLE | |
+| `leave_dates` | `TIMESTAMPTZ[]` | NULLABLE | PostgreSQL array |
+| `approver_id` | `INTEGER` | NULLABLE | Redmine user ID of PM |
+| `status` | `ENUM` | NOT NULL, DEFAULT 'pending' | pending, approved, rejected |
+| `created_at` | `TIMESTAMPTZ` | | |
+| `updated_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `approved_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `approved_by` | `VARCHAR(255)` | NULLABLE | |
+| `approved_by_role` | `VARCHAR(50)` | NULLABLE | |
+| `rejected_at` | `TIMESTAMPTZ` | NULLABLE | |
+| `rejected_by` | `VARCHAR(255)` | NULLABLE | |
+| `rejected_by_role` | `VARCHAR(50)` | NULLABLE | |
+
+**Enums:**
+- `leavetype`: `EL`, `PL`, `UPL`
+- `leavestatus`: `pending`, `approved`, `rejected`
 
 **Relationships:**
 - `user_email` ↔ Redmine `users.mail`
 - `approver_id` ↔ Redmine `users.id`
-- `user_id` ↔ Keycloak user `sub` (UUID)
+- `user_id` ↔ Keycloak user `sub`
 
 ---
 
 ### 4. `holidays`
-Holiday calendar.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `country_code` | string | e.g. "IN" |
-| `region` | string | e.g. "KA", "TN" |
-| `holiday_date` | string | YYYY-MM-DD |
-| `holiday_name` | string | e.g. "Republic Day" |
-| `holiday_type` | string | GAZETTED or RESTRICTED |
-| `is_national` | bool | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `country_code` | `VARCHAR(10)` | NOT NULL | e.g. "IN" |
+| `region` | `VARCHAR(100)` | NULLABLE | e.g. "KA" |
+| `holiday_date` | `VARCHAR(10)` | NOT NULL | YYYY-MM-DD |
+| `holiday_name` | `VARCHAR(255)` | NOT NULL | |
+| `holiday_type` | `VARCHAR(50)` | NOT NULL | GAZETTED, RESTRICTED |
+| `is_national` | `BOOLEAN` | DEFAULT false | |
 
-**Relationships:** Standalone lookup table. Uniqueness: `country_code` + `holiday_date`.
+**Constraints:** `UNIQUE(country_code, holiday_date)` — `uq_holiday`
 
 ---
 
 ### 5. `leave_balances`
-Leave balance allocations per user.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `user_id` | string | Keycloak user sub |
-| `total_earned` | float | Total EL allocated (default 12.0) |
-| `total_paid` | float | Total PL allocated (default 5.0) |
-| `total_unpaid` | float | Total UPL allocated (default 0.0) |
-| *(more fields possible)* | | |
-
-**Relationships:**
-- Referenced by `leaves` stats calculation (`user_id`)
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `user_id` | `VARCHAR(255)` | NOT NULL, UNIQUE, INDEX | Keycloak sub |
+| `total_earned` | `FLOAT` | DEFAULT 12.0 | |
+| `used_earned` | `FLOAT` | DEFAULT 0.0 | |
+| `total_paid` | `FLOAT` | DEFAULT 5.0 | |
+| `used_paid` | `FLOAT` | DEFAULT 0.0 | |
+| `total_unpaid` | `FLOAT` | DEFAULT 0.0 | |
+| `used_unpaid` | `FLOAT` | DEFAULT 0.0 | |
 
 ---
 
 ### 6. `notifications`
-User notifications.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `user_id` | string | Email of recipient |
-| `type` | string | leave_applied, leave_approved, leave_rejected |
-| `message` | string | Notification text |
-| `from_user` | string | Email of actor |
-| `reference_id` | string | Related leave application ID (MongoDB _id) |
-| `is_read` | bool | |
-| `created_at` | datetime | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `user_id` | `VARCHAR(255)` | NOT NULL, INDEX | Recipient email |
+| `type` | `VARCHAR(50)` | NOT NULL | leave_applied, leave_approved, etc. |
+| `message` | `VARCHAR(1000)` | NOT NULL | |
+| `from_user` | `VARCHAR(255)` | NOT NULL | Actor email |
+| `reference_id` | `VARCHAR(255)` | NULLABLE | Related leave ID |
+| `is_read` | `BOOLEAN` | DEFAULT false | |
+| `created_at` | `TIMESTAMPTZ` | | |
 
 **Relationships:**
-- `reference_id` ↔ `leaves._id`
-- `user_id` (recipient email) ↔ Redmine `users.mail` / `leaves.user_email`
+- `reference_id` → `leaves.id`
+- `user_id` ↔ Redmine `users.mail`
 - `from_user` ↔ Redmine `users.mail`
 
 ---
 
 ### 7. `recordings`
-Call recording metadata.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `email` | string | Owner email |
-| `ticket_id` | string | Redmine issue ID |
-| `project` | string | Redmine project name |
-| `priority` | string | Issue priority |
-| `status` | string | Issue status |
-| `filename` | string | Original filename |
-| `recording_url` | string | MinIO object URL |
-| `is_played` | bool | |
-| `created_at` | datetime | |
-| `redmine_details` | object | Enriched Redmine metadata |
-| `redmine_details.redmine_project_id` | int | |
-| `redmine_details.redmine_status_id` | int | |
-| `redmine_details.redmine_priority_id` | int | |
-| `redmine_details.subject` | string | Issue subject |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `email` | `VARCHAR(255)` | NOT NULL, INDEX | Owner email |
+| `ticket_id` | `VARCHAR(50)` | NULLABLE | Redmine issue ID |
+| `project` | `VARCHAR(255)` | NULLABLE | |
+| `priority` | `VARCHAR(50)` | NULLABLE | |
+| `status` | `VARCHAR(50)` | NULLABLE | |
+| `filename` | `VARCHAR(500)` | NOT NULL | |
+| `recording_url` | `VARCHAR(1000)` | NOT NULL | MinIO object URL |
+| `is_played` | `BOOLEAN` | DEFAULT false | |
+| `created_at` | `TIMESTAMPTZ` | | |
+| `redmine_details` | `JSON` | NULLABLE | Enriched Redmine metadata |
 
 **Relationships:**
 - `email` ↔ Redmine `users.mail`
 - `ticket_id` ↔ Redmine `issues.id`
-- `recording_url` → MinIO object (bucket: `recordings`)
+- `recording_url` → MinIO (bucket: `recordings`)
 
 ---
 
 ### 8. `locations`
-User GPS location tracking.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `email` | string | User email (unique key for upsert) |
-| `latitude` | float | |
-| `longitude` | float | |
-| `updated_at` | datetime | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `UUID` | PK | |
+| `email` | `VARCHAR(255)` | NOT NULL, UNIQUE, INDEX | |
+| `latitude` | `FLOAT` | NOT NULL | |
+| `longitude` | `FLOAT` | NOT NULL | |
+| `updated_at` | `TIMESTAMPTZ` | | |
 
-**Relationships:**
-- `email` ↔ Redmine `users.mail`
+**Constraint:** `UNIQUE(email)` — one location per user
 
 ---
 
 ### 9. `system_settings`
-Company settings.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | string | Always `"company"` |
-| `company_name` | string | |
-| `logo_content_type` | string | MIME type of stored logo |
-| `updated_at` | datetime | |
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| `id` | `VARCHAR(50)` | PK | Always `"company"` |
+| `company_name` | `VARCHAR(255)` | DEFAULT '' | |
+| `logo_content_type` | `VARCHAR(100)` | NULLABLE | MIME type |
+| `updated_at` | `TIMESTAMPTZ` | | |
 
-**Relationships:**
-- Logo image stored in MinIO bucket `company-assets` (object name: `logo`)
+**Relationships:** Logo stored in MinIO (bucket: `company-assets`, object: `logo`)
 
 ---
 
-## Keycloak (PostgreSQL — managed by Keycloak)
+## External Systems
 
-### `users` (in Keycloak's realm `attendance-app`)
+### Keycloak (PostgreSQL — realm: `attendance-app`)
+Users with roles: `Admin`, `Project Manager`, `Project Coordinator`, `Technical Resource`.
+- `email` ↔ Redmine `users.mail` (synced on signup)
+- `sub` referenced by `leaves.user_id`, `leave_balances.user_id`
 
-| Attribute | Description |
-|-----------|-------------|
-| `sub` (UUID) | Unique user ID (stored in JWT) |
-| `username` | Login name |
-| `email` | Email address |
-| `timezone` | Custom attribute (IANA timezone, embedded in JWT) |
+### Redmine (PostgreSQL — accessed via REST API)
+- **`users`** — `id`, `login`, `mail`, `firstname`, `lastname`
+- **`projects`** — `id`, `name`, `identifier`, custom fields (City, Office Location, Project Type)
+- **`members`** — `user_id` ↔ `project_id` (many-to-many)
+- **`issues`** — `id`, `subject`, `project_id`, `assigned_to_id`
 
-**Roles:** `Admin`, `Project Manager`, `Project Coordinator`, `Technical Resource`
-
-**Relationships:**
-- `email` ↔ Redmine `users.mail` (synced on signup via background task)
-- `username` ↔ Redmine `users.login` (synced on signup)
-- MongoDB entities reference `sub` as `user_id`
-
----
-
-## Redmine (PostgreSQL — accessed via REST API)
-
-### `users`
-
-| Field | Description |
-|-------|-------------|
-| `id` | Primary key (int) |
-| `login` | Username |
-| `mail` | Email |
-| `firstname` | |
-| `lastname` | |
-| `password` | (synced on signup) |
-| `preferences.time_zone` | IANA timezone |
-
-**Relationships:**
-- `mail` ↔ Keycloak `email` (synced)
-- `mail` ↔ MongoDB `shifts.userEmail`, `leaves.user_email`, `recordings.email`, `locations.email`, `notifications.user_id`, `notifications.from_user`
-- `id` ↔ `projects_members.user_id` (via memberships)
-- `id` ↔ `issues.assigned_to_id`
-
-### `projects`
-
-| Field | Description |
-|-------|-------------|
-| `id` | Primary key (int) |
-| `name` | Project name |
-| `identifier` | URL-friendly slug |
-| `status` | 1=active, 5=closed |
-| Custom fields: City, Customer Office Location, Project Type | |
-
-**Relationships:**
-- `id` ↔ `projects_members.project_id`
-- `id` ↔ `issues.project_id`
-- `id` ↔ MongoDB `shifts.projectId`
-- `name` ↔ MongoDB `recordings.project`
-
-### `members` (project memberships)
-
-| Field | Description |
-|-------|-------------|
-| `project_id` | FK → projects |
-| `user_id` | FK → users |
-| `role_ids` | Array of role IDs |
-
-**Relationships:**
-- Many-to-many between `users` and `projects` (a user can be in many projects; a project has many users)
-
-### `issues`
-
-| Field | Description |
-|-------|-------------|
-| `id` | Primary key (int) |
-| `subject` | |
-| `description` | |
-| `project_id` | FK → projects |
-| `assigned_to_id` | FK → users |
-| `author_id` | FK → users |
-| `status_id` | |
-| `priority_id` | |
-| `tracker_id` | |
-| `created_on` | |
-| `updated_on` | |
-
-**Relationships:**
-- `project_id` ↔ `projects.id`
-- `assigned_to_id` ↔ `users.id`
-- MongoDB `recordings.ticket_id` ↔ `issues.id`
+### MinIO (S3)
+- Bucket `recordings` — audio files (path: `{username}/{date}/{time}_{uuid}.ext`)
+- Bucket `company-assets` — company logo (object: `logo`)
 
 ---
 
-## MinIO (S3-compatible Object Storage)
-
-### Bucket: `recordings`
-Stores audio recording files uploaded via the recordings feature.
-
-Object path format: `{username}/{YYYY-MM-DD}/{HHMMSS}_{short_uuid}.{ext}`
-
-**Relationships:** Referenced by MongoDB `recordings.recording_url`
-
-### Bucket: `company-assets`
-Stores the company logo.
-
-Object: `logo`
-
-**Relationships:** Referenced by MongoDB `system_settings`
-
----
-
-## In-Memory Session Store
-
-### Sessions
-
-| Key | Value |
-|-----|-------|
-| `session_id` (random token) | `{data: {sub, username, email, roles, kc_refresh_token?}, expires: datetime}` |
-
-**Relationships:**
-- `data.sub` ↔ Keycloak user `sub`
-- Keycloak refresh token stored for session renewal
-
----
-
-## Entity Relationship Summary
+## Entity Relationship Diagram
 
 ```
-Keycloak (Auth)          Redmine (Projects)         MongoDB (App Data)          MinIO (Files)
-═══════════              ═════════════════          ═════════════════           ═════════════
-users                    users ─────────────────► shifts                         recordings bucket
-  sub (UUID)               │   id, mail              user_id, userEmail            ▲
-  username ─────────────►  │   login, mail            projectId                    │
-  email                    │                          userId                     recordings
-                           ├── projects ◄─────────► shifts.projectId             recording_url
-                           │     id, name             leaves                      ▲
-                           │     custom_fields         user_email                 │
-                           ├── members                 approver_id              company-assets
-                           │     user_id ──────────► leaves.approver_id           bucket
-                           │     project_id            notifications ▲──┘          ▲
-                           ├── issues ◄────────────►   reference_id               │
-                           │     id                    recordings ◄──┘           system_settings
-                           │     assigned_to_id         ticket_id                  logo
-                           │     project_id             email
-                           │                           locations
-                           │                             email
-                           └── projects.name ──────► recordings.project
+Keycloak (Auth)          Redmine (Projects)         PostgreSQL (App)            MinIO
+═══════════              ═════════════════          ════════════════            ══════
+users                    users ─────────────────► shifts                       recordings
+  sub (UUID)               │  id, mail              user_email, project_id       ▲
+  email ───────────────►   │                        user_id                      │
+  username                 │                                                    │
+                           ├── projects ◄─────────► shifts.project_id          company-assets
+                           │  id, name              leaves                       ▲
+                           │                        user_email                   │
+                           ├── members ◄──────────► leaves.approver_id         system_settings
+                           │  user_id               notifications ◄──┘           logo
+                           │  project_id             reference_id
+                           ├── issues ◄───────────► recordings
+                           │  id                     ticket_id, email
+                           │  assigned_to_id        locations
+                           │                         email
+                           ├── projects.name ─────► recordings.project
+                           │
+                           └── users.id ──────────► leaves.approver_id
+                                                    leave_balances.user_id
 ```
 
-## Cross-Reference: Which Features Use Which Tables
+## Feature-to-Table Mapping
 
-| Feature | MongoDB | Keycloak | Redmine | MinIO |
-|---------|---------|----------|---------|-------|
-| Auth | — | users, sessions | — | — |
-| Shifts | shifts, shift_definitions | users (auth) | users, projects, members | — |
-| Leaves | leaves, holidays, leave_balances | users (auth) | users, projects, members | — |
-| Notifications | notifications | — | users | — |
-| Recordings | recordings | — | users, issues, projects | recordings bucket |
-| Location | locations | — | users | — |
-| Settings | system_settings | — | — | company-assets bucket |
-| Redmine Sync | — | — | users, projects, members, issues | — |
+| Feature | Tables Used | External Dependencies |
+|---------|-------------|----------------------|
+| Auth | — | Keycloak (users, roles) |
+| Shifts | shifts, shift_definitions | Redmine (users, projects) |
+| Leaves | leaves, holidays, leave_balances | Redmine (users, projects), Notifications |
+| Notifications | notifications | Redmine (users) |
+| Recordings | recordings | Redmine (users, issues, projects), MinIO |
+| Location | locations | — |
+| Settings | system_settings | MinIO |
+| Redmine Sync | — | Redmine (users, projects, members, issues) |

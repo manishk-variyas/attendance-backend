@@ -91,19 +91,19 @@ class ShiftStats(BaseModel):
 
 class ShiftHistoryItem(BaseModel):
     id: str
-    userId: int
-    userName: str
+    userId: Optional[int] = None
+    userName: Optional[str] = None
     userEmail: str
-    projectId: int
-    projectName: str
+    projectId: Optional[int] = None
+    projectName: Optional[str] = None
     shift: str
     workStatus: str
     workAddress: Optional[str] = None
     leaveType: Optional[str] = None
     date: str
     endDate: Optional[str] = None
-    shiftStartTime: str
-    shiftEndTime: str
+    shiftStartTime: Optional[str] = None
+    shiftEndTime: Optional[str] = None
     createdAt: Optional[datetime] = None
 
 

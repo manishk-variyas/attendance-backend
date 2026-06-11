@@ -112,6 +112,10 @@ app.include_router(recordings_router, prefix="/api", tags=["recordings"])
 from app.features.leaves.routes import router as leaves_router
 app.include_router(leaves_router, prefix="/api", tags=["leaves"])
 
+# Register Admin Leave Balance routes
+from app.features.leaves.admin_routes import router as leave_balance_router
+app.include_router(leave_balance_router, prefix="/api", tags=["admin-leave-balances"])
+
 # Register Notification routes
 from app.features.notifications.routes import router as notifications_router
 app.include_router(notifications_router, prefix="/api", tags=["notifications"])
@@ -119,6 +123,10 @@ app.include_router(notifications_router, prefix="/api", tags=["notifications"])
 # Register Location Tracking routes
 from app.features.location.routes import router as location_router
 app.include_router(location_router, prefix="/api/location", tags=["location"])
+
+# Register Admin Office Location routes
+from app.features.location.admin_routes import router as office_location_router
+app.include_router(office_location_router, prefix="/api", tags=["admin-office-locations"])
 
 # Register Shift Management routes
 from app.features.shifts.routes import router as shifts_router
@@ -128,5 +136,7 @@ app.include_router(shifts_router, prefix="/api", tags=["shifts"])
 from app.features.settings.routes import router as settings_router
 app.include_router(settings_router, prefix="/api", tags=["settings"])
 
-# (Admin dashboard module was removed)
+# Register Employee Management routes
+from app.features.employees.routes import router as employees_router
+app.include_router(employees_router, prefix="/api", tags=["employees"])
 
