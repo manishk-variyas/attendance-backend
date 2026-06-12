@@ -40,6 +40,20 @@ async def list_redmine_users(
     return await redmine_service.get_all_users()
 
 
+@router.get("/projects", response_model=List[dict])
+async def list_all_projects(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return all Redmine projects. Admin, PM, or PC only."""
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin, Project Manager, or Project Coordinator access required",
+        )
+    return await redmine_service.get_all_projects()
+
+
 @router.post("/projects", response_model=dict)
 async def create_project(
     data: ProjectCreate,

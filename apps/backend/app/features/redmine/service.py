@@ -381,6 +381,30 @@ class RedmineService:
                     return result
         return result
 
+    async def add_user_to_project(self, user_id: int, project_id: int) -> bool:
+        """Add a user to a Redmine project with default Developer role."""
+        role_id = await self._get_developer_role_id()
+        if not role_id:
+            raise Exception("Developer role not found in Redmine")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.url}/projects/{project_id}/memberships.json",
+                json={"membership": {"user_id": user_id, "role_ids": [role_id]}},
+                headers=self.headers,
+            )
+        return resp.status_code in (201, 200)
+
+    async def _get_developer_role_id(self) -> int:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.url}/roles.json", headers=self.headers)
+            resp.raise_for_status()
+            roles = resp.json().get("roles", [])
+            for r in roles:
+                if r.get("name", "").lower() == "developer":
+                    return r["id"]
+        return 0
+
 
 redmine_service = RedmineService()
 

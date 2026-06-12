@@ -25,6 +25,7 @@ from app.core.logging import setup_logging
 from app.core.limiter import limiter
 from app.middleware.correlation import set_correlation_id
 from app.middleware.logging import log_requests
+from app.middleware.active_employee import active_employee_middleware
 from app.features.auth.routes import router as auth_router
 from app.features.auth.dependencies import get_current_user
 from app.features.redmine.routes import router as redmine_router
@@ -67,6 +68,9 @@ app.add_middleware(
 # Order matters: correlation ID is set first, then logging uses it
 app.middleware("http")(log_requests)
 app.middleware("http")(set_correlation_id)
+
+# Active-employee guard — blocks deactivated accounts globally (before any route)
+app.middleware("http")(active_employee_middleware)
 
 
 @app.get("/")
@@ -120,6 +124,10 @@ app.include_router(leave_balance_router, prefix="/api", tags=["admin-leave-balan
 from app.features.notifications.routes import router as notifications_router
 app.include_router(notifications_router, prefix="/api", tags=["notifications"])
 
+# Register Country routes
+from app.features.countries import router as countries_router
+app.include_router(countries_router, prefix="/api", tags=["countries"])
+
 # Register Location Tracking routes
 from app.features.location.routes import router as location_router
 app.include_router(location_router, prefix="/api/location", tags=["location"])
@@ -139,4 +147,12 @@ app.include_router(settings_router, prefix="/api", tags=["settings"])
 # Register Employee Management routes
 from app.features.employees.routes import router as employees_router
 app.include_router(employees_router, prefix="/api", tags=["employees"])
+
+# Register Attendance routes
+from app.features.attendance.routes import router as attendance_router
+app.include_router(attendance_router, prefix="/api", tags=["attendance"])
+
+# Register Admin Attendance routes
+from app.features.attendance.admin_routes import router as admin_attendance_router
+app.include_router(admin_attendance_router, prefix="/api", tags=["admin-attendance"])
 

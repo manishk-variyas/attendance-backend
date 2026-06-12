@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.employee_master import EmployeeMaster
+from app.models.office_location import OfficeLocation
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
 from sqlalchemy import select
 
@@ -44,6 +45,26 @@ class ShiftService:
         if ws in work_location_map:
             ws = work_location_map[ws]
 
+        work_address = data.get("workAddress", "N/A")
+        emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == keycloak_id)).scalars().first()
+        if emp and emp.location_id:
+            office = db.execute(select(OfficeLocation).where(OfficeLocation.id == emp.location_id)).scalars().first()
+            if office:
+                work_address = office.address or f"{office.name}, {office.city or ''}".strip(", ")
+
+        start_time = None
+        end_time = None
+        if data.get("shiftStartTime"):
+            try:
+                start_time = datetime.strptime(data["shiftStartTime"][:5], "%H:%M").time()
+            except ValueError:
+                pass
+        if data.get("shiftEndTime"):
+            try:
+                end_time = datetime.strptime(data["shiftEndTime"][:5], "%H:%M").time()
+            except ValueError:
+                pass
+
         shift = svc.create(Shift,
             keycloak_user_id=keycloak_id,
             redmine_user_id=data.get("userId"),
@@ -54,9 +75,9 @@ class ShiftService:
             project_id=data.get("projectId"),
             project_name=data.get("projectName"),
             work_location_status=ws,
-            work_address=data.get("workAddress", "N/A"),
-            shift_start_time=None,
-            shift_end_time=None,
+            work_address=work_address,
+            shift_start_time=start_time,
+            shift_end_time=end_time,
             shift_start_utc=data.get("shiftStartUTC"),
             shift_end_utc=data.get("shiftEndUTC"),
             country=data.get("country", ""),
@@ -141,6 +162,8 @@ class ShiftService:
                 "projectName": s.project_name,
                 "workStatus": s.work_location_status,
                 "workAddress": s.work_address,
+                "shiftStartTime": s.shift_start_time.isoformat() if s.shift_start_time else None,
+                "shiftEndTime": s.shift_end_time.isoformat() if s.shift_end_time else None,
                 "createdAt": s.created_at,
             }
             for s in shifts

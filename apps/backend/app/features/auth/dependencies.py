@@ -16,7 +16,9 @@ Usage:
         return "secret data"
 """
 from fastapi import Request, HTTPException, Depends
+from sqlalchemy.orm import Session as DBSession
 from app.features.auth.services.session import get_session
+from app.core.database import get_db
 
 
 async def get_current_user(request: Request) -> dict:
@@ -73,3 +75,33 @@ def require_role(role: str):
 # Convenience: pre-built admin guard
 # Note: casing must match Keycloak realm role name exactly
 require_admin = require_role("Admin")
+
+
+async def require_active(
+    db: DBSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> None:
+    """
+    Dependency: blocks deactivated employees from accessing any endpoint.
+
+    Must be used after get_current_user. Looks up employee_master by email
+    from the session and checks is_active is True. Returns 403 if deactivated.
+
+    Usage:
+        @router.get("/some-route")
+        async def route(..., _: None = Depends(require_active)):
+            ...
+    """
+    from app.models.employee_master import EmployeeMaster
+    from app.services.database.base_service import BaseService
+
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Session missing email")
+
+    svc = BaseService[EmployeeMaster](db)
+    emp = svc.fetch_one(EmployeeMaster, user_email=email)
+    if not emp:
+        raise HTTPException(status_code=403, detail="Employee record not found")
+    if not emp.is_active:
+        raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")

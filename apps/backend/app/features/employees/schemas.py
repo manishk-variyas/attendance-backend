@@ -16,6 +16,7 @@ class EmployeeCreate(BaseModel):
     contact_number: Optional[str] = None
     alt_contact_number: Optional[str] = None
     country: Optional[str] = ""
+    reports_to: Optional[int] = None
 
 
 class EmployeeResponse(BaseModel):
@@ -37,6 +38,8 @@ class EmployeeResponse(BaseModel):
     status: str
     onboarded_at: Optional[datetime] = None
     location_id: Optional[str] = None
+    reports_to: Optional[int] = None
+    reports_to_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -55,3 +58,13 @@ class EmployeeStatusUpdate(BaseModel):
 
 class EmployeeLocationUpdate(BaseModel):
     location_id: str  # UUID of the office_location
+
+
+class EmployeeActiveToggle(BaseModel):
+    is_active: bool
+
+
+class AssignProjectRequest(BaseModel):
+    user_email: str
+    project_id: int
+    reports_to: int

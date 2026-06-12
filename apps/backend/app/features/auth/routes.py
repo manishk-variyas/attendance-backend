@@ -20,12 +20,16 @@ import logging
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import get_db
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
 from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub, get_redis
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
 from app.features.auth.dependencies import get_current_user, require_admin
+from app.models.employee_master import EmployeeMaster
+from app.services.database.base_service import BaseService
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse
@@ -37,7 +41,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login")
 @limiter.limit(LOGIN_RATE_LIMIT)
-async def login(request: Request, payload: LoginRequest):
+async def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
     """
     Login endpoint - authenticates user with Keycloak and creates a server-side session.
     
@@ -84,6 +88,16 @@ async def login(request: Request, payload: LoginRequest):
     if not user_data.get("sub"):
         log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "missing_sub"})
         raise HTTPException(status_code=401, detail="Failed to extract user info")
+
+    # Block deactivated employees (admins bypass)
+    email = user_data.get("email")
+    roles = user_data.get("roles", [])
+    if email and "Admin" not in roles:
+        svc = BaseService[EmployeeMaster](db)
+        emp = svc.fetch_one(EmployeeMaster, user_email=email)
+        if emp and not emp.is_active:
+            log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "account_deactivated"})
+            raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")
 
     # Create a new session in server memory with user data and refresh token
     session_id = await create_session(user_data, tokens.get("refresh_token"))

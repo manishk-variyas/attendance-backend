@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, DateTime, text
+from sqlalchemy import Column, String, Integer, Boolean, DateTime, text
 from sqlalchemy.dialects.postgresql import UUID
 from app.core.models import Base
 
@@ -30,7 +30,10 @@ class EmployeeMaster(Base):
     alt_contact_number = Column(String(50), nullable=True)
     country = Column(String(100), server_default=text("''"))
     status = Column(String(20), nullable=False, server_default=text("'active'"))
+    is_active = Column(Boolean, nullable=False, server_default=text("true"))
     onboarded_at = Column(DateTime(timezone=True), nullable=True)
     location_id = Column(UUID(as_uuid=True), nullable=True)
+    reports_to = Column(Integer, nullable=True)
+    reports_to_name = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))

@@ -10,6 +10,7 @@ from app.models.recording import Recording
 from app.models.location import UserLocation
 from app.models.system_setting import SystemSetting
 from app.models.employee_master import EmployeeMaster
+from app.models.attendance import Attendance
 
 __all__ = [
     "Base",
@@ -23,4 +24,5 @@ __all__ = [
     "UserLocation",
     "SystemSetting",
     "EmployeeMaster",
+    "Attendance",
 ]

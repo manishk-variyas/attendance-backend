@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_admin
-from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate
+from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
 from app.models.office_location import OfficeLocation
-from app.services.database.base_service import BaseService
 from app.features.redmine.service import redmine_service
+from app.services.database.base_service import BaseService
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,11 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
         "alt_contact_number": e.alt_contact_number,
         "country": e.country,
         "status": e.status,
+        "is_active": e.is_active,
         "onboarded_at": e.onboarded_at,
         "location_id": str(e.location_id) if e.location_id else None,
+        "reports_to": e.reports_to,
+        "reports_to_name": e.reports_to_name,
         "created_at": e.created_at,
         "updated_at": e.updated_at,
     }
@@ -183,6 +186,61 @@ async def update_employee_location(
     emp.location_id = payload.location_id
     db.commit()
     return _employee_to_dict(emp)
+
+
+@router.patch("/{employee_id}/activate")
+async def toggle_employee_active(
+    employee_id: str,
+    payload: EmployeeActiveToggle,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    svc = BaseService[EmployeeMaster](db)
+    emp = svc.fetch_one(EmployeeMaster, id=employee_id)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    svc.update(EmployeeMaster, employee_id, is_active=payload.is_active)
+    return {"message": f"Employee {'activated' if payload.is_active else 'deactivated'}"}
+
+
+@router.patch("/assign-project")
+async def assign_project(
+    payload: AssignProjectRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    svc = BaseService[EmployeeMaster](db)
+    emp = svc.fetch_one(EmployeeMaster, user_email=payload.user_email)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if not emp.redmine_user_id:
+        raise HTTPException(status_code=400, detail="Employee not onboarded in Redmine yet")
+
+    manager = svc.fetch_one(EmployeeMaster, redmine_user_id=payload.reports_to)
+    if not manager:
+        raise HTTPException(status_code=404, detail="Reporting manager not found")
+
+    try:
+        await redmine_service.add_user_to_project(emp.redmine_user_id, payload.project_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to assign project: {e}")
+
+    projects = await redmine_service.get_all_projects()
+    project_name = next((p["name"] for p in projects if p["id"] == payload.project_id), str(payload.project_id))
+
+    reports_to_name = f"{manager.first_name} {manager.last_name}, {manager.designation}"
+    svc.update(EmployeeMaster, emp.id, reports_to=payload.reports_to, reports_to_name=reports_to_name)
+
+    logger.info(f"Admin assigned project {payload.project_id} + reports-to {payload.reports_to} for {payload.user_email}")
+    return {
+        "message": "Project assigned successfully",
+        "project_id": payload.project_id,
+        "project_name": project_name,
+        "reports_to": payload.reports_to,
+        "reports_to_name": reports_to_name,
+    }
 
 
 @router.get("/by-email/{email}", response_model=EmployeeResponse)
