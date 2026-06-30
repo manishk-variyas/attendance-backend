@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Float, DateTime, text
 from sqlalchemy.dialects.postgresql import UUID
+from geoalchemy2 import Geometry
 from app.core.models import Base
 
 
@@ -19,6 +20,7 @@ class OfficeLocation(Base):
     __tablename__ = "office_locations"
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    category = Column(String(50), nullable=False, server_default=text("'Office'"))
     name = Column(String(255), nullable=False)           # "Noida Office", "Delhi HQ"
     address = Column(String(500), nullable=True)
     city = Column(String(100), nullable=True)
@@ -27,12 +29,14 @@ class OfficeLocation(Base):
     longitude = Column(Float, nullable=False)
     radius_meters = Column(Float, nullable=False, server_default=text("300"))  # geofence radius
     created_by = Column(String(255), nullable=True)      # admin email who created it
+    geom = Column(Geometry("POINT", srid=4326), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
+            "category": self.category,
             "name": self.name,
             "address": self.address,
             "city": self.city,

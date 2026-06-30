@@ -381,11 +381,12 @@ class RedmineService:
                     return result
         return result
 
-    async def add_user_to_project(self, user_id: int, project_id: int) -> bool:
-        """Add a user to a Redmine project with default Developer role."""
-        role_id = await self._get_developer_role_id()
+    async def add_user_to_project(self, user_id: int, project_id: int, role_id: int = None) -> bool:
+        """Add a user to a Redmine project. Defaults to Developer role if not specified."""
+        if role_id is None:
+            role_id = await self._get_developer_role_id()
         if not role_id:
-            raise Exception("Developer role not found in Redmine")
+            raise Exception("Role not found in Redmine")
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -394,6 +395,58 @@ class RedmineService:
                 headers=self.headers,
             )
         return resp.status_code in (201, 200)
+
+    async def get_roles(self) -> list:
+        """Fetch all Redmine roles."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.url}/roles.json", headers=self.headers)
+            resp.raise_for_status()
+            return resp.json().get("roles", [])
+
+    async def update_user(self, user_id: int, data: dict) -> bool:
+        """Update a Redmine user's profile fields."""
+        payload: dict = {"user": {}}
+        if "login" in data:
+            payload["user"]["login"] = data["login"]
+        if "firstname" in data:
+            payload["user"]["firstname"] = data["firstname"]
+        if "lastname" in data:
+            payload["user"]["lastname"] = data["lastname"]
+        if "mail" in data:
+            payload["user"]["mail"] = data["mail"]
+
+        if not payload["user"]:
+            return True
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{self.url}/users/{user_id}.json",
+                json=payload,
+                headers=self.headers,
+            )
+        return resp.status_code in (200, 204)
+
+    async def remove_user_from_project(self, user_id: int, project_id: int) -> bool:
+        """Remove a user from a Redmine project."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{self.url}/projects/{project_id}/memberships.json?include=user",
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            memberships = resp.json().get("memberships", [])
+            membership_id = next(
+                (m["id"] for m in memberships if m.get("user", {}).get("id") == user_id),
+                None,
+            )
+            if not membership_id:
+                return False
+
+            resp = await client.delete(
+                f"{self.url}/memberships/{membership_id}.json",
+                headers=self.headers,
+            )
+        return resp.status_code in (200, 204)
 
     async def _get_developer_role_id(self) -> int:
         async with httpx.AsyncClient() as client:

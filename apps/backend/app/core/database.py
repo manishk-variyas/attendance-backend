@@ -51,6 +51,24 @@ def _run_migrations():
                 END IF;
             END $$;
         """))
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='attendance' AND column_name='is_synced'
+                ) THEN
+                    ALTER TABLE attendance ADD COLUMN is_synced BOOLEAN NOT NULL DEFAULT false;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='attendance' AND column_name='server_received_at'
+                ) THEN
+                    ALTER TABLE attendance ADD COLUMN server_received_at TIMESTAMPTZ;
+                END IF;
+            END $$;
+        """))
         conn.commit()
 
 

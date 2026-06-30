@@ -101,7 +101,5 @@ async def require_active(
 
     svc = BaseService[EmployeeMaster](db)
     emp = svc.fetch_one(EmployeeMaster, user_email=email)
-    if not emp:
-        raise HTTPException(status_code=403, detail="Employee record not found")
-    if not emp.is_active:
+    if emp and not emp.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")

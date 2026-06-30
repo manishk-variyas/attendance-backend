@@ -23,6 +23,23 @@ async def list_timezones():
 
 
 # ------------------------------------------------------------------ #
+#  GET /api/redmine/roles  — Redmine role list                       #
+# ------------------------------------------------------------------ #
+@router.get("/redmine/roles")
+async def list_redmine_roles(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return all Redmine roles. Admin, PM, or PC only."""
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin, Project Manager, or Project Coordinator access required",
+        )
+    return await redmine_service.get_roles()
+
+
+# ------------------------------------------------------------------ #
 #  GET /api/redmine/users  — Roster: employee dropdown               #
 # ------------------------------------------------------------------ #
 @router.get("/redmine/users")

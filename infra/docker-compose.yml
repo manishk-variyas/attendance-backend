@@ -12,7 +12,6 @@
 
 include:
   - keycloak/docker-compose.yml
-  - redis/docker-compose.yml
   - backend/docker-compose.yml
   - nginx/docker-compose.yml
   - redmine/docker-compose.yml

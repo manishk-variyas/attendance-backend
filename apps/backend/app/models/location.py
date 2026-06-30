@@ -12,6 +12,7 @@ class UserLocation(Base):
     email = Column(String(255), nullable=False, unique=True, index=True)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
+    location_name = Column(String(500), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=text("now()"))
 
     def to_dict(self) -> dict:

@@ -14,12 +14,13 @@ class LocationService(BaseService[UserLocation]):
         stmt = select(UserLocation).where(UserLocation.email == email)
         return self.db.execute(stmt).scalars().first()
 
-    def upsert(self, email: str, latitude: float, longitude: float) -> UserLocation:
+    def upsert(self, email: str, latitude: float, longitude: float, location_name: str = None) -> UserLocation:
         existing = self.fetch_by_email(email)
         if existing:
             existing.latitude = latitude
             existing.longitude = longitude
+            existing.location_name = location_name
             existing.updated_at = datetime.now(timezone.utc)
             self.db.commit()
             return existing
-        return self.create(UserLocation, email=email, latitude=latitude, longitude=longitude)
+        return self.create(UserLocation, email=email, latitude=latitude, longitude=longitude, location_name=location_name)

@@ -27,6 +27,10 @@ async def get_settings(db: Session = Depends(get_db)):
         "id": "company",
         "company_name": doc.company_name,
         "logo_url": LOGO_URL_PATH,
+        "default_shift_start_time": doc.default_shift_start_time.isoformat() if doc.default_shift_start_time else None,
+        "default_shift_end_time": doc.default_shift_end_time.isoformat() if doc.default_shift_end_time else None,
+        "default_timezone": doc.default_timezone,
+        "grace_minutes": doc.grace_minutes,
         "updated_at": doc.updated_at,
     }
 
@@ -49,6 +53,10 @@ async def get_logo(db: Session = Depends(get_db)):
 async def update_settings(
     company_name: str = Form(...),
     logo: UploadFile = File(None),
+    default_shift_start_time: str = Form(None),
+    default_shift_end_time: str = Form(None),
+    default_timezone: str = Form(None),
+    grace_minutes: int = Form(None),
     db: Session = Depends(get_db),
     _: None = Depends(require_admin),
 ):
@@ -69,5 +77,13 @@ async def update_settings(
             content_type=logo_content_type,
         )
 
-    updated = svc.upsert(company_name=company_name, logo_content_type=logo_content_type)
-    return {"id": "company", "company_name": company_name, "logo_url": LOGO_URL_PATH, "updated_at": updated.updated_at}
+    updated = svc.upsert(
+        company_name=company_name,
+        logo_content_type=logo_content_type,
+        default_shift_start_time=default_shift_start_time,
+        default_shift_end_time=default_shift_end_time,
+        default_timezone=default_timezone,
+        grace_minutes=grace_minutes,
+    )
+    settings = svc.fetch()
+    return settings.to_dict() if settings else {"id": "company", "company_name": company_name}

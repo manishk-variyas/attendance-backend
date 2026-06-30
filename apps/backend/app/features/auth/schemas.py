@@ -52,6 +52,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(...)
     timezone: str = Field(default="UTC", description="IANA timezone name, e.g. 'Asia/Kolkata'")
+    role: str = Field(default="Technical Resource", description="Keycloak realm role")
 
     @field_validator("username")
     @classmethod

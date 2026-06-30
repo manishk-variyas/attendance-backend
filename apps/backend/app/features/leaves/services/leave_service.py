@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone, date
 import io
 from typing import List, Dict, Any
+from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 import openpyxl
 from pydantic import ValidationError
@@ -12,6 +13,8 @@ from app.services.database.holiday_service import HolidayService as HolidayDBSer
 from app.models.leave import Leave
 from app.models.leave_balance import LeaveBalance
 from app.models.holiday import Holiday
+from app.models.shift import Shift
+from app.models.attendance import Attendance
 from sqlalchemy import select, and_, func
 
 class LeaveBusinessService:
@@ -22,8 +25,18 @@ class LeaveBusinessService:
 
     async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> str:
         """Submit a new leave application with overlap protection."""
-        start = leave_data.start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end   = leave_data.end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        IST = ZoneInfo("Asia/Kolkata")
+        from_ist = leave_data.start_date
+        if from_ist.tzinfo is None:
+            from_ist = from_ist.replace(tzinfo=timezone.utc)
+        from_ist = from_ist.astimezone(IST)
+        to_ist = leave_data.end_date
+        if to_ist.tzinfo is None:
+            to_ist = to_ist.replace(tzinfo=timezone.utc)
+        to_ist = to_ist.astimezone(IST)
+
+        start = from_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = to_ist.replace(hour=23, minute=59, second=59, microsecond=999999)
 
         # Check for overlaps
         stmt = select(Leave).where(
@@ -40,12 +53,47 @@ class LeaveBusinessService:
                 detail="You already have an approved or pending leave application that overlaps with these dates."
             )
 
+        # shift_stmt = select(Shift).where(
+        #     Shift.keycloak_user_id == user_id,
+        #     Shift.date >= start.date(),
+        #     Shift.date <= end.date(),
+        # )
+        # conflicting_shift = self.leave_db.db.execute(shift_stmt).scalars().first()
+        # if conflicting_shift:
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"Leave cannot be applied. A shift ({conflicting_shift.shift_code}) is already assigned on {conflicting_shift.date}.",
+        #     )
+
+        # Check sufficient leave balance before submitting
+        requested_days = (end.date() - start.date()).days + 1
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+
+        if leave_data.leave_type == LeaveType.EL:
+            total_earned = balance.total_earned if balance else 12.0
+            used_earned = balance.used_earned if balance else 0.0
+            remaining = total_earned - used_earned
+            if remaining < requested_days:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient earned leave balance. Remaining: {remaining}, Requested: {requested_days}"
+                )
+        elif leave_data.leave_type == LeaveType.PL:
+            accrued = balance.accrued_compoff if balance else 0.0
+            consumed = balance.consumed_compoff if balance else 0.0
+            remaining = accrued - consumed
+            if remaining < requested_days:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Insufficient comp off balance. Remaining: {remaining}, Requested: {requested_days}"
+                )
+
         # Create leave record
         leave_doc = {
             "keycloak_user_id": user_id,
             "user_email": email,
-            "start_date": leave_data.start_date.date(),
-            "end_date": leave_data.end_date.date(),
+            "start_date": start.date(),
+            "end_date": end.date(),
             "leave_type": leave_data.leave_type.value,
             "reason": leave_data.comment or leave_data.reason,
             "comment": leave_data.comment,
@@ -57,6 +105,70 @@ class LeaveBusinessService:
         
         new_leave = self.leave_db.create(Leave, **leave_doc)
         return str(new_leave.id)
+
+    def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
+        today = date.today()
+
+        existing_leave = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id == user_id,
+                Leave.approval_status.in_([LeaveStatus.APPROVED.value, LeaveStatus.PENDING.value]),
+                Leave.start_date <= today,
+                Leave.end_date >= today,
+            )
+        ).scalars().first()
+        if existing_leave:
+            raise HTTPException(status_code=400, detail="Already on leave for today.")
+
+        existing_attendance = self.leave_db.db.execute(
+            select(Attendance).where(
+                Attendance.keycloak_user_id == user_id,
+                Attendance.attendance_date == today,
+            )
+        ).scalars().first()
+        if existing_attendance:
+            if existing_attendance.check_out_time:
+                raise HTTPException(status_code=400, detail="Already completed work for today.")
+            existing_attendance.check_out_time = datetime.now(timezone.utc)
+            existing_attendance.remarks = (existing_attendance.remarks or "") + " | Emergency leave"
+            self.leave_db.db.commit()
+
+        shift = self.leave_db.db.execute(
+            select(Shift).where(
+                Shift.keycloak_user_id == user_id,
+                Shift.date == today,
+            )
+        ).scalars().first()
+        if shift:
+            shift.work_location_status = "LEAVE"
+            self.leave_db.db.commit()
+
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+        if not balance:
+            self.balance_db.create(LeaveBalance,
+                keycloak_user_id=user_id,
+                year=today.year,
+                total_earned=12.0,
+                used_earned=1,
+                accrued_compoff=0,
+                consumed_compoff=0,
+                unpaid=0,
+            )
+        else:
+            balance.used_earned = (balance.used_earned or 0) + 1
+            self.leave_db.db.commit()
+
+        leave_doc = {
+            "keycloak_user_id": user_id,
+            "user_email": email,
+            "start_date": today,
+            "end_date": today,
+            "leave_type": LeaveType.EL.value,
+            "reason": reason or "Emergency leave",
+            "approval_status": LeaveStatus.APPROVED.value,
+        }
+        new_leave = self.leave_db.create(Leave, **leave_doc)
+        return {"message": "Emergency leave applied", "leave_id": str(new_leave.id)}
 
     async def get_leave_history(self, user_id: str, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
         """Fetch leave history for a user."""
@@ -229,17 +341,26 @@ class LeaveBusinessService:
 
         stats = {
             "total_earned": balance_doc.total_earned if balance_doc else 12.0,
-            "used_earned": used_map.get(LeaveType.EL.value, 0.0),
-            "total_paid": (balance_doc.unpaid if balance_doc else 0.0) + (balance_doc.total_earned if balance_doc else 12.0),
-            "used_paid": used_map.get(LeaveType.PL.value, 0.0),
-            "total_unpaid": balance_doc.unpaid if balance_doc else 0.0,
+            "used_earned": balance_doc.used_earned if balance_doc else 0.0,
+            "total_paid": balance_doc.accrued_compoff if balance_doc else 0.0,
+            "used_paid": balance_doc.consumed_compoff if balance_doc else 0.0,
+            "total_unpaid": 0,
             "used_unpaid": used_map.get(LeaveType.UPL.value, 0.0),
             "pending_applications": pending_count or 0
         }
         return stats
 
     async def approve_leave(self, leave_id: str, current_user: dict) -> bool:
-        """Approve a leave application."""
+        """
+        Approve a leave application with balance validation.
+        
+        Checks:
+        - EL (Earned Leave): total_earned - used_earned >= requested days
+        - PL (Comp Off)    : accrued_compoff - consumed_compoff >= requested days
+        - UPL (Unpaid)     : no balance check needed
+        
+        On approval, updates leave_balances to consume the leave credit.
+        """
         leave = self.leave_db.fetch_one(Leave, id=leave_id)
         if not leave:
             return False
@@ -268,6 +389,36 @@ class LeaveBusinessService:
             if not pm_project_ids.intersection(tr_project_ids):
                 raise HTTPException(status_code=403, detail="You can only approve leaves for resources in your projects.")
 
+        # ── Calculate requested leave days ─────────────────────────────────
+        requested_days = (leave.end_date - leave.start_date).days + 1
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+
+        # ── Balance check by leave type ────────────────────────────────────
+        leave_type = leave.leave_type
+        detail = None
+
+        if leave_type == LeaveType.EL.value:
+            # Earned Leave: check remaining balance
+            total_earned = balance.total_earned if balance else 12.0
+            used_earned = balance.used_earned if balance else 0.0
+            remaining = total_earned - used_earned
+            if remaining < requested_days:
+                detail = f"Insufficient earned leave balance. Remaining: {remaining}, Requested: {requested_days}"
+
+        elif leave_type == LeaveType.PL.value:
+            # Comp Off / Paid Leave: check accrued - consumed
+            accrued = balance.accrued_compoff if balance else 0.0
+            consumed = balance.consumed_compoff if balance else 0.0
+            remaining = accrued - consumed
+            if remaining < requested_days:
+                detail = f"Insufficient comp off balance. Remaining: {remaining}, Requested: {requested_days}"
+
+        # UPL: no balance check needed, always passes
+
+        if detail:
+            raise HTTPException(status_code=400, detail=detail)
+
+        # ── Mark leave as approved ─────────────────────────────────────────
         now = datetime.utcnow()
         actor_email = current_user.get("email")
         
@@ -278,6 +429,14 @@ class LeaveBusinessService:
             approved_at=now, 
             approved_by=actor_email,
         )
+
+        # ── Update leave balance (consume credit) ──────────────────────────
+        if balance:
+            if leave_type == LeaveType.EL.value:
+                self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
+            elif leave_type == LeaveType.PL.value:
+                self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
+
         return True
 
     async def reject_leave(self, leave_id: str, current_user: dict) -> bool:

@@ -39,8 +39,11 @@ class Attendance(Base):
     is_late = Column(Boolean, nullable=False, server_default=text("false"))
     status = Column(String(50), nullable=False, server_default=text("'present'"))
     is_manual_entry = Column(Boolean, nullable=False, server_default=text("false"))
+    is_synced = Column(Boolean, nullable=False, server_default=text("false"))
+    server_received_at = Column(DateTime(timezone=True), nullable=True)
     modified_by = Column(String(255), nullable=True)
     remarks = Column(String(500), nullable=True)
+    comp_off_credited = Column(Boolean, nullable=False, server_default=text("false"))
     is_deleted = Column(Boolean, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
@@ -65,6 +68,8 @@ class Attendance(Base):
             "isLate": self.is_late,
             "status": self.status,
             "isManualEntry": self.is_manual_entry,
+            "isSynced": self.is_synced,
+            "serverReceivedAt": self.server_received_at.isoformat() if self.server_received_at else None,
             "modifiedBy": self.modified_by,
             "remarks": self.remarks,
             "isDeleted": self.is_deleted,

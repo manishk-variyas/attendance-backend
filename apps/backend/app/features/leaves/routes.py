@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from typing import List
+from typing import List, Optional
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
@@ -177,6 +177,17 @@ async def apply_leave(
             logger.warning(f"Failed to create notification: {e}")
 
     return {"message": "Leave application submitted successfully", "leave_id": leave_id}
+
+@router.post("/emergency")
+async def emergency_leave(
+    payload: Optional[dict] = None,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    user_id = current_user.get("sub")
+    email = current_user.get("email")
+    reason = payload.get("reason") if payload else None
+    return leave_service.emergency_leave(user_id, email, reason)
 
 @router.get("/pending")
 async def get_pending_leaves(

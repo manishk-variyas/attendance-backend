@@ -4,6 +4,7 @@ from typing import Optional
 
 
 class OfficeLocationCreate(BaseModel):
+    category: str = Field("Office", max_length=50)
     name: str = Field(..., max_length=255)
     address: Optional[str] = Field(None, max_length=500)
     city: Optional[str] = Field(None, max_length=100)
@@ -14,6 +15,7 @@ class OfficeLocationCreate(BaseModel):
 
 
 class OfficeLocationUpdate(BaseModel):
+    category: Optional[str] = Field(None, max_length=50)
     name: Optional[str] = Field(None, max_length=255)
     address: Optional[str] = Field(None, max_length=500)
     city: Optional[str] = Field(None, max_length=100)
@@ -25,6 +27,7 @@ class OfficeLocationUpdate(BaseModel):
 
 class OfficeLocationResponse(BaseModel):
     id: str
+    category: str = "Office"
     name: str
     address: Optional[str] = None
     city: Optional[str] = None

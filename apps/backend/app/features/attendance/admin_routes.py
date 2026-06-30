@@ -10,21 +10,53 @@ from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.attendance.schemas import AdminAttendanceCreate, AdminAttendanceUpdate, AttendanceResponse
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
+from app.models.office_location import OfficeLocation
+from app.models.shift_definition import ShiftDefinition
 from app.services.database.base_service import BaseService
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/attendance", tags=["admin-attendance"])
 
 
-def _to_response(a: Attendance) -> dict:
-    return a.to_dict()
+def _safe_zone(tz_str: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_str)
+    except Exception:
+        return ZoneInfo("Asia/Kolkata")
+
+
+def _enrich(db: Session, data: dict, a: Attendance) -> dict:
+    if a.location_id:
+        office = db.query(OfficeLocation).filter(OfficeLocation.id == a.location_id).first()
+        data["officeName"] = office.name if office else None
+    else:
+        data["officeName"] = None
+    if a.shift_code:
+        sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == a.shift_code).first()
+        if sd:
+            data["shiftName"] = sd.shift_name
+            tz = sd.timezone or "Asia/Kolkata"
+            if sd.start_time:
+                data["shiftStartTime"] = datetime.combine(a.attendance_date, sd.start_time, tzinfo=_safe_zone(tz)).isoformat()
+            if sd.end_time:
+                data["shiftEndTime"] = datetime.combine(a.attendance_date, sd.end_time, tzinfo=_safe_zone(tz)).isoformat()
+    else:
+        data["shiftName"] = None
+    return data
+
+
+def _to_response(db: Session, a: Attendance) -> dict:
+    return _enrich(db, a.to_dict(), a)
 
 
 def _to_response_with_email(db: Session, a: Attendance) -> dict:
-    data = a.to_dict()
+    data = _enrich(db, a.to_dict(), a)
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.keycloak_user_id).first()
-    data["userEmail"] = emp.user_email if emp else None
+    if emp:
+        data["userEmail"] = emp.user_email
+        data["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
     return data
 
 
@@ -85,7 +117,7 @@ async def admin_create_attendance(
     db.refresh(attendance)
 
     logger.info(f"Admin {current_user['email']} created attendance for {payload.user_email} on {att_date}")
-    return _to_response(attendance)
+    return _to_response(db, attendance)
 
 
 @router.put("/{attendance_id}", response_model=AttendanceResponse)
@@ -128,7 +160,7 @@ async def admin_update_attendance(
     db.refresh(attendance)
 
     logger.info(f"Admin {current_user['email']} updated attendance {attendance_id}")
-    return _to_response(attendance)
+    return _to_response(db, attendance)
 
 
 @router.get("/{attendance_id}", response_model=AttendanceResponse)
@@ -141,7 +173,7 @@ async def admin_get_attendance(
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
-    return _to_response(attendance)
+    return _to_response(db, attendance)
 
 
 @router.get("")
@@ -150,6 +182,7 @@ async def admin_list_attendance(
     from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     status: Optional[str] = Query(None, description="Filter by status"),
+    is_synced: Optional[bool] = Query(None, description="Filter by synced records"),
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(20, ge=1, le=100, description="Items per page"),
     db: Session = Depends(get_db),
@@ -179,6 +212,8 @@ async def admin_list_attendance(
             raise HTTPException(status_code=400, detail="Invalid to_date format")
     if status:
         query = query.filter(Attendance.status == status)
+    if is_synced is not None:
+        query = query.filter(Attendance.is_synced == is_synced)
 
     total = query.count()
     offset = (page - 1) * per_page

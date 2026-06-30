@@ -25,8 +25,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub, get_redis
-from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password
+from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub
+from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.models.employee_master import EmployeeMaster
 from app.services.database.base_service import BaseService
@@ -111,6 +111,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
         value=session_id,
         httponly=True,  # Browser can't access this cookie via JavaScript (prevents XSS)
         secure=settings.COOKIE_SECURE,  # Only send over HTTPS in production
+         
         samesite="lax",  # Protects against CSRF attacks
         max_age=settings.SESSION_EXPIRE_HOURS * 3600,
         path="/",
@@ -306,6 +307,9 @@ async def signup(
         user_id = await create_keycloak_user(signup_data.username, signup_data.email, signup_data.timezone)
         await set_keycloak_password(user_id, signup_data.password)
 
+        # Assign Keycloak realm role (defaults to "Technical Resource")
+        await add_realm_role_to_user(user_id, signup_data.role)
+
         logger.info(f"User {signup_data.username} created via signup")
         log_security_event(
             correlation_id,
@@ -345,3 +349,13 @@ async def signup(
             severity="error",
         )
         raise HTTPException(status_code=500, detail="Failed to create user")
+
+
+@router.get("/roles")
+async def list_keycloak_roles(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    """Return all Keycloak realm roles. Admin only."""
+    return await get_realm_roles()

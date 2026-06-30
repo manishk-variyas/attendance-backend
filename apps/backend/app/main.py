@@ -37,7 +37,8 @@ root_logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
-    title="Backend API with Keycloak Authentication", version="1.0", lifespan=lifespan
+    title="Backend API with Keycloak Authentication", version="1.0", lifespan=lifespan,
+    docs_url=None, redoc_url=None, openapi_url=None,
 )
 
 # Add rate limiting middleware to track and limit requests per IP

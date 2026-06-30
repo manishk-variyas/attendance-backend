@@ -16,33 +16,11 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
-# Redis imports commented out as requested
-# import redis.asyncio as redis
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# In-memory session store
-# Key: session_id, Value: {data: dict, expires: datetime}
-
-# ===========================================================================================
-# Todo(Pending) - Should be persistent (Fix!!!!!)
-# ===========================================================================================
 _session_store: Dict[str, dict] = {}
-
-# ===========================================================================================
-# ===========================================================================================
-# ===========================================================================================
-
-
-async def get_redis():
-    """Redis is disabled - returning None as per migration request."""
-    return None
-
-
-async def close_redis():
-    """Redis is disabled."""
-    pass
 
 
 def generate_session_id() -> str:

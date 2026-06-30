@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.core.database import get_db
 from app.features.location.schemas.office_location import (
     OfficeLocationCreate,
@@ -17,6 +18,7 @@ router = APIRouter(prefix="/admin/office-locations", tags=["admin-office-locatio
 def _to_response(loc: OfficeLocation) -> dict:
     return {
         "id": str(loc.id),
+        "category": loc.category,
         "name": loc.name,
         "address": loc.address,
         "city": loc.city,
@@ -46,6 +48,7 @@ async def create_office_location(
         )
     loc = svc.create(
         OfficeLocation,
+        category=payload.category,
         name=payload.name,
         address=payload.address,
         city=payload.city,
@@ -55,17 +58,21 @@ async def create_office_location(
         radius_meters=payload.radius_meters,
         created_by=current_user.get("email"),
     )
+    db.execute(text("UPDATE office_locations SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) WHERE id = :id"), {"id": str(loc.id)})
+    db.commit()
     return _to_response(loc)
 
 
 @router.get("", response_model=List[OfficeLocationResponse])
 async def list_office_locations(
+    category: Optional[str] = Query(None, max_length=50),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
 ):
     svc = OfficeLocationService(db)
-    locations = svc.fetch_all(OfficeLocation)
+    if category:
+        locations = db.query(OfficeLocation).filter(OfficeLocation.category == category).all()
+    else:
+        locations = svc.fetch_all(OfficeLocation)
     return [_to_response(l) for l in locations]
 
 
@@ -73,8 +80,6 @@ async def list_office_locations(
 async def get_office_location(
     location_id: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
 ):
     svc = OfficeLocationService(db)
     loc = svc.fetch_one(OfficeLocation, id=location_id)
@@ -101,6 +106,16 @@ async def update_office_location(
         return _to_response(existing)
 
     loc = svc.update(OfficeLocation, location_id, **update_data)
+
+    # Sync PostGIS geom whenever lat/lng change
+    if "latitude" in update_data or "longitude" in update_data:
+        db.execute(text("""
+            UPDATE office_locations
+            SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+            WHERE id = :id
+        """), {"id": location_id})
+        db.commit()
+
     return _to_response(loc)
 
 

@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.database import init_db
-from app.features.auth.services.session import close_redis
 
 
 logger = logging.getLogger(__name__)
@@ -18,4 +17,3 @@ async def lifespan(app: FastAPI):
     yield
     
     logger.info("Shutting down Backend API...")
-    await close_redis()

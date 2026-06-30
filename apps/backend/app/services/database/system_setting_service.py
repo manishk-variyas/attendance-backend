@@ -14,7 +14,9 @@ class SystemSettingService(BaseService[SystemSetting]):
         stmt = select(SystemSetting).where(SystemSetting.id == "company")
         return self.db.execute(stmt).scalars().first()
 
-    def upsert(self, company_name: str = "", logo_content_type: str = None, created_by: str = None, updated_by: str = None) -> SystemSetting:
+    def upsert(self, company_name: str = "", logo_content_type: str = None, created_by: str = None, updated_by: str = None,
+               default_shift_start_time: str = None, default_shift_end_time: str = None,
+               default_timezone: str = None, grace_minutes: int = None) -> SystemSetting:
         existing = self.fetch()
         now = datetime.utcnow()
         data = {"company_name": company_name, "updated_at": now}
@@ -24,6 +26,14 @@ class SystemSettingService(BaseService[SystemSetting]):
             data["created_by"] = created_by
         if updated_by:
             data["updated_by"] = updated_by
+        if default_shift_start_time is not None:
+            data["default_shift_start_time"] = datetime.strptime(default_shift_start_time, "%H:%M").time() if default_shift_start_time else None
+        if default_shift_end_time is not None:
+            data["default_shift_end_time"] = datetime.strptime(default_shift_end_time, "%H:%M").time() if default_shift_end_time else None
+        if default_timezone is not None:
+            data["default_timezone"] = default_timezone
+        if grace_minutes is not None:
+            data["grace_minutes"] = grace_minutes
         if existing:
             for k, v in data.items():
                 setattr(existing, k, v)

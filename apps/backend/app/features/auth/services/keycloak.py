@@ -87,35 +87,10 @@ async def revoke_keycloak_token(refresh_token: str) -> bool:
 
 
 async def get_jwks() -> dict:
-    """
-    Get Keycloak's JSON Web Key Set (JWKS).
-    
-    The JWKS contains the public keys that Keycloak uses to sign JWTs.
-    These keys are needed to verify that a JWT was actually issued by Keycloak.
-    
-    How it works:
-    1. Check Redis cache first (keys don't change often)
-    2. If not cached, fetch from Keycloak's JWKS endpoint
-    3. Cache the result in Redis for 1 hour
-    
-    Returns:
-        dict: The JWKS containing public keys
-    """
-    from .session import get_redis
-
-    r = await get_redis()
-    cached = await r.get("jwks:keys")
-    if cached:
-        return json.loads(cached)
-
     async with httpx.AsyncClient() as client:
         response = await client.get(settings.JWKS_URL)
         response.raise_for_status()
-        jwks = response.json()
-
-    # Cache JWKS for 1 hour (they don't change often)
-    await r.setex("jwks:keys", 3600, json.dumps(jwks))
-    return jwks
+        return response.json()
 
 
 async def get_admin_token() -> str:
@@ -193,3 +168,83 @@ async def set_keycloak_password(user_id: str, password: str) -> bool:
         )
 
     return response.status_code == 204
+
+
+async def get_realm_roles() -> list:
+    """Fetch all realm roles from Keycloak."""
+    admin_token = await get_admin_token()
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/roles",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        resp.raise_for_status()
+        return [{"id": r["id"], "name": r["name"]} for r in resp.json()]
+
+
+async def add_realm_role_to_user(user_id: str, role_name: str) -> bool:
+    """Assign a realm role to a Keycloak user."""
+    roles = await get_realm_roles()
+    role = next((r for r in roles if r["name"] == role_name), None)
+    if not role:
+        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
+
+    admin_token = await get_admin_token()
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            json=[{"id": role["id"], "name": role["name"]}],
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+        )
+    return resp.status_code == 204
+
+
+async def remove_realm_role_from_user(user_id: str, role_name: str) -> bool:
+    """Remove a realm role from a Keycloak user."""
+    roles = await get_realm_roles()
+    role = next((r for r in roles if r["name"] == role_name), None)
+    if not role:
+        return False
+
+    admin_token = await get_admin_token()
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            json=[{"id": role["id"], "name": role["name"]}],
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+        )
+    return resp.status_code == 204
+
+
+async def update_keycloak_user(user_id: str, data: dict) -> bool:
+    """Update a Keycloak user's profile."""
+    admin_token = await get_admin_token()
+    payload = {}
+    if "email" in data:
+        payload["email"] = data["email"]
+    if "firstName" in data:
+        payload["firstName"] = data["firstName"]
+    if "lastName" in data:
+        payload["lastName"] = data["lastName"]
+    if "attributes" in data:
+        payload["attributes"] = data["attributes"]
+
+    if not payload:
+        return True
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+        )
+    return resp.status_code == 204

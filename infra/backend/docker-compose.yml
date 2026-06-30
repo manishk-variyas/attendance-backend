@@ -21,10 +21,7 @@ services:
       # Internal Docker network URL for the backend
       BACKEND_URL: http://backend:8000
     depends_on:
-      # Wait for these services to be started before starting backend
       keycloak-db:
-        condition: service_started
-      redis:
         condition: service_started
       keycloak:
         condition: service_started

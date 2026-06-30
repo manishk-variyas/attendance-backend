@@ -1,0 +1,47 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+.uv
+*.egg
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Tests
+tests/
+test_*/
+*_test.py
+test_*.py
+
+# Scripts (only keep cron-related and bootstrap)
+scripts/*.py
+!scripts/log-cleanup.cron
+!scripts/bootstrap_admin_employee.py
+
+# Env files
+.env
+.env.*
+*.env
+
+# Logs (created at runtime)
+logs/
+*.log
+
+# Docs
+*.md
+README*
+
+# Docker files
+Dockerfile
+.dockerignore
+docker-compose*

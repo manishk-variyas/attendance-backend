@@ -338,10 +338,6 @@ async def get_shifts_by_date(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    roles = current_user.get("roles", [])
-    if "Admin" in roles or "Project Manager" in roles:
-        return await shift_service.get_shifts_by_date(db, date_str)
-
     email = current_user.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="User email not found.")

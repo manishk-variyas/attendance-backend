@@ -1,15 +1,21 @@
 from pydantic import BaseModel, Field
 from typing import Optional
+from datetime import datetime
 
 
 class CheckInRequest(BaseModel):
     latitude: float
     longitude: float
+    clientTimestamp: Optional[datetime] = None
+    date: Optional[str] = Field(None, description="YYYY-MM-DD for next-day check-in, defaults to today")
 
 
 class CheckOutRequest(BaseModel):
     latitude: float
     longitude: float
+    clientTimestamp: Optional[datetime] = None
+    date: Optional[str] = Field(None, description="YYYY-MM-DD for next-day checkout, defaults to today")
+    remarks: Optional[str] = Field(None, max_length=100)
 
 
 class AttendanceResponse(BaseModel):
@@ -30,6 +36,7 @@ class AttendanceResponse(BaseModel):
     shiftCode: Optional[str] = None
     totalHours: Optional[float] = None
     isLate: bool
+    isSynced: bool = False
     status: str
     remarks: Optional[str] = None
     createdAt: str
@@ -59,3 +66,12 @@ class AdminAttendanceUpdate(BaseModel):
     status: Optional[str] = None
     is_late: Optional[bool] = None
     remarks: Optional[str] = None
+
+
+class CompleteAttendanceRequest(BaseModel):
+    date: str
+    checkInTime: datetime
+    checkOutTime: datetime
+    latitude: float
+    longitude: float
+    remarks: Optional[str] = Field(None, max_length=100)

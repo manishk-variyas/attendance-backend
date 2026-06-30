@@ -68,3 +68,26 @@ class AssignProjectRequest(BaseModel):
     user_email: str
     project_id: int
     reports_to: int
+    redmine_role_name: Optional[str] = "Developer"
+
+
+class EmployeeUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    user_email: Optional[str] = None
+    designation: Optional[str] = None
+    contact_number: Optional[str] = None
+    alt_contact_number: Optional[str] = None
+    work_address: Optional[str] = None
+    home_address: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None
+    location_id: Optional[str] = None
+    reports_to: Optional[int] = None
+    project_id: Optional[int] = None
+    redmine_role_name: Optional[str] = None
+    keycloak_role_name: Optional[str] = None
+
+
+class DisonboardRequest(BaseModel):
+    project_id: int

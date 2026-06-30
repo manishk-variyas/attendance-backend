@@ -29,28 +29,29 @@ class ShiftService:
         end = date.fromisoformat(data.get("endDate", data["date"]))
 
         keycloak_id = data.get("keycloakUserId", "")
-        if not keycloak_id and current_user:
-            keycloak_id = current_user.get("sub", "")
         if not keycloak_id:
             redmine_uid = data.get("userId")
             if redmine_uid:
                 emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == redmine_uid)).scalars().first()
                 if emp:
                     keycloak_id = emp.keycloak_user_id
+        if not keycloak_id and current_user:
+            keycloak_id = current_user.get("sub", "")
         if not keycloak_id:
             keycloak_id = data.get("userEmail", "")
 
         ws = data.get("workStatus", "OFFICE").upper()
-        work_location_map = {"PRESENT": "OFFICE", "REMOTE": "WFH", "CUSTOMER_SITE": "HOME"}
+        work_location_map = {"PRESENT": "OFFICE", "ON-SITE": "CUSTOMER_SITE", "REMOTE": "REMOTE", "WFH": "REMOTE", "CUSTOMER_SITE": "CUSTOMER_SITE", "HOME": "CUSTOMER_SITE"}
         if ws in work_location_map:
             ws = work_location_map[ws]
 
         work_address = data.get("workAddress", "N/A")
-        emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == keycloak_id)).scalars().first()
-        if emp and emp.location_id:
-            office = db.execute(select(OfficeLocation).where(OfficeLocation.id == emp.location_id)).scalars().first()
-            if office:
-                work_address = office.address or f"{office.name}, {office.city or ''}".strip(", ")
+        if work_address == "N/A":
+            emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == keycloak_id)).scalars().first()
+            if emp and emp.location_id:
+                office = db.execute(select(OfficeLocation).where(OfficeLocation.id == emp.location_id)).scalars().first()
+                if office:
+                    work_address = office.address or f"{office.name}, {office.city or ''}".strip(", ")
 
         start_time = None
         end_time = None
