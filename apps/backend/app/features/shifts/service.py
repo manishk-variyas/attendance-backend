@@ -10,6 +10,7 @@ from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
 from sqlalchemy import select
+from sqlalchemy import update as sql_update, delete as sql_delete
 
 logger = logging.getLogger(__name__)
 
@@ -210,8 +211,8 @@ class ShiftService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Shift code '{data['shiftCode']}' already exists.",
             )
-        start = datetime.strptime(data.get("startTime", "00:00"), "%H:%M").time()
-        end = datetime.strptime(data.get("endTime", "00:00"), "%H:%M").time()
+        start = datetime.strptime(data.get("startTime", "00:00")[:5], "%H:%M").time()
+        end = datetime.strptime(data.get("endTime", "00:00")[:5], "%H:%M").time()
         sd = svc.create(ShiftDefinition,
             shift_code=data["shiftCode"],
             shift_name=data.get("shiftName", ""),
@@ -259,20 +260,25 @@ class ShiftService:
         if "shiftName" in data:
             update_data["shift_name"] = data["shiftName"]
         if "startTime" in data:
-            update_data["start_time"] = datetime.strptime(data["startTime"], "%H:%M").time()
+            update_data["start_time"] = datetime.strptime(data["startTime"][:5], "%H:%M").time()
         if "endTime" in data:
-            update_data["end_time"] = datetime.strptime(data["endTime"], "%H:%M").time()
+            update_data["end_time"] = datetime.strptime(data["endTime"][:5], "%H:%M").time()
         if "timezone" in data:
             update_data["timezone"] = data["timezone"]
         if "country" in data:
             update_data["country"] = data["country"]
         if update_data:
-            svc.update(ShiftDefinition, shift_id, **update_data)
+            svc.db.execute(
+                sql_update(ShiftDefinition).where(ShiftDefinition.shift_id == shift_id).values(**update_data)
+            )
+            svc.db.commit()
         return await self.get_shift_definition(db, shift_id)
 
     async def delete_shift_definition(self, db: Session, shift_id: str) -> bool:
         svc = self._def_svc(db)
-        return svc.delete(ShiftDefinition, shift_id)
+        result = svc.db.execute(sql_delete(ShiftDefinition).where(ShiftDefinition.shift_id == shift_id))
+        svc.db.commit()
+        return result.rowcount > 0
 
     async def search_shifts(self, db: Session, query: str, limit: int = 5) -> List[dict]:
         svc = self._svc(db)

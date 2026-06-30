@@ -196,20 +196,56 @@ async def check_in(
     shift_start_time = None
     shift_tz = "Asia/Kolkata"
 
-    today_shift = db.query(Shift).filter(
+    all_shifts_today = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
             Shift.date == target_date,
         )
-    ).first()
-    if today_shift:
-        shift_code = today_shift.shift_code
-        shift_def = db.query(ShiftDefinition).filter(
-            ShiftDefinition.shift_code == shift_code
-        ).first()
-        if shift_def:
-            shift_start_time = shift_def.start_time
-            shift_tz = shift_def.timezone or "Asia/Kolkata"
+    ).all()
+
+    if all_shifts_today:
+        shift_defs = {
+            s.shift_code: db.query(ShiftDefinition).filter(
+                ShiftDefinition.shift_code == s.shift_code
+            ).first()
+            for s in all_shifts_today
+        }
+
+        now_tz = now.astimezone(timezone.utc)
+        active_shift = None
+        next_upcoming = None
+        earliest = None
+        earliest_dt = None
+
+        for s in all_shifts_today:
+            sd = shift_defs.get(s.shift_code)
+            if not sd:
+                continue
+            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            start_dt = datetime.combine(target_date, sd.start_time, tzinfo=tz)
+            end_dt = _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz)
+
+            if earliest_dt is None or start_dt < earliest_dt:
+                earliest_dt = start_dt
+                earliest = (s, sd, tz, start_dt, end_dt)
+
+            if start_dt <= now_tz <= end_dt:
+                active_shift = (s, sd, tz, start_dt, end_dt)
+                break
+
+            if next_upcoming is None and start_dt > now_tz:
+                next_upcoming = (s, sd, tz, start_dt, end_dt)
+
+        picked = active_shift or next_upcoming
+        if not picked:
+            raise HTTPException(
+                status_code=400,
+                detail="All shifts for today have ended. No active or upcoming shift.",
+            )
+        s, sd, tz, start_dt, end_dt = picked
+        shift_code = s.shift_code
+        shift_start_time = sd.start_time
+        shift_tz = sd.timezone or "Asia/Kolkata"
 
     company = None
     if not shift_start_time:
