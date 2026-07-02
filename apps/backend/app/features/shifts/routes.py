@@ -134,10 +134,24 @@ async def create_bulk_shifts(
     if start < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
+    try:
+        st = time.fromisoformat(payload.shiftStartTime[:5])
+        et = time.fromisoformat(payload.shiftEndTime[:5])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM.")
+    if st == et:
+        raise HTTPException(status_code=400, detail="Shift start and end time cannot be the same.")
+
+    from app.models.shift_definition import ShiftDefinition
+    shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
+    if not shift_def:
+        raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
+
     base = payload.model_dump(exclude={"startDate", "endDate"})
 
-    created_shifts = []
+    created = []
     skipped_dates = []
+    leave_blocked = []
 
     from app.services.database.shift_service import ShiftService as PGShiftService
     svc = PGShiftService(db)
@@ -145,21 +159,30 @@ async def create_bulk_shifts(
     while current_date <= end:
         date_str = current_date.isoformat()
 
-        existing = svc.fetch_by_date_and_user(payload.userId, date_str)
-        if existing:
-            skipped_dates.append(date_str)
-        else:
-            shift_data = {**base, "date": date_str, "endDate": date_str}
-            result = await shift_service.create_shift(db, shift_data, current_user)
-            created_shifts.append(result)
+        on_leave = db.execute(
+            select(Leave).where(
+                Leave.user_email == payload.userEmail,
+                Leave.approval_status.in_(["approved"]),
+                Leave.start_date <= current_date,
+                Leave.end_date >= current_date,
+            )
+        ).scalars().first()
+        if on_leave:
+            leave_blocked.append(date_str)
+            current_date += timedelta(days=1)
+            continue
 
+        svc.delete_by_user_and_date(payload.userId, date_str)
+        shift_data = {**base, "date": date_str, "endDate": date_str}
+        result = await shift_service.create_shift(db, shift_data, current_user)
+        created.append(result)
         current_date += timedelta(days=1)
 
     return {
-        "created": len(created_shifts),
-        "skipped": len(skipped_dates),
-        "skipped_dates": skipped_dates,
-        "shifts": created_shifts,
+        "created": len(created),
+        "skipped_leave": len(leave_blocked),
+        "leave_dates": leave_blocked,
+        "shifts": created,
     }
 
 

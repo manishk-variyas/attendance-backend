@@ -28,6 +28,7 @@ class OfficeLocation(Base):
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     radius_meters = Column(Float, nullable=False, server_default=text("300"))  # geofence radius
+    parent_location_id = Column(UUID(as_uuid=True), nullable=True)
     created_by = Column(String(255), nullable=True)      # admin email who created it
     geom = Column(Geometry("POINT", srid=4326), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
@@ -44,6 +45,7 @@ class OfficeLocation(Base):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "radius_meters": self.radius_meters,
+            "parent_location_id": str(self.parent_location_id) if self.parent_location_id else None,
             "created_by": self.created_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

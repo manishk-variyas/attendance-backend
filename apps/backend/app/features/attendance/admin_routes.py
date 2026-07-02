@@ -6,7 +6,7 @@ from sqlalchemy import and_
 from typing import List, Optional
 
 from app.core.database import get_db
-from app.features.auth.dependencies import get_current_user, require_admin
+from app.features.auth.dependencies import get_current_user, require_admin, require_admin_or_pm
 from app.features.attendance.schemas import AdminAttendanceCreate, AdminAttendanceUpdate, AttendanceResponse
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
@@ -86,16 +86,21 @@ async def admin_create_attendance(
     if existing:
         raise HTTPException(status_code=409, detail="Attendance record already exists for this date")
 
+    IST = ZoneInfo("Asia/Kolkata")
     check_in = None
     check_out = None
     if payload.check_in_time:
         try:
             check_in = datetime.fromisoformat(payload.check_in_time)
+            if check_in.tzinfo is None:
+                check_in = check_in.replace(tzinfo=IST)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid check_in_time format")
     if payload.check_out_time:
         try:
             check_out = datetime.fromisoformat(payload.check_out_time)
+            if check_out.tzinfo is None:
+                check_out = check_out.replace(tzinfo=IST)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid check_out_time format")
 
@@ -126,30 +131,48 @@ async def admin_update_attendance(
     payload: AdminAttendanceUpdate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
+    roles = current_user.get("roles", [])
+    is_pm = "Admin" not in roles
+
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
-    if payload.check_in_time is not None:
-        try:
-            attendance.check_in_time = datetime.fromisoformat(payload.check_in_time) if payload.check_in_time else None
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid check_in_time format")
-    if payload.check_out_time is not None:
-        try:
-            attendance.check_out_time = datetime.fromisoformat(payload.check_out_time) if payload.check_out_time else None
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid check_out_time format")
-    if payload.work_location_status is not None:
-        attendance.work_location_status = payload.work_location_status
-    if payload.shift_code is not None:
-        attendance.shift_code = payload.shift_code
-    if payload.status is not None:
-        attendance.status = payload.status
-    if payload.is_late is not None:
-        attendance.is_late = payload.is_late
+    if is_pm:
+        if payload.remarks is None:
+            raise HTTPException(status_code=400, detail="PM can only update remarks.")
+        if payload.check_in_time is not None or payload.check_out_time is not None or \
+           payload.work_location_status is not None or payload.shift_code is not None or \
+           payload.status is not None or payload.is_late is not None:
+            raise HTTPException(status_code=403, detail="PM can only update remarks. Admin required for other fields.")
+    else:
+        if payload.check_in_time is not None:
+            try:
+                t = datetime.fromisoformat(payload.check_in_time) if payload.check_in_time else None
+                if t and t.tzinfo is None:
+                    t = t.replace(tzinfo=IST)
+                attendance.check_in_time = t
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid check_in_time format")
+        if payload.check_out_time is not None:
+            try:
+                t = datetime.fromisoformat(payload.check_out_time) if payload.check_out_time else None
+                if t and t.tzinfo is None:
+                    t = t.replace(tzinfo=IST)
+                attendance.check_out_time = t
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid check_out_time format")
+        if payload.work_location_status is not None:
+            attendance.work_location_status = payload.work_location_status
+        if payload.shift_code is not None:
+            attendance.shift_code = payload.shift_code
+        if payload.status is not None:
+            attendance.status = payload.status
+        if payload.is_late is not None:
+            attendance.is_late = payload.is_late
+
     if payload.remarks is not None:
         attendance.remarks = payload.remarks
 
@@ -168,7 +191,7 @@ async def admin_get_attendance(
     attendance_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
@@ -187,7 +210,7 @@ async def admin_list_attendance(
     per_page: int = Query(20, ge=1, le=100, description="Items per page"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
     query = db.query(Attendance)
 

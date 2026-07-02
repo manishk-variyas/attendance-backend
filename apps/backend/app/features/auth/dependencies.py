@@ -77,6 +77,12 @@ def require_role(role: str):
 require_admin = require_role("Admin")
 
 
+async def require_admin_or_pm(current_user: dict = Depends(get_current_user)) -> None:
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+
 async def require_active(
     db: DBSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),

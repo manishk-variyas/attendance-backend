@@ -12,6 +12,7 @@ class OfficeLocationCreate(BaseModel):
     latitude: float
     longitude: float
     radius_meters: float = 300
+    parent_location_id: Optional[str] = None
 
 
 class OfficeLocationUpdate(BaseModel):
@@ -23,6 +24,7 @@ class OfficeLocationUpdate(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     radius_meters: Optional[float] = None
+    parent_location_id: Optional[str] = None
 
 
 class OfficeLocationResponse(BaseModel):
@@ -35,6 +37,7 @@ class OfficeLocationResponse(BaseModel):
     latitude: float
     longitude: float
     radius_meters: float
+    parent_location_id: Optional[str] = None
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: datetime

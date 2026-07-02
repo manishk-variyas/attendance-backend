@@ -26,6 +26,7 @@ def _to_response(loc: OfficeLocation) -> dict:
         "latitude": loc.latitude,
         "longitude": loc.longitude,
         "radius_meters": loc.radius_meters,
+        "parent_location_id": str(loc.parent_location_id) if loc.parent_location_id else None,
         "created_by": loc.created_by,
         "created_at": loc.created_at,
         "updated_at": loc.updated_at,
@@ -56,6 +57,7 @@ async def create_office_location(
         latitude=payload.latitude,
         longitude=payload.longitude,
         radius_meters=payload.radius_meters,
+        parent_location_id=payload.parent_location_id,
         created_by=current_user.get("email"),
     )
     db.execute(text("UPDATE office_locations SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) WHERE id = :id"), {"id": str(loc.id)})
@@ -105,6 +107,22 @@ async def update_office_location(
     if not update_data:
         return _to_response(existing)
 
+    if "parent_location_id" in update_data:
+        new_parent = update_data["parent_location_id"]
+        if new_parent and new_parent == location_id:
+            raise HTTPException(status_code=400, detail="A location cannot be its own parent.")
+        if new_parent:
+            current = new_parent
+            visited = set()
+            while current:
+                if current == location_id:
+                    raise HTTPException(status_code=400, detail="Circular parent chain detected.")
+                if current in visited:
+                    raise HTTPException(status_code=400, detail="Circular parent chain detected.")
+                visited.add(current)
+                parent_loc = svc.fetch_one(OfficeLocation, id=current)
+                current = str(parent_loc.parent_location_id) if parent_loc and parent_loc.parent_location_id else None
+
     loc = svc.update(OfficeLocation, location_id, **update_data)
 
     # Sync PostGIS geom whenever lat/lng change
@@ -127,6 +145,9 @@ async def delete_office_location(
     _: None = Depends(require_admin),
 ):
     svc = OfficeLocationService(db)
+    child = db.query(OfficeLocation).filter(OfficeLocation.parent_location_id == location_id).first()
+    if child:
+        raise HTTPException(status_code=400, detail="Cannot delete — this location has sub-locations. Remove them first.")
     deleted = svc.delete(OfficeLocation, location_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Office location not found")
