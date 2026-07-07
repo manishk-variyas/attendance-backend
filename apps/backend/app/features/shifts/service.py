@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timedelta, timezone, date
 from typing import List, Optional
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -8,6 +8,9 @@ from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
+from app.models.holiday import Holiday
+from app.models.leave import Leave
+from app.models.attendance import Attendance
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
 from sqlalchemy import select
 from sqlalchemy import update as sql_update, delete as sql_delete
@@ -23,6 +26,57 @@ class ShiftService:
 
     def _def_svc(self, db: Session) -> PGShiftDefinitionService:
         return PGShiftDefinitionService(db)
+
+    def _collect_warnings(self, db: Session, keycloak_id: str, start: date, end: date) -> list:
+        warnings = []
+        current = start
+        while current <= end:
+            if current.weekday() >= 5:
+                warnings.append({"date": current.isoformat(), "type": "weekend", "label": current.strftime("%A")})
+
+            holiday_rec = db.query(Holiday).filter(Holiday.holiday_date == current).first()
+            if holiday_rec:
+                warnings.append({"date": current.isoformat(), "type": "holiday", "label": holiday_rec.holiday_name})
+
+            leave_rec = db.query(Leave).filter(
+                Leave.keycloak_user_id == keycloak_id,
+                Leave.start_date <= current,
+                Leave.end_date >= current,
+                Leave.approval_status == "approved",
+            ).first()
+            if leave_rec:
+                warnings.append({"date": current.isoformat(), "type": "leave", "label": leave_rec.leave_type})
+
+            current += timedelta(days=1)
+
+        overlaps = db.query(Shift).filter(
+            Shift.keycloak_user_id == keycloak_id,
+            Shift.date <= end,
+            Shift.end_date >= start,
+        ).all()
+        for s in overlaps:
+            warnings.append({"date": s.date.isoformat(), "type": "overlap", "label": f"Overlaps with {s.shift_code} ({s.date} → {s.end_date})"})
+
+        return warnings
+
+    async def validate_shift(self, db: Session, data: dict, current_user: dict = None) -> dict:
+        keycloak_id = data.get("keycloakUserId", "")
+        if not keycloak_id:
+            redmine_uid = data.get("userId")
+            if redmine_uid:
+                emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == redmine_uid)).scalars().first()
+                if emp:
+                    keycloak_id = emp.keycloak_user_id
+        if not keycloak_id and current_user:
+            keycloak_id = current_user.get("sub", "")
+        if not keycloak_id:
+            keycloak_id = data.get("userEmail", "")
+
+        d = date.fromisoformat(data["date"])
+        end = date.fromisoformat(data.get("endDate", data["date"]))
+        warnings = self._collect_warnings(db, keycloak_id, d, end)
+        has_warnings = len(warnings) > 0
+        return {"valid": not has_warnings, "warnings": warnings, "message": f"Found {len(warnings)} warning(s)" if has_warnings else "No conflicts found"}
 
     async def create_shift(self, db: Session, data: dict, current_user: dict = None) -> dict:
         svc = self._svc(db)
@@ -42,14 +96,18 @@ class ShiftService:
             keycloak_id = data.get("userEmail", "")
 
         ws = data.get("workStatus", "OFFICE").upper()
-        work_location_map = {"PRESENT": "OFFICE", "ON-SITE": "CUSTOMER_SITE", "REMOTE": "REMOTE", "WFH": "REMOTE", "CUSTOMER_SITE": "CUSTOMER_SITE", "HOME": "CUSTOMER_SITE"}
+        work_location_map = {"PRESENT": "OFFICE", "ON-SITE": "REMOTE_ONSITE", "WFH": "WFH", "REMOTE_ONSITE": "REMOTE_ONSITE", "REMOTE_OFFSITE": "REMOTE_OFFSITE"}
         if ws in work_location_map:
             ws = work_location_map[ws]
 
         work_address = data.get("workAddress", "N/A")
         if work_address == "N/A":
             emp = db.execute(select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == keycloak_id)).scalars().first()
-            if emp and emp.location_id:
+            if not emp:
+                work_address = "N/A"
+            elif ws == "WFH":
+                work_address = emp.home_address or "N/A"
+            elif emp.location_id:
                 office = db.execute(select(OfficeLocation).where(OfficeLocation.id == emp.location_id)).scalars().first()
                 if office:
                     work_address = office.address or f"{office.name}, {office.city or ''}".strip(", ")
@@ -82,8 +140,14 @@ class ShiftService:
             shift_end_time=end_time,
             shift_start_utc=data.get("shiftStartUTC"),
             shift_end_utc=data.get("shiftEndUTC"),
+            location_id=data.get("locationId"),
             country=data.get("country", ""),
+            per_diem_eligible=data.get("perDiemEligible", False),
+            conveyance_eligible=data.get("conveyanceEligible", False),
         )
+
+        warnings = self._collect_warnings(db, keycloak_id, d, end)
+
         return {
             "id": str(shift.id),
             "userId": shift.redmine_user_id,
@@ -99,7 +163,11 @@ class ShiftService:
             "shiftEndTime": shift.shift_end_time.isoformat() if shift.shift_end_time else None,
             "shiftStartUTC": shift.shift_start_utc,
             "shiftEndUTC": shift.shift_end_utc,
+            "locationId": str(shift.location_id) if shift.location_id else None,
             "country": shift.country,
+            "perDiemEligible": shift.per_diem_eligible,
+            "conveyanceEligible": shift.conveyance_eligible,
+            "warnings": warnings,
             "createdAt": shift.created_at,
             "updatedAt": shift.updated_at,
         }
@@ -156,14 +224,19 @@ class ShiftService:
             {
                 "id": str(s.id),
                 "userId": s.redmine_user_id,
+                "userName": None,
                 "userEmail": s.user_email,
-                "date": s.date.isoformat() if s.date else None,
-                "endDate": s.end_date.isoformat() if s.end_date else None,
-                "shift": s.shift_code,
                 "projectId": s.project_id,
                 "projectName": s.project_name,
+                "shift": s.shift_code,
                 "workStatus": s.work_location_status,
+                "status": s.status,
                 "workAddress": s.work_address,
+                "leaveType": None,
+                "perDiemEligible": s.per_diem_eligible,
+                "conveyanceEligible": s.conveyance_eligible,
+                "date": s.date.isoformat() if s.date else None,
+                "endDate": s.end_date.isoformat() if s.end_date else None,
                 "shiftStartTime": s.shift_start_time.isoformat() if s.shift_start_time else None,
                 "shiftEndTime": s.shift_end_time.isoformat() if s.shift_end_time else None,
                 "createdAt": s.created_at,
@@ -187,6 +260,9 @@ class ShiftService:
             "projectId": "project_id",
             "projectName": "project_name",
             "endDate": "end_date",
+            "locationId": "location_id",
+            "perDiemEligible": "per_diem_eligible",
+            "conveyanceEligible": "conveyance_eligible",
         }
         update_data = {}
         for mongo_key, pg_col in mapping.items():
@@ -200,8 +276,89 @@ class ShiftService:
         return await self.get_shift_by_id(db, shift_id)
 
     async def delete_shift(self, db: Session, shift_id: str) -> bool:
-        svc = self._svc(db)
-        return svc.delete(Shift, shift_id)
+        shift = db.query(Shift).filter(Shift.id == shift_id).first()
+        if not shift:
+            return False
+        db.query(Attendance).filter(
+            Attendance.keycloak_user_id == shift.keycloak_user_id,
+            Attendance.attendance_date >= shift.date,
+            Attendance.attendance_date <= (shift.end_date or shift.date),
+            Attendance.shift_code == shift.shift_code,
+        ).update({Attendance.shift_code: None}, synchronize_session=False)
+        db.delete(shift)
+        db.commit()
+        return True
+
+    async def delete_shift_by_date(self, db: Session, keycloak_user_id: str, target_date: date) -> bool:
+        shifts = db.query(Shift).filter(
+            Shift.keycloak_user_id == keycloak_user_id,
+            Shift.date <= target_date,
+            Shift.end_date >= target_date,
+        ).all()
+        if not shifts:
+            return False
+
+        for shift in shifts:
+            db.query(Attendance).filter(
+                Attendance.keycloak_user_id == keycloak_user_id,
+                Attendance.attendance_date == target_date,
+                Attendance.shift_code == shift.shift_code,
+            ).update({Attendance.shift_code: None}, synchronize_session=False)
+
+            if shift.date == shift.end_date:
+                db.delete(shift)
+                continue
+
+            if target_date == shift.date:
+                shift.date = target_date + timedelta(days=1)
+                continue
+
+            if target_date == shift.end_date:
+                shift.end_date = target_date - timedelta(days=1)
+                continue
+
+            left = Shift(
+                keycloak_user_id=shift.keycloak_user_id,
+                redmine_user_id=shift.redmine_user_id,
+                user_email=shift.user_email,
+                date=shift.date,
+                end_date=target_date - timedelta(days=1),
+                shift_code=shift.shift_code,
+                project_id=shift.project_id,
+                project_name=shift.project_name,
+                work_location_status=shift.work_location_status,
+                work_address=shift.work_address,
+                shift_start_time=shift.shift_start_time,
+                shift_end_time=shift.shift_end_time,
+                location_id=shift.location_id,
+                country=shift.country,
+                per_diem_eligible=shift.per_diem_eligible,
+                conveyance_eligible=shift.conveyance_eligible,
+            )
+            right = Shift(
+                keycloak_user_id=shift.keycloak_user_id,
+                redmine_user_id=shift.redmine_user_id,
+                user_email=shift.user_email,
+                date=target_date + timedelta(days=1),
+                end_date=shift.end_date,
+                shift_code=shift.shift_code,
+                project_id=shift.project_id,
+                project_name=shift.project_name,
+                work_location_status=shift.work_location_status,
+                work_address=shift.work_address,
+                shift_start_time=shift.shift_start_time,
+                shift_end_time=shift.shift_end_time,
+                location_id=shift.location_id,
+                country=shift.country,
+                per_diem_eligible=shift.per_diem_eligible,
+                conveyance_eligible=shift.conveyance_eligible,
+            )
+            db.add(left)
+            db.add(right)
+            db.delete(shift)
+
+        db.commit()
+        return True
 
     async def create_shift_definition(self, db: Session, data: dict) -> dict:
         svc = self._def_svc(db)
@@ -313,6 +470,9 @@ class ShiftService:
             "shiftStartUTC": shift.shift_start_utc,
             "shiftEndUTC": shift.shift_end_utc,
             "country": shift.country,
+            "perDiemEligible": shift.per_diem_eligible,
+            "conveyanceEligible": shift.conveyance_eligible,
+            "status": shift.status,
             "createdAt": shift.created_at,
             "updatedAt": shift.updated_at,
         }

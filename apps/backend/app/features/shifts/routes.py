@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from datetime import datetime, timezone, date, timedelta, time
 from typing import List, Optional
@@ -10,7 +11,10 @@ from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
 from app.models.leave import Leave
 from app.models.shift import Shift
+from app.models.employee_master import EmployeeMaster
 from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/shifts", tags=["shifts"])
 
@@ -96,16 +100,39 @@ async def create_shift(
         raise HTTPException(status_code=400, detail="endDate must be on or after date.")
 
     today = date.today()
-    if start < today:
+    if end < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
     await check_and_resolve_tr_availability(db, payload.userId, payload.userEmail, payload.date, payload.endDate)
+
+    from app.models.shift_definition import ShiftDefinition
+    shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
+    if not shift_def:
+        raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
 
     shift_data = payload.model_dump()
     if not shift_data.get("endDate"):
         shift_data["endDate"] = payload.date
     result = await shift_service.create_shift(db, shift_data, current_user)
     return result
+
+
+@router.post("/validate")
+async def validate_shift(
+    payload: ShiftCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    await authorize_shift_access(
+        current_user=current_user,
+        target_email=payload.userEmail,
+        target_project_id=payload.projectId,
+        is_write=True
+    )
+    shift_data = payload.model_dump()
+    if not shift_data.get("endDate"):
+        shift_data["endDate"] = payload.date
+    return await shift_service.validate_shift(db, shift_data, current_user)
 
 
 @router.post("/bulk", status_code=status.HTTP_201_CREATED)
@@ -283,6 +310,11 @@ async def get_shifts_by_email(
     return await shift_service.get_shifts_by_email(db, email)
 
 
+@router.get("/work-locations")
+async def get_work_locations():
+    return ["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "LEAVE"]
+
+
 @router.get("/range")
 async def get_shifts_by_range(
     start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
@@ -457,9 +489,37 @@ async def update_shift(
     return updated
 
 
+@router.delete("/by-date", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_shift_by_date(
+    user_id: int = Query(..., description="Redmine user ID"),
+    target_date: str = Query(..., description="YYYY-MM-DD"),
+    reason: Optional[str] = Query(None, max_length=200, description="Reason for deletion"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    try:
+        td = date.fromisoformat(target_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == user_id).first()
+    if not emp or not emp.keycloak_user_id:
+        raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
+
+    deleted = await shift_service.delete_shift_by_date(db, emp.keycloak_user_id, td)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No shift found for this date")
+
+    if reason:
+        logger.info(f"Admin {current_user.get('email')} deleted shift for user {user_id} on {target_date}: {reason}")
+
+
 @router.delete("/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_shift(
     shift_id: str,
+    reason: Optional[str] = Query(None, max_length=200, description="Reason for deletion"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -471,6 +531,8 @@ async def delete_shift(
     deleted = await shift_service.delete_shift(db, shift_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Shift not found.")
+    if reason:
+        logger.info(f"Admin {current_user.get('email')} deleted shift {shift_id}: {reason}")
 
 
 @router.post("/definitions", status_code=status.HTTP_201_CREATED)

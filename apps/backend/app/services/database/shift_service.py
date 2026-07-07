@@ -58,7 +58,10 @@ class ShiftService(BaseService[Shift]):
     def fetch_by_date_range(self, start_date: str, end_date: str, redmine_user_id: int = None) -> List[Shift]:
         sd = date.fromisoformat(start_date)
         ed = date.fromisoformat(end_date)
-        stmt = select(Shift).where(Shift.date >= sd, Shift.date <= ed)
+        stmt = select(Shift).where(
+            Shift.date <= ed,
+            or_(Shift.end_date == None, Shift.end_date >= sd)
+        )
         if redmine_user_id is not None:
             stmt = stmt.where(Shift.redmine_user_id == redmine_user_id)
         stmt = stmt.order_by(Shift.date)

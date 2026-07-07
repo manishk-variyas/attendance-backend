@@ -4,15 +4,15 @@ from datetime import datetime
 
 
 class CheckInRequest(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     clientTimestamp: Optional[datetime] = None
     date: Optional[str] = Field(None, description="YYYY-MM-DD for next-day check-in, defaults to today")
 
 
 class CheckOutRequest(BaseModel):
-    latitude: float
-    longitude: float
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     clientTimestamp: Optional[datetime] = None
     date: Optional[str] = Field(None, description="YYYY-MM-DD for next-day checkout, defaults to today")
     remarks: Optional[str] = Field(None, max_length=100)
@@ -39,6 +39,8 @@ class AttendanceResponse(BaseModel):
     isSynced: bool = False
     status: str
     remarks: Optional[str] = None
+    perDiemEligible: bool = False
+    conveyanceEligible: bool = False
     createdAt: str
     updatedAt: str
 
@@ -47,6 +49,8 @@ class AttendanceResponse(BaseModel):
 
 
 class AdminAttendanceCreate(BaseModel):
+    model_config = {"populate_by_name": True}
+
     user_email: str
     attendance_date: str
     check_in_time: Optional[str] = None
@@ -54,11 +58,15 @@ class AdminAttendanceCreate(BaseModel):
     work_location_status: str = "OFFICE"
     shift_code: Optional[str] = None
     status: str = "present"
+    per_diem_eligible: Optional[bool] = Field(None, alias="perDiemEligible")
+    conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
     is_late: bool = False
     remarks: Optional[str] = None
 
 
 class AdminAttendanceUpdate(BaseModel):
+    model_config = {"populate_by_name": True}
+
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     work_location_status: Optional[str] = None
@@ -66,12 +74,14 @@ class AdminAttendanceUpdate(BaseModel):
     status: Optional[str] = None
     is_late: Optional[bool] = None
     remarks: Optional[str] = None
+    per_diem_eligible: Optional[bool] = Field(None, alias="perDiemEligible")
+    conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
 
 
 class CompleteAttendanceRequest(BaseModel):
     date: str
     checkInTime: datetime
     checkOutTime: datetime
-    latitude: float
-    longitude: float
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     remarks: Optional[str] = Field(None, max_length=100)

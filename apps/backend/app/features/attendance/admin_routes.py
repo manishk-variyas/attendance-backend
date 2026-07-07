@@ -12,6 +12,8 @@ from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
 from app.models.shift_definition import ShiftDefinition
+from app.models.shift import Shift
+from app.models.leave import Leave
 from app.services.database.base_service import BaseService
 from zoneinfo import ZoneInfo
 
@@ -44,6 +46,10 @@ def _enrich(db: Session, data: dict, a: Attendance) -> dict:
                 data["shiftEndTime"] = datetime.combine(a.attendance_date, sd.end_time, tzinfo=_safe_zone(tz)).isoformat()
     else:
         data["shiftName"] = None
+
+    data["perDiemEligible"] = a.per_diem_eligible
+    data["conveyanceEligible"] = a.conveyance_eligible
+
     return data
 
 
@@ -57,7 +63,61 @@ def _to_response_with_email(db: Session, a: Attendance) -> dict:
     if emp:
         data["userEmail"] = emp.user_email
         data["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
+        data["userDesignation"] = emp.designation
+    data["derivedStatus"] = "shift_ended" if a.check_out_time else "in_progress"
+
+    data["isAtAssignedLocation"] = a.location_id is not None and a.work_location_status == "OFFICE"
+
+    if a.check_out_time:
+        if a.modified_by:
+            ended_by_emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.modified_by).first()
+            data["endedBy"] = f"{ended_by_emp.first_name} {ended_by_emp.last_name}".strip() if ended_by_emp else a.modified_by
+            data["endedByRole"] = ended_by_emp.designation if ended_by_emp else None
+        elif emp:
+            data["endedBy"] = f"{emp.first_name} {emp.last_name}".strip()
+            data["endedByRole"] = emp.designation
+        else:
+            data["endedBy"] = None
+            data["endedByRole"] = None
+    else:
+        data["endedBy"] = None
+        data["endedByRole"] = None
     return data
+
+
+def _build_virtual_record(db: Session, shift, emp) -> dict:
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    has_started = False
+    if shift.shift_code:
+        sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == shift.shift_code).first()
+        if sd and sd.start_time:
+            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            shift_start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
+            has_started = now_ist >= shift_start_dt
+
+    derived = "not_started" if not has_started else "no_show"
+
+    return {
+        "id": None,
+        "keycloakUserId": shift.keycloak_user_id,
+        "attendanceDate": shift.date.isoformat() if shift.date else None,
+        "checkInTime": None, "checkInLat": None, "checkInLng": None, "checkInLocationName": None,
+        "checkOutTime": None, "checkOutLat": None, "checkOutLng": None, "checkOutLocationName": None,
+        "locationId": None, "officeName": None,
+        "workLocationStatus": shift.work_location_status,
+        "shiftCode": shift.shift_code, "shiftName": None,
+        "totalHours": None, "isLate": False, "status": "present",
+        "isManualEntry": False, "isSynced": False, "remarks": None,
+        "userEmail": emp.user_email if emp else shift.user_email,
+        "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else shift.user_email,
+        "userDesignation": emp.designation if emp else None,
+        "derivedStatus": derived,
+        "isAtAssignedLocation": None,
+        "endedBy": None,
+        "endedByRole": None,
+        "perDiemEligible": shift.per_diem_eligible,
+        "conveyanceEligible": shift.conveyance_eligible,
+    }
 
 
 @router.post("", response_model=AttendanceResponse, status_code=status.HTTP_201_CREATED)
@@ -113,6 +173,8 @@ async def admin_create_attendance(
         shift_code=payload.shift_code,
         status=payload.status,
         is_late=payload.is_late,
+        per_diem_eligible=payload.per_diem_eligible if payload.per_diem_eligible is not None else False,
+        conveyance_eligible=payload.conveyance_eligible if payload.conveyance_eligible is not None else False,
         is_manual_entry=True,
         modified_by=current_user["sub"],
         remarks=payload.remarks,
@@ -172,6 +234,10 @@ async def admin_update_attendance(
             attendance.status = payload.status
         if payload.is_late is not None:
             attendance.is_late = payload.is_late
+        if payload.per_diem_eligible is not None:
+            attendance.per_diem_eligible = payload.per_diem_eligible
+        if payload.conveyance_eligible is not None:
+            attendance.conveyance_eligible = payload.conveyance_eligible
 
     if payload.remarks is not None:
         attendance.remarks = payload.remarks
@@ -242,12 +308,29 @@ async def admin_list_attendance(
     offset = (page - 1) * per_page
     records = query.order_by(Attendance.attendance_date.desc()).offset(offset).limit(per_page).all()
 
+    result = [_to_response_with_email(db, r) for r in records]
+    attended_user_ids = {r.keycloak_user_id for r in records}
+
+    if from_date and to_date and per_page > len(result):
+        shift_query = db.query(Shift).filter(
+            and_(
+                Shift.date >= date.fromisoformat(from_date),
+                Shift.date <= date.fromisoformat(to_date),
+                Shift.keycloak_user_id.notin_(attended_user_ids) if attended_user_ids else True,
+            )
+        )
+        shift_records = shift_query.order_by(Shift.date.desc()).limit(per_page - len(result)).all()
+        for s in shift_records:
+            emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == s.keycloak_user_id).first()
+            result.append(_build_virtual_record(db, s, emp))
+            attended_user_ids.add(s.keycloak_user_id)
+
     return {
-        "total": total,
+        "total": total + shift_query.count() if from_date and to_date else total,
         "page": page,
         "per_page": per_page,
-        "total_pages": (total + per_page - 1) // per_page,
-        "records": [_to_response_with_email(db, r) for r in records],
+        "total_pages": max(1, (total + 1 + per_page - 1) // per_page),
+        "records": result,
     }
 
 
@@ -261,6 +344,14 @@ async def admin_delete_attendance(
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
+
+    if attendance.check_in_time is not None and attendance.keycloak_user_id and attendance.attendance_date:
+        shift_rec = db.query(Shift).filter(
+            Shift.keycloak_user_id == attendance.keycloak_user_id,
+            Shift.date == attendance.attendance_date,
+        ).first()
+        if shift_rec:
+            shift_rec.status = "Yet to start"
 
     db.delete(attendance)
     db.commit()

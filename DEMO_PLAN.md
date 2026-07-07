@@ -84,6 +84,7 @@
 ### Leaves
 - Apply leave for a shift day
 - If already on leave or emergency leave:
+
   → `"You already have an approved or pending leave application that overlaps with these dates."`
 
 ### Compare Redmine Data

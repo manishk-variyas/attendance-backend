@@ -28,7 +28,9 @@ class Attendance(Base):
     check_out_lng = Column(Numeric(11, 8), nullable=True)
     check_out_location_name = Column(String(500), nullable=True)
     location_id = Column(UUID(as_uuid=True), nullable=True)
-    work_location_status = Column(String(100), nullable=False, server_default=text("'OFFICE'"))
+    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'LEAVE', name='work_location', create_type=False), nullable=False, server_default=text("'OFFICE'"))
+    per_diem_eligible = Column(Boolean, nullable=False, server_default=text("false"))
+    conveyance_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     shift_code = Column(String(50), nullable=True)
     total_hours = Column(Numeric(5, 2), Computed(
         "CASE WHEN check_in_time IS NOT NULL AND check_out_time IS NOT NULL "
@@ -63,6 +65,8 @@ class Attendance(Base):
             "checkOutLocationName": self.check_out_location_name,
             "locationId": str(self.location_id) if self.location_id else None,
             "workLocationStatus": self.work_location_status,
+            "perDiemEligible": self.per_diem_eligible,
+            "conveyanceEligible": self.conveyance_eligible,
             "shiftCode": self.shift_code,
             "totalHours": float(self.total_hours) if self.total_hours else None,
             "isLate": self.is_late,

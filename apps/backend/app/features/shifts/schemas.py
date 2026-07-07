@@ -22,6 +22,9 @@ class ShiftCreate(BaseModel):
     shiftName: str
     timezone: str = "Asia/Kolkata"
     country: str = ""
+    locationId: Optional[str] = None
+    perDiemEligible: bool = False
+    conveyanceEligible: bool = False
 
 
 class ShiftBulkCreate(BaseModel):
@@ -33,13 +36,14 @@ class ShiftBulkCreate(BaseModel):
     projectId: int
     projectName: str
     shift: str           # "morning" | "general" | "afternoon" | "night" | "Not in Any Shift"
-    workStatus: str      # "WFH" | "OFFICE" | "CUSTOMER_SITE" | "LEAVE"
+    workStatus: str      # "WFH" | "OFFICE" | "REMOTE_ONSITE" | "REMOTE_OFFSITE" | "LEAVE"
     workAddress: Optional[str] = "N/A"
     leaveType: Optional[str] = None
     startDate: str       # "YYYY-MM-DD"  — first day (inclusive)
     endDate: str         # "YYYY-MM-DD"  — last day  (inclusive, same as startDate for single day)
     shiftStartTime: str  # "HH:MM"
     shiftEndTime: str    # "HH:MM"
+    locationId: Optional[str] = None
 
 
 class ShiftUpdate(BaseModel):
@@ -54,6 +58,9 @@ class ShiftUpdate(BaseModel):
     projectId: Optional[int] = None
     projectName: Optional[str] = None
     endDate: Optional[str] = None
+    locationId: Optional[str] = None
+    perDiemEligible: Optional[bool] = None
+    conveyanceEligible: Optional[bool] = None
 
 
 class ShiftResponse(BaseModel):
@@ -98,6 +105,9 @@ class ShiftHistoryItem(BaseModel):
     projectName: Optional[str] = None
     shift: str
     workStatus: str
+    status: Optional[str] = None
+    perDiemEligible: bool = False
+    conveyanceEligible: bool = False
     workAddress: Optional[str] = None
     leaveType: Optional[str] = None
     date: str

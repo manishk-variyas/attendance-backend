@@ -222,6 +222,7 @@ async def update_employee(
     # ── 1. employee_master fields (always safe, always first) ──────────────
     db_fields = {
         "first_name": "first_name",
+        "middle_name": "middle_name",
         "last_name": "last_name",
         "designation": "designation",
         "contact_number": "contact_number",

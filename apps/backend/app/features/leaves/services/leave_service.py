@@ -76,7 +76,7 @@ class LeaveBusinessService:
             if remaining < requested_days:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Insufficient earned leave balance. Remaining: {remaining}, Requested: {requested_days}"
+                    detail=f"You have {int(remaining)} day(s) of leave remaining, but requested {int(requested_days)} day(s)"
                 )
         elif leave_data.leave_type == LeaveType.PL:
             accrued = balance.accrued_compoff if balance else 0.0
@@ -85,7 +85,7 @@ class LeaveBusinessService:
             if remaining < requested_days:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Insufficient comp off balance. Remaining: {remaining}, Requested: {requested_days}"
+                    detail=f"You have {int(remaining)} comp-off day(s) accrued, but requested {int(requested_days)} day(s)"
                 )
 
         # Create leave record
@@ -403,15 +403,14 @@ class LeaveBusinessService:
             used_earned = balance.used_earned if balance else 0.0
             remaining = total_earned - used_earned
             if remaining < requested_days:
-                detail = f"Insufficient earned leave balance. Remaining: {remaining}, Requested: {requested_days}"
+                detail = f"You have {int(remaining)} day(s) of leave remaining, but requested {int(requested_days)} day(s)"
 
         elif leave_type == LeaveType.PL.value:
-            # Comp Off / Paid Leave: check accrued - consumed
             accrued = balance.accrued_compoff if balance else 0.0
             consumed = balance.consumed_compoff if balance else 0.0
             remaining = accrued - consumed
             if remaining < requested_days:
-                detail = f"Insufficient comp off balance. Remaining: {remaining}, Requested: {requested_days}"
+                detail = f"You have {int(remaining)} comp-off day(s) accrued, but requested {int(requested_days)} day(s)"
 
         # UPL: no balance check needed, always passes
 

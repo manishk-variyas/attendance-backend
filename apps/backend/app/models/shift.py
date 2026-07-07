@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Date, Time, DateTime, text
+from sqlalchemy import Column, String, Integer, Boolean, Date, Time, DateTime, Enum as SAEnum, text
 from sqlalchemy.dialects.postgresql import UUID
 from app.core.models import Base
 
@@ -17,13 +17,17 @@ class Shift(Base):
     shift_code = Column(String(50), nullable=False)
     project_id = Column(Integer, nullable=True)
     project_name = Column(String(255), nullable=True)
-    work_location_status = Column(String(6), nullable=False)
+    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'LEAVE', name='work_location', create_type=False), nullable=False)
     work_address = Column(String(500), server_default=text("'N/A'"))
     shift_start_time = Column(Time, nullable=True)
     shift_end_time = Column(Time, nullable=True)
     shift_start_utc = Column(DateTime(timezone=True), nullable=True)
     shift_end_utc = Column(DateTime(timezone=True), nullable=True)
-    country = Column(String(10), server_default=text("''"))
+    location_id = Column(UUID(as_uuid=True), nullable=True)
+    country = Column(String(50), server_default=text("''"))
+    status = Column(String(20), nullable=False, server_default=text("'Yet to start'"))
+    per_diem_eligible = Column(Boolean, nullable=False, server_default=text("false"))
+    conveyance_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
@@ -44,7 +48,11 @@ class Shift(Base):
             "shiftEndTime": self.shift_end_time.isoformat() if self.shift_end_time else None,
             "shiftStartUTC": self.shift_start_utc,
             "shiftEndUTC": self.shift_end_utc,
+            "locationId": str(self.location_id) if self.location_id else None,
             "country": self.country,
+            "status": self.status,
+            "perDiemEligible": self.per_diem_eligible,
+            "conveyanceEligible": self.conveyance_eligible,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }

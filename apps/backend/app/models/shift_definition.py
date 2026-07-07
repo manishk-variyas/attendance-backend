@@ -14,7 +14,7 @@ class ShiftDefinition(Base):
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
     timezone = Column(String(50), nullable=False, server_default=text("'Asia/Kolkata'"))
-    country = Column(String(10), server_default=text("''"))
+    country = Column(String(100), server_default=text("''"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 

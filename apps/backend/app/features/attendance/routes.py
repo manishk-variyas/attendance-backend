@@ -140,6 +140,8 @@ def _to_response(db: Session, a: Attendance) -> dict:
         data["shiftName"] = shift_def.shift_name if shift_def else None
     else:
         data["shiftName"] = None
+    data["perDiemEligible"] = a.per_diem_eligible
+    data["conveyanceEligible"] = a.conveyance_eligible
     return data
 
 
@@ -273,12 +275,23 @@ async def check_in(
         EmployeeMaster.keycloak_user_id == keycloak_user_id
     ).first()
     location_id = emp.location_id if emp else None
-    work_location_status = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
-    if work_location_status == "OFFICE" and location_id:
-        office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
-        check_in_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
+    if shift_code and s:
+        shift_loc = s.location_id
+        if shift_loc:
+            location_id = shift_loc
+
+    is_wfh_shift = shift_code and s and s.work_location_status == "WFH"
+
+    if is_wfh_shift:
+        work_location_status = "WFH"
+        check_in_location_name = "Home"
     else:
-        check_in_location_name = await _reverse_geocode(payload.latitude, payload.longitude)
+        work_location_status = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
+        if work_location_status == "OFFICE" and location_id:
+            office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
+            check_in_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
+        else:
+            check_in_location_name = await _reverse_geocode(payload.latitude, payload.longitude)
 
     remarks = None
     if target_date != today:
@@ -303,8 +316,12 @@ async def check_in(
     db.commit()
     db.refresh(attendance)
 
+    if shift_code and s:
+        s.status = "In Progress"
+        db.commit()
+
     user_email = current_user.get("email")
-    if user_email:
+    if user_email and payload.latitude is not None and payload.longitude is not None:
         existing_loc = db.query(UserLocation).filter(UserLocation.email == user_email).first()
         if existing_loc:
             existing_loc.latitude = payload.latitude
@@ -369,6 +386,7 @@ async def check_out(
         attendance.remarks = (attendance.remarks or "") + (" | Next-day checkout" if attendance.remarks else "Next-day checkout")
     attendance.check_out_lat = payload.latitude
     attendance.check_out_lng = payload.longitude
+
     check_out_ws = _determine_work_location(db, payload.latitude, payload.longitude, attendance.location_id)
     if check_out_ws == "OFFICE" and attendance.location_id:
         office = db.query(OfficeLocation).filter(OfficeLocation.id == attendance.location_id).first()
@@ -399,7 +417,7 @@ async def check_out(
             attendance.remarks = (attendance.remarks or "") + " | Early leave"
 
     user_email = current_user.get("email")
-    if user_email:
+    if user_email and payload.latitude is not None and payload.longitude is not None:
         existing_loc = db.query(UserLocation).filter(UserLocation.email == user_email).first()
         if existing_loc:
             existing_loc.latitude = payload.latitude
@@ -409,6 +427,14 @@ async def check_out(
         else:
             db.add(UserLocation(email=user_email, latitude=payload.latitude, longitude=payload.longitude, location_name=attendance.check_out_location_name, updated_at=attendance.check_out_time))
         db.commit()
+
+    if attendance.shift_code and attendance.keycloak_user_id and attendance.attendance_date:
+        shift_rec = db.query(Shift).filter(
+            Shift.keycloak_user_id == attendance.keycloak_user_id,
+            Shift.date == attendance.attendance_date,
+        ).first()
+        if shift_rec:
+            shift_rec.status = "Ended"
 
     db.commit()
     db.refresh(attendance)
@@ -462,12 +488,17 @@ async def complete_attendance(
     if shift:
         shift_code = shift.shift_code
 
-    ws = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
-    if ws == "OFFICE" and location_id:
-        office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
-        loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
+    is_wfh = shift and shift.work_location_status == "WFH"
+    if is_wfh:
+        ws = "WFH"
+        loc_name = "Home"
     else:
-        loc_name = await _reverse_geocode(payload.latitude, payload.longitude)
+        ws = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
+        if ws == "OFFICE" and location_id:
+            office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
+            loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
+        else:
+            loc_name = await _reverse_geocode(payload.latitude, payload.longitude)
 
     if existing:
         existing.check_out_time = payload.checkOutTime
@@ -482,6 +513,9 @@ async def complete_attendance(
             existing.remarks += f" ({payload.remarks})"
         db.commit()
         db.refresh(existing)
+        if shift:
+            shift.status = "Ended"
+            db.commit()
         _credit_comp_off_if_holiday(db, existing)
         return _to_response(db, existing)
 
@@ -506,6 +540,10 @@ async def complete_attendance(
     db.add(attendance)
     db.commit()
     db.refresh(attendance)
+
+    if shift:
+        shift.status = "Ended"
+        db.commit()
 
     _credit_comp_off_if_holiday(db, attendance)
 

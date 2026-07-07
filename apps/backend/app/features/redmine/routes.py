@@ -154,6 +154,40 @@ async def get_all_user_projects(
 #     return await redmine_service.get_issues_for_user(user["id"])
 
 
+@router.get("/projects/all/issues", response_model=List[IssueResponse])
+async def get_all_project_issues(
+    current_user: dict = Depends(get_current_user),
+):
+    """Get issues across all projects scoped by user role.
+    Admin → all projects. PM/PC → managed projects. TR → own projects."""
+    roles = current_user.get("roles", [])
+    if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator", "Technical Resource"]):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    email = current_user.get("email")
+    user = await redmine_service.get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+
+    is_tr = "Technical Resource" in roles and "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles
+
+    if "Admin" in roles:
+        projects = await redmine_service.get_all_projects()
+    else:
+        projects = await redmine_service.get_projects_for_user(user["id"])
+
+    all_issues = []
+    for p in projects:
+        pid = p.id if hasattr(p, 'id') else p.get("id")
+        if is_tr:
+            issues = await redmine_service.get_issues_for_project(pid, assigned_to_id=user["id"])
+        else:
+            issues = await redmine_service.get_issues_for_project(pid)
+        all_issues.extend(issues)
+
+    return all_issues
+
+
 @router.get("/projects/{project_id}/issues", response_model=List[IssueResponse])
 async def get_project_issues(
     project_id: int,
@@ -245,8 +279,21 @@ async def get_project_members(
     project_id: int,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get all members of a project with their roles."""
-    return await redmine_service.get_project_members(project_id)
+    """Get all members of a project with their roles. Scoped by user role."""
+    roles = current_user.get("roles", [])
+    if "Admin" in roles:
+        return await redmine_service.get_project_members(project_id)
+
+    email = current_user.get("email")
+    user = await redmine_service.get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=403, detail="Redmine account not found")
+
+    user_projects = await redmine_service.get_projects_for_user(user["id"])
+    if any(p.id == project_id for p in user_projects):
+        return await redmine_service.get_project_members(project_id)
+
+    raise HTTPException(status_code=403, detail="You are not a member of this project")
 
 
 @router.get("/search", response_model=SearchResponse)
