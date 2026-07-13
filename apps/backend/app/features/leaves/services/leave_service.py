@@ -23,7 +23,7 @@ class LeaveBusinessService:
         self.holiday_db = holiday_db
         self.balance_db = balance_db
 
-    async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> str:
+    async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> dict:
         """Submit a new leave application with overlap protection."""
         IST = ZoneInfo("Asia/Kolkata")
         from_ist = leave_data.start_date
@@ -38,55 +38,35 @@ class LeaveBusinessService:
         start = from_ist.replace(hour=0, minute=0, second=0, microsecond=0)
         end   = to_ist.replace(hour=23, minute=59, second=59, microsecond=999999)
 
+        # Determine requested days and overlap check dates
+        if leave_data.leave_dates:
+            target_dates = [d.astimezone(IST).date() if d.tzinfo else d.replace(tzinfo=timezone.utc).astimezone(IST).date() for d in leave_data.leave_dates]
+            requested_days = len(target_dates)
+        else:
+            target_dates = None
+            requested_days = (end.date() - start.date()).days + 1
+
         # Check for overlaps
-        stmt = select(Leave).where(
-            Leave.keycloak_user_id == user_id,
-            Leave.approval_status.in_([LeaveStatus.APPROVED.value, LeaveStatus.PENDING.value]),
-            Leave.start_date <= end.date(),
-            Leave.end_date >= start.date()
-        )
-        existing_overlap = self.leave_db.db.execute(stmt).scalars().first()
-        
-        if existing_overlap:
-            raise HTTPException(
-                status_code=400, 
-                detail="You already have an approved or pending leave application that overlaps with these dates."
+        existing_leaves = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id == user_id,
+                Leave.approval_status.in_([LeaveStatus.APPROVED.value, LeaveStatus.PENDING.value]),
+                Leave.start_date <= end.date(),
+                Leave.end_date >= start.date()
             )
+        ).scalars().all()
 
-        # shift_stmt = select(Shift).where(
-        #     Shift.keycloak_user_id == user_id,
-        #     Shift.date >= start.date(),
-        #     Shift.date <= end.date(),
-        # )
-        # conflicting_shift = self.leave_db.db.execute(shift_stmt).scalars().first()
-        # if conflicting_shift:
-        #     raise HTTPException(
-        #         status_code=400,
-        #         detail=f"Leave cannot be applied. A shift ({conflicting_shift.shift_code}) is already assigned on {conflicting_shift.date}.",
-        #     )
-
-        # Check sufficient leave balance before submitting
-        requested_days = (end.date() - start.date()).days + 1
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
-
-        if leave_data.leave_type == LeaveType.EL:
-            total_earned = balance.total_earned if balance else 12.0
-            used_earned = balance.used_earned if balance else 0.0
-            remaining = total_earned - used_earned
-            if remaining < requested_days:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"You have {int(remaining)} day(s) of leave remaining, but requested {int(requested_days)} day(s)"
-                )
-        elif leave_data.leave_type == LeaveType.PL:
-            accrued = balance.accrued_compoff if balance else 0.0
-            consumed = balance.consumed_compoff if balance else 0.0
-            remaining = accrued - consumed
-            if remaining < requested_days:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"You have {int(remaining)} comp-off day(s) accrued, but requested {int(requested_days)} day(s)"
-                )
+        if existing_leaves:
+            if target_dates:
+                for d in target_dates:
+                    for existing in existing_leaves:
+                        if existing.leave_dates:
+                            if d.isoformat() in existing.leave_dates:
+                                raise HTTPException(status_code=400, detail=f"You already have a leave on {d.isoformat()}")
+                        elif existing.start_date <= d <= existing.end_date:
+                            raise HTTPException(status_code=400, detail=f"You already have a leave on {d.isoformat()}")
+            else:
+                raise HTTPException(status_code=400, detail="You already have an approved or pending leave application that overlaps with these dates.")
 
         # Create leave record
         leave_doc = {
@@ -99,12 +79,29 @@ class LeaveBusinessService:
             "comment": leave_data.comment,
             "is_traveling": leave_data.is_traveling,
             "contact_number": leave_data.contact_number,
+            "resuming_date": leave_data.resuming_date.date() if leave_data.resuming_date else None,
+            "leave_dates": [d.isoformat() for d in target_dates] if target_dates else None,
             "approver_id": leave_data.approver_id,
             "approval_status": LeaveStatus.PENDING.value,
         }
         
         new_leave = self.leave_db.create(Leave, **leave_doc)
-        return str(new_leave.id)
+
+        # Calculate balance info (no block, just for warning)
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+        balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
+        if balance and leave_data.leave_type in (LeaveType.EL, LeaveType.PL):
+            if leave_data.leave_type == LeaveType.EL:
+                if balance.total_earned is None:
+                    remaining = None
+                else:
+                    remaining = balance.total_earned - (balance.used_earned or 0.0)
+            else:
+                remaining = (balance.accrued_compoff or 0.0) - (balance.consumed_compoff or 0.0)
+            balance_info["remaining"] = remaining
+            balance_info["will_be_negative"] = remaining < requested_days if remaining is not None else None
+
+        return {"leave_id": str(new_leave.id), "balance": balance_info}
 
     def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
         today = date.today()
@@ -171,13 +168,11 @@ class LeaveBusinessService:
         return {"message": "Emergency leave applied", "leave_id": str(new_leave.id)}
 
     async def get_leave_history(self, user_id: str, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
-        """Fetch leave history for a user."""
         stmt = select(Leave).where(Leave.keycloak_user_id == user_id).order_by(Leave.start_date.desc()).offset(skip).limit(limit)
         results = self.leave_db.db.execute(stmt).scalars().all()
         return [r.to_dict() for r in results]
 
     async def get_user_leave_history(self, email: str, current_user: dict, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
-        """Get leave history for a specific user. PMs scoped to shared projects."""
         roles = current_user.get("roles", [])
 
         tr_user = await redmine_service.get_user_by_email(email)
@@ -231,7 +226,6 @@ class LeaveBusinessService:
         return visible
 
     async def get_holidays(self, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
-        """Fetch paginated list of holidays."""
         stmt = select(Holiday).order_by(Holiday.holiday_date.asc()).offset(skip).limit(limit)
         results = self.holiday_db.db.execute(stmt).scalars().all()
         return [r.to_dict() for r in results]
@@ -340,7 +334,7 @@ class LeaveBusinessService:
         pending_count = self.leave_db.db.execute(stmt_pending).scalar()
 
         stats = {
-            "total_earned": balance_doc.total_earned if balance_doc else 12.0,
+            "total_earned": balance_doc.total_earned if balance_doc else 0.0,
             "used_earned": balance_doc.used_earned if balance_doc else 0.0,
             "total_paid": balance_doc.accrued_compoff if balance_doc else 0.0,
             "used_paid": balance_doc.consumed_compoff if balance_doc else 0.0,
@@ -393,29 +387,8 @@ class LeaveBusinessService:
         requested_days = (leave.end_date - leave.start_date).days + 1
         balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
 
-        # ── Balance check by leave type ────────────────────────────────────
+        # ── Balance check (info only, no block) ────────────────────────────
         leave_type = leave.leave_type
-        detail = None
-
-        if leave_type == LeaveType.EL.value:
-            # Earned Leave: check remaining balance
-            total_earned = balance.total_earned if balance else 12.0
-            used_earned = balance.used_earned if balance else 0.0
-            remaining = total_earned - used_earned
-            if remaining < requested_days:
-                detail = f"You have {int(remaining)} day(s) of leave remaining, but requested {int(requested_days)} day(s)"
-
-        elif leave_type == LeaveType.PL.value:
-            accrued = balance.accrued_compoff if balance else 0.0
-            consumed = balance.consumed_compoff if balance else 0.0
-            remaining = accrued - consumed
-            if remaining < requested_days:
-                detail = f"You have {int(remaining)} comp-off day(s) accrued, but requested {int(requested_days)} day(s)"
-
-        # UPL: no balance check needed, always passes
-
-        if detail:
-            raise HTTPException(status_code=400, detail=detail)
 
         # ── Mark leave as approved ─────────────────────────────────────────
         now = datetime.utcnow()
@@ -481,22 +454,41 @@ class LeaveBusinessService:
         return True
 
     async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
-        """Fetch all pending leaves."""
+        """Fetch all pending leaves with balance info."""
         roles = current_user.get("roles", [])
 
         if "Admin" in roles:
             stmt = select(Leave).where(Leave.approval_status == LeaveStatus.PENDING.value).order_by(Leave.created_at.desc())
             results = self.leave_db.db.execute(stmt).scalars().all()
-            return [r.to_dict() for r in results]
+        else:
+            pm_user = await redmine_service.get_user_by_email(current_user.get("email"))
+            if not pm_user:
+                return []
+            stmt = select(Leave).where(
+                Leave.approval_status == LeaveStatus.PENDING.value,
+                Leave.approver_id == int(pm_user["id"])
+            ).order_by(Leave.created_at.desc())
+            results = self.leave_db.db.execute(stmt).scalars().all()
 
-        pm_user = await redmine_service.get_user_by_email(current_user.get("email"))
-        if not pm_user:
-            return []
+        pending = []
+        for r in results:
+            d = r.to_dict()
+            balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=r.keycloak_user_id)
+            requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
+            d["requested_days"] = requested_days
+            d["balance_remaining"] = None
+            d["balance_warning"] = None
+            if balance and r.leave_type in (LeaveType.EL.value, LeaveType.PL.value):
+                if r.leave_type == LeaveType.EL.value:
+                    if balance.total_earned is None:
+                        remaining = None
+                    else:
+                        remaining = balance.total_earned - (balance.used_earned or 0.0)
+                else:
+                    remaining = (balance.accrued_compoff or 0.0) - (balance.consumed_compoff or 0.0)
+                d["balance_remaining"] = remaining
+                if remaining is not None and remaining < requested_days:
+                    d["balance_warning"] = f"{int(requested_days)} day(s) requested, {int(remaining)} balance remaining"
+            pending.append(d)
 
-        stmt = select(Leave).where(
-            Leave.approval_status == LeaveStatus.PENDING.value,
-            Leave.approver_id == int(pm_user["id"])
-        ).order_by(Leave.created_at.desc())
-        
-        results = self.leave_db.db.execute(stmt).scalars().all()
-        return [r.to_dict() for r in results]
+        return pending

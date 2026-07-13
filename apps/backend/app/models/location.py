@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Float, DateTime, text
 from sqlalchemy.dialects.postgresql import UUID
+from geoalchemy2 import Geometry
 from app.core.models import Base
 
 
@@ -13,6 +14,7 @@ class UserLocation(Base):
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     location_name = Column(String(500), nullable=True)
+    geom = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=text("now()"))
 
     def to_dict(self) -> dict:

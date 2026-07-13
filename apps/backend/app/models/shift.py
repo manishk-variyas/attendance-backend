@@ -25,6 +25,7 @@ class Shift(Base):
     shift_end_utc = Column(DateTime(timezone=True), nullable=True)
     location_id = Column(UUID(as_uuid=True), nullable=True)
     country = Column(String(50), server_default=text("''"))
+    pincode = Column(String(10), nullable=True)
     status = Column(String(20), nullable=False, server_default=text("'Yet to start'"))
     per_diem_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     conveyance_eligible = Column(Boolean, nullable=False, server_default=text("false"))
@@ -50,6 +51,7 @@ class Shift(Base):
             "shiftEndUTC": self.shift_end_utc,
             "locationId": str(self.location_id) if self.location_id else None,
             "country": self.country,
+            "pincode": self.pincode,
             "status": self.status,
             "perDiemEligible": self.per_diem_eligible,
             "conveyanceEligible": self.conveyance_eligible,

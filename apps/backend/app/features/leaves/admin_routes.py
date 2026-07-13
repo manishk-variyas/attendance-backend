@@ -80,16 +80,17 @@ async def list_leave_balances(
     _: None = Depends(require_admin),
 ):
     svc = LeaveBalanceService(db)
-    filters = {}
+    query = db.query(LeaveBalance)
+
     if user_email:
         emp_svc = BaseService[EmployeeMaster](db)
         emp = emp_svc.fetch_one(EmployeeMaster, user_email=user_email)
         if not emp or not emp.keycloak_user_id:
             raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
-        filters["keycloak_user_id"] = emp.keycloak_user_id
+        query = query.filter(LeaveBalance.keycloak_user_id == emp.keycloak_user_id)
     if year:
-        filters["year"] = year
-    balances = svc.fetch_all(LeaveBalance, **filters)
+        query = query.filter(LeaveBalance.year == year)
+    balances = query.all()
     return [_to_response(b) for b in balances]
 
 

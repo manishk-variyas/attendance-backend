@@ -11,6 +11,7 @@ from app.models.location import UserLocation
 from app.models.system_setting import SystemSetting
 from app.models.employee_master import EmployeeMaster
 from app.models.attendance import Attendance
+from app.models.session import Session
 
 __all__ = [
     "Base",

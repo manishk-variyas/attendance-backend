@@ -35,18 +35,13 @@ async def get_user_leave_history(
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    """Get leave history for a specific user.
-    - Admin: Any user.
-    - PM: Only users sharing a project.
-    """
     roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles:
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Admins and Project Managers can view other users' leave history."
+            detail="Only Admin, PM, or PC can view leave history."
         )
-    history = await leave_service.get_user_leave_history(email, current_user, limit, skip)
-    return history
+    return await leave_service.get_user_leave_history(email, current_user, limit, skip)
 
 @router.get("/users")
 async def list_leave_users(
@@ -72,10 +67,8 @@ async def get_history(
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    """Get paginated leave application history."""
     user_id = current_user.get("sub")
-    history = await leave_service.get_leave_history(user_id, limit, skip)
-    return history
+    return await leave_service.get_leave_history(user_id, limit, skip)
 
 @router.get("/holidays", response_model=List[Holiday])
 async def get_holidays(
@@ -84,7 +77,6 @@ async def get_holidays(
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    """Get the holiday calendar with pagination."""
     return await leave_service.get_holidays(limit, skip)
 
 from fastapi import UploadFile, File
@@ -154,7 +146,9 @@ async def apply_leave(
     """Submit a new leave application."""
     user_id = current_user.get("sub")
     email = current_user.get("email")
-    leave_id = await leave_service.apply_for_leave(user_id, email, leave_data)
+    result = await leave_service.apply_for_leave(user_id, email, leave_data)
+    leave_id = result["leave_id"]
+    bal = result["balance"]
 
     # Notify the approver
     if leave_data.approver_id:
@@ -166,17 +160,20 @@ async def apply_leave(
             )
             if approver:
                 user_name = current_user.get("username") or email
+                msg = f"{user_name} applied for {leave_data.leave_type} leave ({bal['requested_days']} day(s))"
+                if bal["will_be_negative"]:
+                    msg += f" ⚠ {int(bal['requested_days'])} day(s) requested, {int(bal['remaining'])} balance remaining"
                 await notification_service.create_notification(
                     user_id=approver["email"],
                     type="leave_applied",
-                    message=f"{user_name} applied for {leave_data.leave_type} leave",
+                    message=msg,
                     from_user=email,
                     reference_id=leave_id,
                 )
         except Exception as e:
             logger.warning(f"Failed to create notification: {e}")
 
-    return {"message": "Leave application submitted successfully", "leave_id": leave_id}
+    return {"message": "Leave application submitted successfully", "leave_id": leave_id, "balance": bal}
 
 @router.post("/emergency")
 async def emergency_leave(
@@ -200,10 +197,10 @@ async def get_pending_leaves(
     - Admin: Gets all pending leaves.
     """
     roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles:
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Project Managers and Administrators can view pending leaves."
+            detail="Only Admin, PM, or PC can view pending leaves."
         )
 
     pending_list = await leave_service.get_pending_leaves(current_user)
@@ -221,10 +218,10 @@ async def approve_leave(
     - Admin: Full access.
     """
     roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles:
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Project Managers and Administrators can approve leaves."
+            detail="Only Admin, PM, or PC can approve leaves."
         )
 
     success = await leave_service.approve_leave(leave_id, current_user)
@@ -265,10 +262,10 @@ async def reject_leave(
     - Admin: Full access.
     """
     roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles:
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Project Managers and Administrators can reject leaves."
+            detail="Only Admin, PM, or PC can reject leaves."
         )
 
     success = await leave_service.reject_leave(leave_id, current_user)

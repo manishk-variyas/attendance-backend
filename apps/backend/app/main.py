@@ -27,7 +27,7 @@ from app.middleware.correlation import set_correlation_id
 from app.middleware.logging import log_requests
 from app.middleware.active_employee import active_employee_middleware
 from app.features.auth.routes import router as auth_router
-from app.features.auth.dependencies import get_current_user
+from app.features.auth.dependencies import get_current_user, require_active
 from app.features.redmine.routes import router as redmine_router
 
 
@@ -60,8 +60,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -87,7 +86,9 @@ def health_check():
 
 
 @app.get("/server-time")
-def get_server_time():
+def get_server_time(
+    _: None = Depends(require_active),
+):
     """Returns the current server time in UTC."""
     now = datetime.now(timezone.utc)
     return {

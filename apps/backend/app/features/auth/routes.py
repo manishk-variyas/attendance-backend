@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, delete_sessions_by_sub
+from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.models.employee_master import EmployeeMaster
@@ -99,8 +99,9 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
             log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "account_deactivated"})
             raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")
 
-    # Create a new session in server memory with user data and refresh token
+    # Enforce single session per user
     session_id = await create_session(user_data, tokens.get("refresh_token"))
+    await enforce_session_limit(user_data.get("sub"), max_sessions=1)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
 

@@ -5,7 +5,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.features.auth.dependencies import get_current_user
+from app.features.auth.dependencies import get_current_user, require_active
 from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftResponse, ShiftStats, ShiftHistoryItem, ShiftDefinitionCreate, ShiftDefinitionResponse
 from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
@@ -24,27 +24,38 @@ async def authorize_shift_access(current_user: dict, target_email: str = None, t
 
     if "Admin" in roles:
         return True
-        
-    if "Project Manager" in roles or "Project Coordinator" in roles:
-        if target_project_id:
-            user = await redmine_service.get_user_by_email(email)
-            if user:
-                projects = await redmine_service.get_projects_for_user(user["id"])
-                if any(p.id == target_project_id for p in projects):
-                    return True
-                    
-    if is_write:
+
+    if "Project Manager" not in roles and "Project Coordinator" not in roles:
+        if is_write:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only Admin, Project Manager, or Project Coordinator can create or update shifts.",
+            )
+        if target_email and email == target_email:
+            return True
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have permission to create or update shifts.",
+            detail="You don't have access to this shift.",
+        )
+
+    if target_project_id:
+        user = await redmine_service.get_user_by_email(email)
+        if user:
+            projects = await redmine_service.get_projects_for_user(user["id"])
+            project_ids = {p.id for p in projects}
+            if target_project_id in project_ids:
+                return True
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't manage this project.",
         )
 
     if target_email and email == target_email:
         return True
-        
+
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="You do not have permission to access or manage this shift.",
+        detail="You don't have access to this shift.",
     )
 
 
@@ -64,7 +75,7 @@ async def check_and_resolve_tr_availability(db: Session, userId: int, userEmail:
         if existing_leave:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="TR is not available for this shift."
+                detail="User has an approved leave during this period."
             )
     except HTTPException:
         raise
@@ -214,7 +225,10 @@ async def create_bulk_shifts(
 
 
 @router.get("/server-time")
-async def get_server_time():
+async def get_server_time(
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
     now = datetime.now(timezone.utc)
     return {
         "server_time": now.isoformat(),

@@ -52,7 +52,7 @@ services:
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
-      JAVA_OPTS_APPEND: "-Xms256m -Xmx512m"
+      JAVA_OPTS_APPEND: "-Xms256m -Xmx1g"
     # Only expose to localhost (not public internet)
     ports:
       - "127.0.0.1:8080:8080"

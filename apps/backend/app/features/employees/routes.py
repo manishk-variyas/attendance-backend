@@ -7,16 +7,44 @@ from datetime import datetime, timezone
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_admin, require_active
-from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, DisonboardRequest
+from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, DisonboardRequest, UserProfileResponse
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
 from app.models.office_location import OfficeLocation
 from app.features.redmine.service import redmine_service
-from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user
+from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user, get_user_realm_roles
+from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/employees", tags=["employees"])
+
+
+@router.get("/me", response_model=UserProfileResponse)
+async def get_my_profile(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    email = current_user.get("email")
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee record not found")
+    return {
+        "first_name": emp.first_name,
+        "middle_name": emp.middle_name,
+        "last_name": emp.last_name,
+        "user_email": emp.user_email,
+        "designation": emp.designation,
+        "employee_id": emp.employee_id,
+        "work_location_status": emp.work_location_status,
+        "contact_number": emp.contact_number,
+        "alt_contact_number": emp.alt_contact_number,
+        "work_address": emp.work_address,
+        "home_address": emp.home_address,
+        "reports_to_name": emp.reports_to_name,
+        "is_active": emp.is_active,
+    }
 
 
 def _employee_to_dict(e: EmployeeMaster) -> dict:
@@ -49,8 +77,6 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
 
 @router.get("")
 async def list_employees(
-    page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(20, ge=1, le=100, description="Items per page"),
     status: Optional[str] = Query(None, description="Filter by status"),
     onboarded: Optional[bool] = Query(None, description="Filter onboarded employees (have keycloak_user_id and active)"),
     db: Session = Depends(get_db),
@@ -58,7 +84,6 @@ async def list_employees(
     _: None = Depends(require_admin),
 ):
     svc = BaseService[EmployeeMaster](db)
-    offset = (page - 1) * per_page
     query = db.query(EmployeeMaster)
 
     if status:
@@ -69,14 +94,64 @@ async def list_employees(
         query = query.filter(EmployeeMaster.onboarded_at.is_(None))
 
     total = query.count()
-    employees = query.order_by(EmployeeMaster.created_at.desc()).offset(offset).limit(per_page).all()
+    employees = query.order_by(EmployeeMaster.created_at.desc()).all()
+
+    # Batch fetch Redmine project roles for all employees
+    user_redmine_roles = {}
+    user_kc_roles = {}
+    try:
+        projects = await redmine_service.get_all_projects()
+        rm_roles_cache = {}  # role_id -> name
+        for p in projects:
+            pid = p.get("id") if isinstance(p, dict) else p.id
+            try:
+                members = await redmine_service.get_project_members(pid)
+                pname = p.get("name") if isinstance(p, dict) else p.name
+                for m in members:
+                    uid = m.get("user_id")
+                    if uid:
+                        if uid not in user_redmine_roles:
+                            user_redmine_roles[uid] = []
+                        for role_name in m.get("roles", []):
+                            user_redmine_roles[uid].append({"project": pname, "role": role_name})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Batch fetch Keycloak roles using service account
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as kc:
+            token_resp = await kc.post(
+                f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token",
+                data={"client_id": settings.KEYCLOAK_CLIENT_ID, "client_secret": settings.KEYCLOAK_CLIENT_SECRET, "grant_type": "client_credentials"}
+            )
+            if token_resp.status_code == 200:
+                admin_token = token_resp.json().get("access_token")
+                for e in employees:
+                    if e.keycloak_user_id:
+                        try:
+                            resp = await kc.get(
+                                f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{e.keycloak_user_id}/role-mappings/realm",
+                                headers={"Authorization": f"Bearer {admin_token}"}
+                            )
+                            realm_roles = resp.json() if resp.status_code == 200 else []
+                            display = [r["name"] for r in realm_roles if r["name"] not in ("default-roles-attendance-app", "offline_access", "uma_authorization")]
+                            user_kc_roles[e.keycloak_user_id] = display[0] if display else "Technical Resource"
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
     return {
         "total": total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": (total + per_page - 1) // per_page,
-        "employees": [_employee_to_dict(e) for e in employees],
+        "employees": [{
+            **_employee_to_dict(e),
+            "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
+            "keycloak_role": user_kc_roles.get(e.keycloak_user_id, "Technical Resource"),
+            "redmine_roles": user_redmine_roles.get(e.redmine_user_id, []),
+        } for e in employees],
     }
 
 
@@ -95,6 +170,18 @@ async def create_employee(
         existing_emp = svc.fetch_one(EmployeeMaster, employee_id=payload.employee_id)
         if existing_emp:
             raise HTTPException(status_code=409, detail="Employee with this employee ID already exists")
+    if payload.contact_number:
+        dup_contact = svc.fetch_one(EmployeeMaster, contact_number=payload.contact_number)
+        if dup_contact:
+            raise HTTPException(status_code=409, detail=f"Contact number already in use by {dup_contact.user_email}")
+    if payload.contact_number and payload.alt_contact_number and payload.contact_number == payload.alt_contact_number:
+        raise HTTPException(status_code=400, detail="Alternative contact number cannot be same as primary")
+    if payload.reports_to:
+        mgr = svc.fetch_one(EmployeeMaster, redmine_user_id=payload.reports_to)
+        if mgr and mgr.keycloak_user_id:
+            kc_roles = await get_user_realm_roles(mgr.keycloak_user_id)
+            if "Admin" not in kc_roles and not any(r in kc_roles for r in ["Project Manager", "Project Coordinator"]):
+                raise HTTPException(status_code=400, detail="Reporting manager must be Admin, Project Manager, or Project Coordinator")
     emp = svc.create(EmployeeMaster, **payload.model_dump())
     return _employee_to_dict(emp)
 
@@ -156,6 +243,10 @@ async def update_employee_status(
         raise HTTPException(status_code=404, detail="Employee not found")
     emp.status = payload.status
     db.commit()
+
+    if payload.status == EmployeeStatus.DISABLED and emp.keycloak_user_id:
+        await delete_sessions_by_sub(emp.keycloak_user_id)
+
     return {"message": f"Employee status updated to {payload.status}"}
 
 
@@ -219,6 +310,52 @@ async def update_employee(
     warnings = []
     changes = payload.model_dump(exclude_none=True)
 
+    # Validate contact uniqueness
+    if changes.get("contact_number"):
+        dup = svc.fetch_one(EmployeeMaster, contact_number=changes["contact_number"])
+        if dup and str(dup.id) != employee_id:
+            raise HTTPException(status_code=409, detail=f"Contact number already in use by {dup.user_email}")
+    if "contact_number" in changes or "alt_contact_number" in changes:
+        new_primary = changes.get("contact_number", emp.contact_number)
+        new_alt = changes.get("alt_contact_number", emp.alt_contact_number)
+        if new_primary and new_alt and new_primary == new_alt:
+            raise HTTPException(status_code=400, detail="Alternative contact number cannot be same as primary")
+
+    # Validate reports_to is a valid manager in the target project
+    if changes.get("reports_to"):
+        target_rm_user_id = changes["reports_to"]
+        manager_emp = svc.fetch_one(EmployeeMaster, redmine_user_id=target_rm_user_id)
+        if not manager_emp:
+            raise HTTPException(status_code=400, detail="Reporting manager not found")
+
+        # Check if manager has Admin KC role
+        is_admin = False
+        if manager_emp.keycloak_user_id:
+            try:
+                kc_roles = await get_user_realm_roles(manager_emp.keycloak_user_id)
+                is_admin = "Admin" in kc_roles
+            except Exception:
+                pass
+
+        if is_admin:
+            pass  # Admin can manage anyone
+        else:
+            target_project_id = changes.get("project_id")
+            if not target_project_id and emp.redmine_user_id:
+                memberships = await redmine_service.get_projects_for_user(emp.redmine_user_id)
+                target_project_id = memberships[0].id if memberships else None
+            if target_project_id:
+                project_members = await redmine_service.get_project_members(target_project_id)
+                manager_in_project = next(
+                    (m for m in project_members if m["user_id"] == target_rm_user_id),
+                    None
+                )
+                if not manager_in_project:
+                    raise HTTPException(status_code=400, detail=f"Reporting manager doesn't belong to this project")
+                manager_roles = manager_in_project.get("roles", [])
+                if not any(r in manager_roles for r in ["Project Manager", "Project Coordinator"]):
+                    raise HTTPException(status_code=400, detail=f"Reporting manager must be Admin, Project Manager, or Project Coordinator")
+
     # ── 1. employee_master fields (always safe, always first) ──────────────
     db_fields = {
         "first_name": "first_name",
@@ -229,6 +366,7 @@ async def update_employee(
         "alt_contact_number": "alt_contact_number",
         "work_address": "work_address",
         "home_address": "home_address",
+        "work_location_status": "work_location_status",
         "country": "country",
         "location_id": "location_id",
         "reports_to": "reports_to",
@@ -263,11 +401,17 @@ async def update_employee(
             except Exception:
                 warnings.append("Keycloak user sync failed")
 
-    # ── 3. Keycloak role ────────────────────────────────────────────────────
+    # ── 3. Keycloak role (replace) ──────────────────────────────────────────
     if is_admin and emp.keycloak_user_id and "keycloak_role_name" in changes:
         try:
-            current_roles = current_user.get("roles", [])  # not the target user's roles, just skip self-demote
-            await add_realm_role_to_user(emp.keycloak_user_id, changes["keycloak_role_name"])
+            new_role = changes["keycloak_role_name"]
+            managed = {"Admin", "Project Manager", "Project Coordinator", "Technical Resource"}
+            # Remove any managed role the user currently has (except the new one)
+            current_roles = await get_user_realm_roles(emp.keycloak_user_id)
+            for cr in current_roles:
+                if cr in managed and cr != new_role:
+                    await remove_realm_role_from_user(emp.keycloak_user_id, cr)
+            await add_realm_role_to_user(emp.keycloak_user_id, new_role)
         except Exception:
             warnings.append("Keycloak role sync failed")
 

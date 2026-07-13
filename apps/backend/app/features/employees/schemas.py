@@ -4,6 +4,23 @@ from datetime import datetime
 
 
 class EmployeeCreate(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    user_email: str
+    designation: Optional[str] = Field(None, max_length=100)
+    employee_id: Optional[str] = Field(None, max_length=50)
+    work_location_status: Optional[str] = None
+    work_address: Optional[str] = "N/A"
+    home_address: Optional[str] = None
+    contact_number: Optional[str] = Field(None, max_length=15)
+    alt_contact_number: Optional[str] = Field(None, max_length=15)
+    country: Optional[str] = Field("", max_length=50)
+    reports_to: Optional[int] = None
+    location_id: Optional[str] = None
+
+
+class UserProfileResponse(BaseModel):
     first_name: str
     middle_name: Optional[str] = None
     last_name: str
@@ -11,13 +28,12 @@ class EmployeeCreate(BaseModel):
     designation: Optional[str] = None
     employee_id: Optional[str] = None
     work_location_status: Optional[str] = None
-    work_address: Optional[str] = "N/A"
+    contact_number: Optional[str] = None
+    alt_contact_number: Optional[str] = None
+    work_address: Optional[str] = None
     home_address: Optional[str] = None
-    contact_number: Optional[str] = Field(None, max_length=15)
-    alt_contact_number: Optional[str] = Field(None, max_length=15)
-    country: Optional[str] = ""
-    reports_to: Optional[int] = None
-    location_id: Optional[str] = None
+    reports_to_name: Optional[str] = None
+    is_active: bool
 
 
 class EmployeeResponse(BaseModel):
@@ -73,16 +89,17 @@ class AssignProjectRequest(BaseModel):
 
 
 class EmployeeUpdate(BaseModel):
-    first_name: Optional[str] = None
-    middle_name: Optional[str] = None
-    last_name: Optional[str] = None
+    first_name: Optional[str] = Field(None, max_length=100)
+    middle_name: Optional[str] = Field(None, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
     user_email: Optional[str] = None
-    designation: Optional[str] = None
+    designation: Optional[str] = Field(None, max_length=100)
     contact_number: Optional[str] = Field(None, max_length=15)
-    alt_contact_number: Optional[str] = None
+    alt_contact_number: Optional[str] = Field(None, max_length=15)
     work_address: Optional[str] = None
     home_address: Optional[str] = None
-    country: Optional[str] = None
+    work_location_status: Optional[str] = None
+    country: Optional[str] = Field(None, max_length=50)
     timezone: Optional[str] = None
     location_id: Optional[str] = None
     reports_to: Optional[int] = None

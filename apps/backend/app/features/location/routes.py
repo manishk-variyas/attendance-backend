@@ -2,10 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-import httpx
 
 from app.core.database import get_db
-from app.features.location.schemas.location import LocationSaveRequest, LocationResponse
+from app.features.location.schemas.location import LocationSaveRequest, LocationSaveResponse, LocationGetResponse
 from app.features.auth.dependencies import get_current_user
 from app.services.database.location_service import LocationService
 from app.models.employee_master import EmployeeMaster
@@ -13,8 +12,6 @@ from app.models.office_location import OfficeLocation
 
 router = APIRouter()
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
-_GEO_CACHE: dict = {}
 GEOFENCE_SQL = text("""
     SELECT
         ST_DWithin(ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, o.geom::geography, o.radius_meters) AS inside,
@@ -23,29 +20,38 @@ GEOFENCE_SQL = text("""
     WHERE o.id = :office_id
 """)
 
+DISTANCE_KM_SQL = text("""
+    SELECT ROUND((ST_Distance(
+        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+        (SELECT geom FROM office_locations WHERE id = :office_id)::geography
+    ) / 1000.0)::numeric, 2)
+""")
 
-async def _reverse_geocode(lat: float, lng: float) -> str:
-    cache_key = (round(lat, 3), round(lng, 3))
-    if cache_key in _GEO_CACHE:
-        return _GEO_CACHE[cache_key]
+
+def _loc_name(db: Session, lat: float, lng: float, location_id) -> str:
+    if not location_id:
+        return f"{lat:.4f}, {lng:.4f}"
+    office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
+    if not office:
+        return f"{lat:.4f}, {lng:.4f}"
+    inside = db.execute(
+        GEOFENCE_SQL,
+        {"lng": lng, "lat": lat, "office_id": str(location_id)},
+    ).first()
+    if inside and inside.inside:
+        return f"{office.name}, {office.address}" if office.address else office.name
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                NOMINATIM_URL,
-                params={"format": "json", "lat": lat, "lon": lng},
-                headers={"User-Agent": "AttendanceApp/1.0"},
-            )
-            if resp.status_code == 200 and resp.text.strip():
-                data = resp.json()
-                name = data.get("display_name", "")[:500]
-                if name:
-                    _GEO_CACHE[cache_key] = name
-                return name
+        dist = db.execute(
+            DISTANCE_KM_SQL,
+            {"lng": lng, "lat": lat, "office_id": str(location_id)},
+        ).scalar()
+        if dist is not None:
+            return f"{dist} km from {office.name}"
     except Exception:
         pass
-    return ""
+    return f"{lat:.4f}, {lng:.4f}"
 
-@router.post("", response_model=LocationResponse)
+@router.post("", response_model=LocationSaveResponse)
 async def save_location(
     payload: LocationSaveRequest,
     db: Session = Depends(get_db),
@@ -58,29 +64,37 @@ async def save_location(
         )
 
     svc = LocationService(db)
-    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == payload.email).first()
+    email = payload.email
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+    office = None
+    geo = None
     if emp and emp.location_id:
-        geo = db.execute(
-            GEOFENCE_SQL,
-            {"lng": payload.longitude, "lat": payload.latitude, "office_id": str(emp.location_id)},
-        ).first()
-        if geo and geo.inside:
-            office = db.query(OfficeLocation).filter(OfficeLocation.id == emp.location_id).first()
-            loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
-        else:
-            loc_name = await _reverse_geocode(payload.latitude, payload.longitude)
+        office = db.query(OfficeLocation).filter(OfficeLocation.id == emp.location_id).first()
+        if office and office.geom is not None:
+            geo = db.execute(
+                GEOFENCE_SQL,
+                {"lng": payload.longitude, "lat": payload.latitude, "office_id": str(office.id)},
+            ).first()
+    if geo and geo.inside:
+        loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
     else:
-        loc_name = await _reverse_geocode(payload.latitude, payload.longitude)
-    loc = svc.upsert(email=payload.email, latitude=payload.latitude, longitude=payload.longitude, location_name=loc_name)
-    return {
+        loc_name = _loc_name(db, payload.latitude, payload.longitude, emp.location_id if emp else None)
+    loc = svc.upsert(email=email, latitude=payload.latitude, longitude=payload.longitude, location_name=loc_name)
+    result = {
         "email": loc.email,
         "latitude": loc.latitude,
         "longitude": loc.longitude,
         "location_name": loc.location_name,
+        "office_name": office.name if office else None,
+        "office_lat": office.latitude if office else None,
+        "office_lng": office.longitude if office else None,
+        "distance_km": round(geo.distance_m / 1000.0, 2) if geo else None,
+        "is_inside_office": geo.inside if geo else None,
         "updated_at": loc.updated_at,
     }
+    return result
 
-@router.get("/{email}")
+@router.get("/{email}", response_model=LocationGetResponse)
 async def get_location(
     email: str,
     db: Session = Depends(get_db),
@@ -100,14 +114,14 @@ async def get_location(
         )
 
     result = {
-        "email": loc.email,
-        "latitude": loc.latitude,
-        "longitude": loc.longitude,
-        "location_name": loc.location_name,
-        "updated_at": loc.updated_at,
+        "lat": loc.latitude,
+        "lng": loc.longitude,
         "office_name": None,
-        "distance_from_office": None,
+        "office_lat": None,
+        "office_lng": None,
+        "distance_km": None,
         "is_inside_office": None,
+        "updated_at": loc.updated_at,
     }
 
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
@@ -115,12 +129,14 @@ async def get_location(
         office = db.query(OfficeLocation).filter(OfficeLocation.id == emp.location_id).first()
         if office and office.geom is not None:
             result["office_name"] = office.name
+            result["office_lat"] = office.latitude
+            result["office_lng"] = office.longitude
             geo = db.execute(
                 GEOFENCE_SQL,
                 {"lng": loc.longitude, "lat": loc.latitude, "office_id": str(office.id)},
             ).first()
             if geo:
                 result["is_inside_office"] = geo.inside
-                result["distance_from_office"] = geo.distance_m
+                result["distance_km"] = round(geo.distance_m / 1000.0, 2)
 
     return result

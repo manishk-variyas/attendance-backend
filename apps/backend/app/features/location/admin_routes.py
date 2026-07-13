@@ -1,5 +1,7 @@
+from datetime import datetime, timezone
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from typing import List, Optional
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.core.database import get_db
@@ -72,9 +74,9 @@ async def list_office_locations(
 ):
     svc = OfficeLocationService(db)
     if category:
-        locations = db.query(OfficeLocation).filter(OfficeLocation.category == category).all()
+        locations = db.query(OfficeLocation).filter(OfficeLocation.category == category).order_by(OfficeLocation.updated_at.desc()).all()
     else:
-        locations = svc.fetch_all(OfficeLocation)
+        locations = svc.fetch_all(OfficeLocation, order_by=OfficeLocation.updated_at.desc())
     return [_to_response(l) for l in locations]
 
 
@@ -106,6 +108,7 @@ async def update_office_location(
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
         return _to_response(existing)
+    update_data["updated_at"] = datetime.now(timezone.utc)
 
     if "parent_location_id" in update_data:
         new_parent = update_data["parent_location_id"]

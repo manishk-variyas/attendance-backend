@@ -2,15 +2,14 @@ import logging
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, text
+from sqlalchemy import and_, or_, text
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest
+from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
@@ -19,13 +18,15 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.location import UserLocation
 from app.models.holiday import Holiday
 from app.models.leave_balance import LeaveBalance
+from app.models.leave import Leave
+from app.models.shift import Shift
+from app.features.redmine.service import redmine_service
 from app.models.system_setting import SystemSetting
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 GEOFENCE_SQL = text("""
     SELECT ST_DWithin(
         ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
@@ -34,14 +35,12 @@ GEOFENCE_SQL = text("""
     )
 """)
 
-_GEO_CACHE: dict = {}
-
-
-def _safe_zone(tz_str: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(tz_str)
-    except Exception:
-        return ZoneInfo("Asia/Kolkata")
+DISTANCE_SQL = text("""
+    SELECT ROUND(ST_Distance(
+        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
+        (SELECT geom FROM office_locations WHERE id = :office_id)::geography
+    )::INT / 1000.0, 1) AS distance_km
+""")
 
 
 def _determine_work_location(db: Session, user_lat: float, user_lng: float, location_id) -> str:
@@ -57,26 +56,35 @@ def _determine_work_location(db: Session, user_lat: float, user_lng: float, loca
     return "OFFICE" if inside else "WFH"
 
 
-async def _reverse_geocode(lat: float, lng: float) -> str:
-    cache_key = (round(lat, 3), round(lng, 3))
-    if cache_key in _GEO_CACHE:
-        return _GEO_CACHE[cache_key]
+def _safe_zone(tz_str: str) -> ZoneInfo:
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                NOMINATIM_URL,
-                params={"format": "json", "lat": lat, "lon": lng},
-                headers={"User-Agent": "AttendanceApp/1.0"},
-            )
-            if resp.status_code == 200 and resp.text.strip():
-                data = resp.json()
-                name = data.get("display_name", "")[:500]
-                if name:
-                    _GEO_CACHE[cache_key] = name
-                return name
-    except Exception as e:
-        logger.warning(f"Reverse geocode failed for ({lat}, {lng}): {e}")
-    return ""
+        return ZoneInfo(tz_str)
+    except Exception:
+        return ZoneInfo("Asia/Kolkata")
+
+
+def _location_name(db: Session, lat: float, lng: float, location_id) -> str:
+    if not location_id:
+        return f"{lat:.4f}, {lng:.4f}"
+    office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
+    if not office:
+        return f"{lat:.4f}, {lng:.4f}"
+    inside = db.execute(
+        GEOFENCE_SQL,
+        {"lng": lng, "lat": lat, "office_id": str(location_id), "radius": office.radius_meters},
+    ).scalar()
+    if inside:
+        return f"{office.name}, {office.address}" if office.address else office.name
+    try:
+        dist = db.execute(
+            DISTANCE_SQL,
+            {"lng": lng, "lat": lat, "office_id": str(location_id)},
+        ).scalar()
+        if dist is not None:
+            return f"{dist} km from {office.name}"
+    except Exception:
+        pass
+    return f"{lat:.4f}, {lng:.4f}"
 
 
 def _credit_comp_off_if_holiday(db: Session, attendance: Attendance) -> None:
@@ -201,7 +209,10 @@ async def check_in(
     all_shifts_today = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
-            Shift.date == target_date,
+            or_(
+                Shift.date == target_date,
+                and_(Shift.end_date.is_not(None), Shift.end_date >= target_date),
+            ),
         )
     ).all()
 
@@ -291,7 +302,7 @@ async def check_in(
             office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
             check_in_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
         else:
-            check_in_location_name = await _reverse_geocode(payload.latitude, payload.longitude)
+            check_in_location_name = _location_name(db, payload.latitude, payload.longitude, location_id)
 
     remarks = None
     if target_date != today:
@@ -392,7 +403,7 @@ async def check_out(
         office = db.query(OfficeLocation).filter(OfficeLocation.id == attendance.location_id).first()
         attendance.check_out_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
     else:
-        attendance.check_out_location_name = await _reverse_geocode(payload.latitude, payload.longitude)
+        attendance.check_out_location_name = _location_name(db, payload.latitude, payload.longitude, attendance.location_id)
 
     if payload.remarks:
         attendance.remarks = payload.remarks
@@ -430,8 +441,13 @@ async def check_out(
 
     if attendance.shift_code and attendance.keycloak_user_id and attendance.attendance_date:
         shift_rec = db.query(Shift).filter(
-            Shift.keycloak_user_id == attendance.keycloak_user_id,
-            Shift.date == attendance.attendance_date,
+            and_(
+                Shift.keycloak_user_id == attendance.keycloak_user_id,
+                or_(
+                    Shift.date == attendance.attendance_date,
+                    and_(Shift.end_date.is_not(None), Shift.end_date >= attendance.attendance_date),
+                ),
+            )
         ).first()
         if shift_rec:
             shift_rec.status = "Ended"
@@ -482,7 +498,10 @@ async def complete_attendance(
     shift = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
-            Shift.date == target_date,
+            or_(
+                Shift.date == target_date,
+                and_(Shift.end_date.is_not(None), Shift.end_date >= target_date),
+            ),
         )
     ).first()
     if shift:
@@ -498,7 +517,7 @@ async def complete_attendance(
             office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
             loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
         else:
-            loc_name = await _reverse_geocode(payload.latitude, payload.longitude)
+            loc_name = _location_name(db, payload.latitude, payload.longitude, location_id)
 
     if existing:
         existing.check_out_time = payload.checkOutTime
@@ -609,59 +628,169 @@ async def get_pending_attendance(
     raise HTTPException(status_code=404, detail="No pending attendance action")
 
 
-@router.get("/today")
+@router.get("/today", response_model=TodayAttendanceResponse)
 async def get_today_attendance(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
 ):
     keycloak_user_id = current_user["sub"]
+    now = datetime.now(timezone.utc)
     today = date.today()
-    attendance = db.query(Attendance).filter(
+    yesterday = today - timedelta(days=1)
+
+    # 1. Open (unchecked-out) session takes priority
+    open_att = db.query(Attendance).filter(
+        and_(
+            Attendance.keycloak_user_id == keycloak_user_id,
+            Attendance.check_out_time.is_(None),
+        )
+    ).order_by(Attendance.attendance_date.desc()).first()
+
+    if open_att:
+        s = "overnight" if open_att.attendance_date < today else "in_progress"
+        return _build_status_response(db, open_att, today, s)
+
+    # 2. Find shifts covering today (single-day: date==today, multi-day: date<=today AND end_date>=today)
+    shifts_today = db.query(Shift).filter(
+        and_(
+            Shift.keycloak_user_id == keycloak_user_id,
+            or_(
+                Shift.date == today,
+                and_(Shift.end_date.is_not(None), Shift.end_date >= today),
+            ),
+        )
+    ).order_by(Shift.date.asc()).all()
+
+    # 3. Pick active or next-upcoming shift (same logic as check-in)
+    picked = _pick_shift(db, shifts_today, today, now)
+
+    if picked:
+        shift, sd, tz, start_dt, end_dt = picked
+        shift_att = db.query(Attendance).filter(
+            and_(
+                Attendance.keycloak_user_id == keycloak_user_id,
+                Attendance.attendance_date == today,
+            )
+        ).first()
+
+        if shift_att:
+            s = "completed" if shift_att.check_out_time else "in_progress"
+            return _build_status_response(db, shift_att, today, s)
+
+        if end_dt and now > end_dt:
+            return _no_attendance_response("missed", shift, sd, tz, today)
+
+        return _no_attendance_response("yet_to_start", shift, sd, tz, today)
+
+    # 4. Any attendance record today (checked in without a shift)
+    att_today = db.query(Attendance).filter(
         and_(
             Attendance.keycloak_user_id == keycloak_user_id,
             Attendance.attendance_date == today,
         )
     ).first()
-    if not attendance:
-        attendance = db.query(Attendance).filter(
-            and_(
-                Attendance.keycloak_user_id == keycloak_user_id,
-                Attendance.attendance_date == today - timedelta(days=1),
-                Attendance.check_out_time.is_(None),
-            )
-        ).first()
-    if not attendance:
-        raise HTTPException(status_code=404, detail="No attendance record for today")
 
-    result = _to_response(db, attendance)
+    if att_today:
+        s = "completed" if att_today.check_out_time else "in_progress"
+        return _build_status_response(db, att_today, today, s)
 
+    # 5. Nothing at all
+    return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
+
+
+def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> Optional[tuple]:
+    shift_defs = {
+        s.shift_code: db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == s.shift_code).first()
+        for s in shifts
+    }
+    active = None
+    next_upcoming = None
+    earliest = None
+    earliest_dt = None
+
+    for s in shifts:
+        sd = shift_defs.get(s.shift_code)
+        if not sd:
+            continue
+        tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+        start_dt = datetime.combine(target_date, sd.start_time, tzinfo=tz)
+        end_dt = _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz)
+
+        if earliest_dt is None or start_dt < earliest_dt:
+            earliest_dt = start_dt
+            earliest = (s, sd, tz, start_dt, end_dt)
+
+        if start_dt <= now <= end_dt:
+            active = (s, sd, tz, start_dt, end_dt)
+            break
+
+        if next_upcoming is None and start_dt > now:
+            next_upcoming = (s, sd, tz, start_dt, end_dt)
+
+    return active or next_upcoming or earliest
+
+
+def _build_status_response(db: Session, att: Attendance, today: date, status: str) -> dict:
+    shift_info = None
     shift_start_dt = None
     shift_end_dt = None
-    if attendance.shift_code:
-        shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == attendance.shift_code).first()
-        if shift_def:
-            tz = _safe_zone(shift_def.timezone or "Asia/Kolkata")
-            if shift_def.start_time:
-                shift_start_dt = datetime.combine(today, shift_def.start_time, tzinfo=tz)
-            if shift_def.end_time:
-                shift_end_dt = _shift_end_datetime(today, shift_def.start_time, shift_def.end_time, tz)
+    if att.shift_code:
+        sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == att.shift_code).first()
+        if sd:
+            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            if sd.start_time:
+                shift_start_dt = datetime.combine(att.attendance_date, sd.start_time, tzinfo=tz)
+            if sd.end_time:
+                shift_end_dt = _shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, tz)
+            shift_info = {
+                "shift_code": att.shift_code,
+                "shift_name": sd.shift_name,
+                "date": att.attendance_date.isoformat(),
+                "work_location_status": att.work_location_status,
+                "start_time": shift_start_dt.isoformat() if shift_start_dt else None,
+                "end_time": shift_end_dt.isoformat() if shift_end_dt else None,
+            }
 
-    result["shiftStartTime"] = shift_start_dt.isoformat() if shift_start_dt else None
-    result["shiftEndTime"] = shift_end_dt.isoformat() if shift_end_dt else None
-    if shift_end_dt:
-        result["remainingHours"] = round(max((shift_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600, 0), 2)
+    remaining = 0.0
+    if att.check_out_time:
+        remaining = 0.0
+    elif shift_end_dt:
+        remaining = round(max((shift_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600, 0), 2)
     else:
-        result["remainingHours"] = None
-    return result
+        remaining = None
+
+    return {
+        "status": status,
+        "shift": shift_info,
+        "attendance": _to_response(db, att),
+        "remainingHours": remaining,
+    }
+
+
+def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: ZoneInfo, target_date: date) -> dict:
+    shift_info = None
+    if sd:
+        shift_info = {
+            "shift_code": shift.shift_code,
+            "shift_name": sd.shift_name,
+            "date": target_date.isoformat(),
+            "work_location_status": shift.work_location_status,
+            "start_time": datetime.combine(target_date, sd.start_time, tzinfo=tz).isoformat() if sd.start_time else None,
+            "end_time": _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
+        }
+    return {
+        "status": status,
+        "shift": shift_info,
+        "attendance": None,
+        "remainingHours": 0.0 if status == "missed" else None,
+    }
 
 
 @router.get("/history")
 async def get_attendance_history(
     from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
@@ -673,16 +802,13 @@ async def get_attendance_history(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    query = db.query(Attendance).filter(
+    records = db.query(Attendance).filter(
         and_(
             Attendance.keycloak_user_id == keycloak_user_id,
             Attendance.attendance_date >= f,
             Attendance.attendance_date <= t,
         )
-    )
-    total = query.count()
-    offset = (page - 1) * per_page
-    records = query.order_by(Attendance.attendance_date.desc()).offset(offset).limit(per_page).all()
+    ).order_by(Attendance.attendance_date.desc()).all()
 
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
     user_name = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
@@ -702,10 +828,99 @@ async def get_attendance_history(
                     rec["shiftEndTime"] = _shift_end_datetime(r.attendance_date, sd.start_time, sd.end_time, tz).isoformat()
         records_data.append(rec)
 
+    return records_data
+
+
+@router.get("/project/{project_id}")
+async def get_project_attendance(
+    project_id: int,
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    members = await redmine_service.get_project_members(project_id)
+    if not members:
+        return {"total": 0, "records": []}
+
+    member_rm_ids = [m["user_id"] for m in members if m.get("user_id")]
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
+    visible_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
+    if not visible_ids:
+        return {"total": 0, "records": []}
+
+    query = db.query(Attendance).filter(
+        Attendance.keycloak_user_id.in_(visible_ids)
+    )
+    if from_date:
+        try:
+            query = query.filter(Attendance.attendance_date >= date.fromisoformat(from_date))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid from_date format.")
+    if to_date:
+        try:
+            query = query.filter(Attendance.attendance_date <= date.fromisoformat(to_date))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid to_date format.")
+
+    records = query.order_by(Attendance.attendance_date.desc()).all()
+
+    result = []
+    for a in records:
+        rec = _to_response(db, a)
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.keycloak_user_id).first()
+        if emp:
+            rec["userEmail"] = emp.user_email
+            rec["userName"] = f"{emp.first_name} {emp.last_name}".strip()
+            rec["userDesignation"] = emp.designation
+
+        rec["derivedStatus"] = "shift_ended" if a.check_out_time else "in_progress"
+        rec["isAtAssignedLocation"] = a.location_id is not None and a.work_location_status == "OFFICE"
+        rec["dayName"] = a.attendance_date.strftime("%A") if a.attendance_date else None
+
+        shift = db.query(Shift).filter(
+            and_(Shift.keycloak_user_id == a.keycloak_user_id, Shift.date == a.attendance_date)
+        ).first()
+        rec["shiftProject"] = shift.project_name if shift else None
+
+        leave = db.query(Leave).filter(
+            and_(
+                Leave.keycloak_user_id == a.keycloak_user_id,
+                Leave.approval_status == "approved",
+                Leave.start_date <= a.attendance_date,
+                Leave.end_date >= a.attendance_date,
+            )
+        ).first()
+        rec["onLeave"] = leave is not None
+        rec["leaveType"] = leave.leave_type if leave else None
+        rec["leaveStartDate"] = leave.start_date.isoformat() if leave and leave.start_date else None
+        rec["leaveEndDate"] = leave.end_date.isoformat() if leave and leave.end_date else None
+        rec["leaveStartDay"] = leave.start_date.strftime("%A") if leave and leave.start_date else None
+        rec["leaveEndDay"] = leave.end_date.strftime("%A") if leave and leave.end_date else None
+
+        if a.check_out_time:
+            if a.modified_by:
+                ended_by_emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.modified_by).first()
+                rec["endedBy"] = f"{ended_by_emp.first_name} {ended_by_emp.last_name}".strip() if ended_by_emp else a.modified_by
+                rec["endedByRole"] = ended_by_emp.designation if ended_by_emp else None
+            elif emp:
+                rec["endedBy"] = f"{emp.first_name} {emp.last_name}".strip()
+                rec["endedByRole"] = emp.designation
+            else:
+                rec["endedBy"] = None
+                rec["endedByRole"] = None
+        else:
+            rec["endedBy"] = None
+            rec["endedByRole"] = None
+
+        result.append(rec)
+
     return {
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": (total + per_page - 1) // per_page,
-        "records": records_data,
+        "total": len(result),
+        "records": result,
     }

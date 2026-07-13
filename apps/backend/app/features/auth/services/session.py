@@ -1,37 +1,37 @@
 """
-In-memory session service - manages user sessions stored in the server's memory.
-
-This module handles all session-related operations using a local dictionary:
-- Creating sessions (after login)
-- Getting session data
-- Deleting sessions (logout)
-- Refreshing sessions
-- Extending session expiry
-
-Note: In-memory sessions are lost when the server restarts.
+PostgreSQL-backed session service — survives restarts, works across containers.
+Original in-memory version is commented below for fallback.
 """
 import json
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
+from sqlalchemy.orm import Session as DBSession
+from sqlalchemy import text
+
 from app.core.config import settings
+from app.models.session import Session
 
 logger = logging.getLogger(__name__)
 
-_session_store: Dict[str, dict] = {}
+# ═══════════════════════════════════════════════════════════════
+#  PUBLIC API — same interface, PostgreSQL backend
+# ═══════════════════════════════════════════════════════════════
+
+def _db() -> DBSession:
+    """Get a raw DB session. Needed because this module is called
+    before FastAPI dependency injection is available (login flow)."""
+    from app.core.database import SessionLocal
+    return SessionLocal()
 
 
 def generate_session_id() -> str:
-    """Generate a secure random session ID."""
     return secrets.token_urlsafe(32)
 
 
-async def create_session(
-    user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None
-) -> str:
-    """Create a new session in server memory."""
+async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None) -> str:
     session_id = generate_session_id()
     expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
 
@@ -41,78 +41,134 @@ async def create_session(
         "email": user_data.get("email"),
         "roles": user_data.get("roles", []),
     }
-
     if keycloak_refresh_token:
         session_data["kc_refresh_token"] = keycloak_refresh_token
 
-    # Store in memory with expiry
-    _session_store[session_id] = {
-        "data": session_data,
-        "expires": datetime.now() + timedelta(hours=expire_hours)
-    }
-    
-    logger.info(f"Session created in-memory: {session_id[:8]}...")
+    db = _db()
+    try:
+        s = Session(
+            id=session_id,
+            user_sub=user_data.get("sub"),
+            data=session_data,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=expire_hours),
+        )
+        db.add(s)
+        db.commit()
+    finally:
+        db.close()
+
+    logger.info(f"Session created: {session_id[:8]}...")
     return session_id
 
 
 async def get_session(session_id: str) -> Optional[dict]:
-    """Get session data from memory, checking for expiry."""
-    session = _session_store.get(session_id)
-    if not session:
-        return None
-
-    # Check if session has expired
-    if datetime.now() > session["expires"]:
-        logger.info(f"Session expired in-memory: {session_id[:8]}...")
-        del _session_store[session_id]
-        return None
-
-    return session["data"]
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s:
+            return None
+        if datetime.now(timezone.utc) > s.expires_at:
+            db.delete(s)
+            db.commit()
+            logger.info(f"Session expired: {session_id[:8]}...")
+            return None
+        return s.data
+    finally:
+        db.close()
 
 
 async def delete_session(session_id: str) -> bool:
-    """Delete a session from memory (logout)."""
-    if session_id in _session_store:
-        del _session_store[session_id]
-        logger.info(f"Session deleted from memory: {session_id[:8]}...")
-        return True
-    return False
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if s:
+            db.delete(s)
+            db.commit()
+            logger.info(f"Session deleted: {session_id[:8]}...")
+            return True
+        return False
+    finally:
+        db.close()
 
 
 async def delete_sessions_by_sub(sub: str) -> int:
-    """Delete all sessions belonging to a specific user (sub)."""
-    deleted = 0
-    keys_to_delete = [
-        sid for sid, info in _session_store.items() 
-        if info.get("data", {}).get("sub") == sub
-    ]
-            
-    for sid in keys_to_delete:
-        del _session_store[sid]
-        deleted += 1
-        
-    if deleted > 0:
-        logger.info(f"Deleted {deleted} in-memory sessions for user sub: {sub}")
-        
-    return deleted
+    db = _db()
+    try:
+        deleted = db.query(Session).filter(Session.user_sub == sub).delete()
+        db.commit()
+        if deleted > 0:
+            logger.info(f"Deleted {deleted} sessions for sub: {sub}")
+        return deleted
+    finally:
+        db.close()
+
+
+async def enforce_session_limit(sub: str, max_sessions: int = 2) -> int:
+    db = _db()
+    try:
+        sessions = db.query(Session).filter(Session.user_sub == sub).order_by(Session.created_at.desc()).all()
+        deleted = 0
+        for s in sessions[max_sessions:]:
+            db.delete(s)
+            deleted += 1
+        db.commit()
+        if deleted > 0:
+            logger.info(f"Enforced session limit: deleted {deleted} extra for {sub}")
+        return deleted
+    finally:
+        db.close()
 
 
 async def refresh_session(session_id: str, keycloak_refresh_token: str) -> bool:
-    """Update the refresh token for an existing in-memory session."""
-    session = _session_store.get(session_id)
-    if not session:
-        return False
-
-    session["data"]["kc_refresh_token"] = keycloak_refresh_token
-    return True
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s:
+            return False
+        data = dict(s.data) if s.data else {}
+        data["kc_refresh_token"] = keycloak_refresh_token
+        s.data = data
+        db.commit()
+        return True
+    finally:
+        db.close()
 
 
 async def extend_session(session_id: str, hours: int = None) -> bool:
-    """Extend the expiry time of an existing in-memory session."""
-    session = _session_store.get(session_id)
-    if not session:
-        return False
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s:
+            return False
+        expire_hours = hours or settings.SESSION_EXPIRE_HOURS
+        s.expires_at = datetime.now(timezone.utc) + timedelta(hours=expire_hours)
+        db.commit()
+        return True
+    finally:
+        db.close()
 
-    expire_hours = hours or settings.SESSION_EXPIRE_HOURS
-    session["expires"] = datetime.now() + timedelta(hours=expire_hours)
-    return True
+
+# ═══════════════════════════════════════════════════════════════
+#  OLD — IN-MEMORY SESSION STORE (kept for fallback)
+# ═══════════════════════════════════════════════════════════════
+#
+# _session_store: Dict[str, dict] = {}
+#
+# async def create_session(user_data: dict, ...):
+#     session_id = generate_session_id()
+#     _session_store[session_id] = {"data": session_data, "expires": datetime.now() + timedelta(hours=expire_hours)}
+#     return session_id
+#
+# async def get_session(session_id: str):
+#     session = _session_store.get(session_id)
+#     if not session or datetime.now() > session["expires"]:
+#         ...
+#
+# async def delete_session(session_id: str):
+#     ...
+#
+# async def delete_sessions_by_sub(sub: str):
+#     ...
+#
+# async def enforce_session_limit(sub: str, max_sessions: int = 2):
+#     ...

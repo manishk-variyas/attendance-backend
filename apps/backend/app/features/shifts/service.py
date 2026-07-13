@@ -142,6 +142,7 @@ class ShiftService:
             shift_end_utc=data.get("shiftEndUTC"),
             location_id=data.get("locationId"),
             country=data.get("country", ""),
+            pincode=data.get("pincode"),
             per_diem_eligible=data.get("perDiemEligible", False),
             conveyance_eligible=data.get("conveyanceEligible", False),
         )
@@ -165,6 +166,7 @@ class ShiftService:
             "shiftEndUTC": shift.shift_end_utc,
             "locationId": str(shift.location_id) if shift.location_id else None,
             "country": shift.country,
+            "pincode": shift.pincode,
             "perDiemEligible": shift.per_diem_eligible,
             "conveyanceEligible": shift.conveyance_eligible,
             "warnings": warnings,
@@ -232,6 +234,7 @@ class ShiftService:
                 "workStatus": s.work_location_status,
                 "status": s.status,
                 "workAddress": s.work_address,
+                "pincode": s.pincode,
                 "leaveType": None,
                 "perDiemEligible": s.per_diem_eligible,
                 "conveyanceEligible": s.conveyance_eligible,
@@ -261,6 +264,7 @@ class ShiftService:
             "projectName": "project_name",
             "endDate": "end_date",
             "locationId": "location_id",
+            "pincode": "pincode",
             "perDiemEligible": "per_diem_eligible",
             "conveyanceEligible": "conveyance_eligible",
         }
@@ -273,6 +277,22 @@ class ShiftService:
                 update_data[pg_col] = val
         if update_data:
             svc.update(Shift, shift.id, **update_data)
+
+        # Cascade to attendance records in this shift's date range
+        att_updates = {}
+        if "shift_code" in update_data:
+            att_updates["shift_code"] = update_data["shift_code"]
+        if "work_location_status" in update_data:
+            att_updates["work_location_status"] = update_data["work_location_status"]
+        if att_updates:
+            db.query(Attendance).filter(
+                Attendance.keycloak_user_id == shift.keycloak_user_id,
+                Attendance.attendance_date >= shift.date,
+                Attendance.attendance_date <= (shift.end_date or shift.date),
+                Attendance.shift_code == shift.shift_code,
+            ).update(att_updates, synchronize_session=False)
+            db.commit()
+
         return await self.get_shift_by_id(db, shift_id)
 
     async def delete_shift(self, db: Session, shift_id: str) -> bool:
@@ -470,6 +490,7 @@ class ShiftService:
             "shiftStartUTC": shift.shift_start_utc,
             "shiftEndUTC": shift.shift_end_utc,
             "country": shift.country,
+            "pincode": shift.pincode,
             "perDiemEligible": shift.per_diem_eligible,
             "conveyanceEligible": shift.conveyance_eligible,
             "status": shift.status,

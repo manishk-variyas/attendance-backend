@@ -2,7 +2,7 @@ import uuid
 import enum
 from datetime import datetime
 from sqlalchemy import Column, String, Integer, Date, Boolean, DateTime, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSON
 from app.core.models import Base
 
 
@@ -31,6 +31,8 @@ class Leave(Base):
     comment = Column(String(1000), nullable=True)
     is_traveling = Column(Boolean, nullable=True)
     contact_number = Column(String(50), nullable=True)
+    resuming_date = Column(Date, nullable=True)
+    leave_dates = Column(JSON, nullable=True)
     approver_id = Column(Integer, nullable=True)
     approval_status = Column(String(8), nullable=False, server_default=text("'pending'"))
     approved_at = Column(DateTime(timezone=True), nullable=True)
@@ -52,6 +54,8 @@ class Leave(Base):
             "comment": self.comment,
             "is_traveling": self.is_traveling,
             "contact_number": self.contact_number,
+            "resuming_date": self.resuming_date.isoformat() if self.resuming_date else None,
+            "leave_dates": self.leave_dates if self.leave_dates else None,
             "approver_id": self.approver_id,
             "status": self.approval_status,
             "approved_at": self.approved_at,

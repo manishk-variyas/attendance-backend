@@ -38,12 +38,14 @@ class BaseService(Generic[T]):
             logger.error(f"Database error during fetch_one for model {model.__name__}: {e}")
             raise RuntimeError("An internal error occurred while retrieving data.")
 
-    def fetch_all(self, model: Type[T], limit: int = 100, offset: int = 0, **filters: Any) -> List[T]:
+    def fetch_all(self, model: Type[T], limit: int = 100, offset: int = 0, order_by=None, **filters: Any) -> List[T]:
         """
         Securely fetches multiple records matching the filters with pagination.
         """
         try:
             stmt = select(model).filter_by(**filters).limit(limit).offset(offset)
+            if order_by is not None:
+                stmt = stmt.order_by(order_by)
             result = self.db.execute(stmt)
             return list(result.scalars().all())
         except SQLAlchemyError as e:

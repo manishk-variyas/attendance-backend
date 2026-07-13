@@ -68,6 +68,28 @@ def _to_response_with_email(db: Session, a: Attendance) -> dict:
 
     data["isAtAssignedLocation"] = a.location_id is not None and a.work_location_status == "OFFICE"
 
+    data["dayName"] = a.attendance_date.strftime("%A") if a.attendance_date else None
+
+    shift = db.query(Shift).filter(
+        and_(Shift.keycloak_user_id == a.keycloak_user_id, Shift.date == a.attendance_date)
+    ).first()
+    data["shiftProject"] = shift.project_name if shift else None
+
+    leave = db.query(Leave).filter(
+        and_(
+            Leave.keycloak_user_id == a.keycloak_user_id,
+            Leave.approval_status == "approved",
+            Leave.start_date <= a.attendance_date,
+            Leave.end_date >= a.attendance_date,
+        )
+    ).first()
+    data["onLeave"] = leave is not None
+    data["leaveType"] = leave.leave_type if leave else None
+    data["leaveStartDate"] = leave.start_date.isoformat() if leave and leave.start_date else None
+    data["leaveEndDate"] = leave.end_date.isoformat() if leave and leave.end_date else None
+    data["leaveStartDay"] = leave.start_date.strftime("%A") if leave and leave.start_date else None
+    data["leaveEndDay"] = leave.end_date.strftime("%A") if leave and leave.end_date else None
+
     if a.check_out_time:
         if a.modified_by:
             ended_by_emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.modified_by).first()
@@ -113,6 +135,14 @@ def _build_virtual_record(db: Session, shift, emp) -> dict:
         "userDesignation": emp.designation if emp else None,
         "derivedStatus": derived,
         "isAtAssignedLocation": None,
+        "dayName": shift.date.strftime("%A") if shift.date else None,
+        "shiftProject": shift.project_name,
+        "onLeave": False,
+        "leaveType": None,
+        "leaveStartDate": None,
+        "leaveEndDate": None,
+        "leaveStartDay": None,
+        "leaveEndDay": None,
         "endedBy": None,
         "endedByRole": None,
         "perDiemEligible": shift.per_diem_eligible,
@@ -183,6 +213,16 @@ async def admin_create_attendance(
     db.commit()
     db.refresh(attendance)
 
+    if payload.shift_code and emp.keycloak_user_id:
+        shift_rec = db.query(Shift).filter(
+            Shift.keycloak_user_id == emp.keycloak_user_id,
+            Shift.date == att_date,
+            Shift.shift_code == payload.shift_code,
+        ).first()
+        if shift_rec:
+            shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
+            db.commit()
+
     logger.info(f"Admin {current_user['email']} created attendance for {payload.user_email} on {att_date}")
     return _to_response(db, attendance)
 
@@ -245,6 +285,18 @@ async def admin_update_attendance(
     attendance.is_manual_entry = True
     attendance.modified_by = current_user["sub"]
 
+    if attendance.shift_code and attendance.keycloak_user_id:
+        shift_rec = db.query(Shift).filter(
+            Shift.keycloak_user_id == attendance.keycloak_user_id,
+            Shift.date == attendance.attendance_date,
+            Shift.shift_code == attendance.shift_code,
+        ).first()
+        if shift_rec:
+            if attendance.check_out_time:
+                shift_rec.status = "Ended"
+            elif attendance.check_in_time:
+                shift_rec.status = "In Progress"
+
     db.commit()
     db.refresh(attendance)
 
@@ -272,8 +324,6 @@ async def admin_list_attendance(
     to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     status: Optional[str] = Query(None, description="Filter by status"),
     is_synced: Optional[bool] = Query(None, description="Filter by synced records"),
-    page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(20, ge=1, le=100, description="Items per page"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin_or_pm),
@@ -283,10 +333,10 @@ async def admin_list_attendance(
     if user_email:
         emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.ilike(f"{user_email}%")).limit(50).all()
         if not emps:
-            return {"total": 0, "page": page, "per_page": per_page, "total_pages": 0, "records": []}
+            return {"total": 0, "records": []}
         keycloak_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
         if not keycloak_ids:
-            return {"total": 0, "page": page, "per_page": per_page, "total_pages": 0, "records": []}
+            return {"total": 0, "records": []}
         query = query.filter(Attendance.keycloak_user_id.in_(keycloak_ids))
 
     if from_date:
@@ -304,34 +354,25 @@ async def admin_list_attendance(
     if is_synced is not None:
         query = query.filter(Attendance.is_synced == is_synced)
 
-    total = query.count()
-    offset = (page - 1) * per_page
-    records = query.order_by(Attendance.attendance_date.desc()).offset(offset).limit(per_page).all()
-
+    records = query.order_by(Attendance.attendance_date.desc()).all()
     result = [_to_response_with_email(db, r) for r in records]
     attended_user_ids = {r.keycloak_user_id for r in records}
 
-    if from_date and to_date and per_page > len(result):
+    if from_date and to_date:
+        f = date.fromisoformat(from_date)
+        t = date.fromisoformat(to_date)
         shift_query = db.query(Shift).filter(
             and_(
-                Shift.date >= date.fromisoformat(from_date),
-                Shift.date <= date.fromisoformat(to_date),
+                Shift.date >= f,
+                Shift.date <= t,
                 Shift.keycloak_user_id.notin_(attended_user_ids) if attended_user_ids else True,
             )
         )
-        shift_records = shift_query.order_by(Shift.date.desc()).limit(per_page - len(result)).all()
-        for s in shift_records:
+        for s in shift_query.order_by(Shift.date.desc()).all():
             emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == s.keycloak_user_id).first()
             result.append(_build_virtual_record(db, s, emp))
-            attended_user_ids.add(s.keycloak_user_id)
 
-    return {
-        "total": total + shift_query.count() if from_date and to_date else total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": max(1, (total + 1 + per_page - 1) // per_page),
-        "records": result,
-    }
+    return {"total": len(result), "records": result}
 
 
 @router.delete("/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -343,7 +384,7 @@ async def admin_delete_attendance(
 ):
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
-        raise HTTPException(status_code=404, detail="Attendance record not found")
+        raise HTTPException(status_code=404, detail="Attendance h tellrecord not found")
 
     if attendance.check_in_time is not None and attendance.keycloak_user_id and attendance.attendance_date:
         shift_rec = db.query(Shift).filter(

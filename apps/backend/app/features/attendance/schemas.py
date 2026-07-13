@@ -85,3 +85,37 @@ class CompleteAttendanceRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     remarks: Optional[str] = Field(None, max_length=100)
+
+
+class TodayShiftInfo(BaseModel):
+    shift_code: Optional[str] = None
+    shift_name: Optional[str] = None
+    date: Optional[str] = None
+    work_location_status: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+
+
+class TodayAttendance(BaseModel):
+    checkInTime: Optional[str] = None
+    checkInLat: Optional[float] = None
+    checkInLng: Optional[float] = None
+    checkInLocationName: Optional[str] = None
+    checkOutTime: Optional[str] = None
+    checkOutLat: Optional[float] = None
+    checkOutLng: Optional[float] = None
+    checkOutLocationName: Optional[str] = None
+    workLocationStatus: Optional[str] = None
+    isLate: bool = False
+    totalHours: Optional[float] = None
+    officeName: Optional[str] = None
+    shiftCode: Optional[str] = None
+    status: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class TodayAttendanceResponse(BaseModel):
+    status: str
+    shift: Optional[TodayShiftInfo] = None
+    attendance: Optional[TodayAttendance] = None
+    remainingHours: Optional[float] = None

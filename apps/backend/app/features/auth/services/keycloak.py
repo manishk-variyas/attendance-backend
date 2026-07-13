@@ -182,6 +182,19 @@ async def get_realm_roles() -> list:
         return [{"id": r["id"], "name": r["name"]} for r in resp.json()]
 
 
+async def get_user_realm_roles(user_id: str) -> list:
+    """Get realm role names assigned to a specific user."""
+    admin_token = await get_admin_token()
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        if resp.status_code != 200:
+            return []
+        return [r["name"] for r in resp.json()]
+
+
 async def add_realm_role_to_user(user_id: str, role_name: str) -> bool:
     """Assign a realm role to a Keycloak user."""
     roles = await get_realm_roles()

@@ -119,7 +119,7 @@ class RedmineService:
                     "name": f"{u['firstname']} {u['lastname']}".strip(),
                     "email": u.get("mail", ""),
                 }
-                for u in users if not u.get("admin", False)
+                for u in users if u.get("id") != 1
             ]
 
     async def get_all_projects(self) -> list:

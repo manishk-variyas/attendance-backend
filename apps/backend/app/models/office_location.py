@@ -32,7 +32,7 @@ class OfficeLocation(Base):
     created_by = Column(String(255), nullable=True)      # admin email who created it
     geom = Column(Geometry("POINT", srid=4326), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"), onupdate=text("now()"))
 
     def to_dict(self) -> dict:
         return {

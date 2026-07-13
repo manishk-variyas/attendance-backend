@@ -23,6 +23,7 @@ class ShiftCreate(BaseModel):
     timezone: str = "Asia/Kolkata"
     country: str = ""
     locationId: Optional[str] = None
+    pincode: Optional[str] = Field(None, max_length=10)
     perDiemEligible: bool = False
     conveyanceEligible: bool = False
 
@@ -59,6 +60,7 @@ class ShiftUpdate(BaseModel):
     projectName: Optional[str] = None
     endDate: Optional[str] = None
     locationId: Optional[str] = None
+    pincode: Optional[str] = Field(None, max_length=10)
     perDiemEligible: Optional[bool] = None
     conveyanceEligible: Optional[bool] = None
 
@@ -106,6 +108,7 @@ class ShiftHistoryItem(BaseModel):
     shift: str
     workStatus: str
     status: Optional[str] = None
+    pincode: Optional[str] = None
     perDiemEligible: bool = False
     conveyanceEligible: bool = False
     workAddress: Optional[str] = None
