@@ -114,18 +114,27 @@ async def create_shift(
     if end < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
-    await check_and_resolve_tr_availability(db, payload.userId, payload.userEmail, payload.date, payload.endDate)
-
     from app.models.shift_definition import ShiftDefinition
     shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
     if not shift_def:
         raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
 
-    shift_data = payload.model_dump()
-    if not shift_data.get("endDate"):
-        shift_data["endDate"] = payload.date
-    result = await shift_service.create_shift(db, shift_data, current_user)
-    return result
+    base = payload.model_dump()
+    created = []
+    from app.services.database.shift_service import ShiftService as PGShiftService
+    svc = PGShiftService(db)
+    current_date = start
+    while current_date <= end:
+        date_str = current_date.isoformat()
+        await check_and_resolve_tr_availability(db, payload.userId, payload.userEmail, date_str, date_str)
+        shift_data = {**base, "date": date_str, "endDate": date_str}
+        result = await shift_service.create_shift(db, shift_data, current_user)
+        created.append(result)
+        current_date += timedelta(days=1)
+
+    if len(created) == 1:
+        return created[0]
+    return {"created": len(created), "shifts": created}
 
 
 @router.post("/validate")

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 import io
 from typing import List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -46,6 +46,21 @@ class LeaveBusinessService:
             target_dates = None
             requested_days = (end.date() - start.date()).days + 1
 
+        # Check for completed attendance on requested dates
+        completed_att = self.leave_db.db.execute(
+            select(Attendance).where(
+                Attendance.keycloak_user_id == user_id,
+                Attendance.attendance_date >= start.date(),
+                Attendance.attendance_date <= end.date(),
+                Attendance.check_out_time.is_not(None),
+            )
+        ).scalars().first()
+        if completed_att:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Shift already completed on {completed_att.attendance_date}. Cannot apply for leave."
+            )
+
         # Check for overlaps
         existing_leaves = self.leave_db.db.execute(
             select(Leave).where(
@@ -87,7 +102,6 @@ class LeaveBusinessService:
         
         new_leave = self.leave_db.create(Leave, **leave_doc)
 
-        # Calculate balance info (no block, just for warning)
         balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
         balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
         if balance and leave_data.leave_type in (LeaveType.EL, LeaveType.PL):

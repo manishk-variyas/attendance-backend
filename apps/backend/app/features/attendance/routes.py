@@ -216,6 +216,8 @@ async def check_in(
         )
     ).all()
 
+    all_shifts_today.sort(key=lambda s: 0 if s.date == target_date else 1)
+
     if all_shifts_today:
         shift_defs = {
             s.shift_code: db.query(ShiftDefinition).filter(
@@ -443,12 +445,17 @@ async def check_out(
         shift_rec = db.query(Shift).filter(
             and_(
                 Shift.keycloak_user_id == attendance.keycloak_user_id,
-                or_(
-                    Shift.date == attendance.attendance_date,
-                    and_(Shift.end_date.is_not(None), Shift.end_date >= attendance.attendance_date),
-                ),
+                Shift.date == attendance.attendance_date,
             )
         ).first()
+        if not shift_rec:
+            shift_rec = db.query(Shift).filter(
+                and_(
+                    Shift.keycloak_user_id == attendance.keycloak_user_id,
+                    Shift.end_date.is_not(None),
+                    Shift.end_date >= attendance.attendance_date,
+                )
+            ).first()
         if shift_rec:
             shift_rec.status = "Ended"
 
