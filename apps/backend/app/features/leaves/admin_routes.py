@@ -7,7 +7,7 @@ from app.features.leaves.schemas.leaves import (
     LeaveBalanceUpdate,
     LeaveBalanceResponse,
 )
-from app.features.auth.dependencies import get_current_user, require_admin
+from app.features.auth.dependencies import get_current_user, require_admin, require_admin_or_pm
 from app.services.database.leave_service import LeaveBalanceService
 from app.models.leave_balance import LeaveBalance
 from app.models.employee_master import EmployeeMaster
@@ -77,7 +77,7 @@ async def list_leave_balances(
     year: Optional[int] = Query(None, description="Filter by year"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
     svc = LeaveBalanceService(db)
     query = db.query(LeaveBalance)
@@ -99,7 +99,7 @@ async def get_leave_balance(
     balance_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
     svc = LeaveBalanceService(db)
     bal = svc.fetch_one(LeaveBalance, id=balance_id)
@@ -115,7 +115,7 @@ async def update_leave_balance_by_user(
     payload: LeaveBalanceUpdate = ...,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
+    _: None = Depends(require_admin_or_pm),
 ):
     emp_svc = BaseService[EmployeeMaster](db)
     emp = emp_svc.fetch_one(EmployeeMaster, user_email=user_email)

@@ -844,6 +844,15 @@ async def get_project_attendance(
     if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
+    if "Admin" not in roles:
+        email = current_user.get("email")
+        rm_user = await redmine_service.get_user_by_email(email)
+        if not rm_user:
+            raise HTTPException(status_code=403, detail="Not found in Redmine.")
+        my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+        if not any(p.id == project_id for p in my_projects):
+            raise HTTPException(status_code=403, detail="You are not a member of this project.")
+
     members = await redmine_service.get_project_members(project_id)
     if not members:
         return {"total": 0, "records": []}
@@ -857,6 +866,112 @@ async def get_project_attendance(
     query = db.query(Attendance).filter(
         Attendance.keycloak_user_id.in_(visible_ids)
     )
+    if from_date:
+        try:
+            query = query.filter(Attendance.attendance_date >= date.fromisoformat(from_date))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid from_date format.")
+    if to_date:
+        try:
+            query = query.filter(Attendance.attendance_date <= date.fromisoformat(to_date))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid to_date format.")
+
+    records = query.order_by(Attendance.attendance_date.desc()).all()
+
+    result = []
+    for a in records:
+        shift = db.query(Shift).filter(
+            and_(Shift.keycloak_user_id == a.keycloak_user_id, Shift.date == a.attendance_date)
+        ).first()
+        if not shift or shift.project_id != project_id:
+            continue
+
+        rec = _to_response(db, a)
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.keycloak_user_id).first()
+        if emp:
+            rec["userEmail"] = emp.user_email
+            rec["userName"] = f"{emp.first_name} {emp.last_name}".strip()
+            rec["userDesignation"] = emp.designation
+
+        rec["derivedStatus"] = "shift_ended" if a.check_out_time else "in_progress"
+        rec["isAtAssignedLocation"] = a.location_id is not None and a.work_location_status == "OFFICE"
+        rec["dayName"] = a.attendance_date.strftime("%A") if a.attendance_date else None
+
+        rec["shiftProject"] = shift.project_name if shift else None
+
+        leave = db.query(Leave).filter(
+            and_(
+                Leave.keycloak_user_id == a.keycloak_user_id,
+                Leave.approval_status == "approved",
+                Leave.start_date <= a.attendance_date,
+                Leave.end_date >= a.attendance_date,
+            )
+        ).first()
+        rec["onLeave"] = leave is not None
+        rec["leaveType"] = leave.leave_type if leave else None
+        rec["leaveStartDate"] = leave.start_date.isoformat() if leave and leave.start_date else None
+        rec["leaveEndDate"] = leave.end_date.isoformat() if leave and leave.end_date else None
+        rec["leaveStartDay"] = leave.start_date.strftime("%A") if leave and leave.start_date else None
+        rec["leaveEndDay"] = leave.end_date.strftime("%A") if leave and leave.end_date else None
+
+        if a.check_out_time:
+            if a.modified_by:
+                ended_by_emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == a.modified_by).first()
+                rec["endedBy"] = f"{ended_by_emp.first_name} {ended_by_emp.last_name}".strip() if ended_by_emp else a.modified_by
+                rec["endedByRole"] = ended_by_emp.designation if ended_by_emp else None
+            elif emp:
+                rec["endedBy"] = f"{emp.first_name} {emp.last_name}".strip()
+                rec["endedByRole"] = emp.designation
+            else:
+                rec["endedBy"] = None
+                rec["endedByRole"] = None
+        else:
+            rec["endedBy"] = None
+            rec["endedByRole"] = None
+
+        result.append(rec)
+
+    return {
+        "total": len(result),
+        "records": result,
+    }
+
+
+@router.get("/my-projects")
+async def get_my_projects_attendance(
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    email = current_user.get("email")
+    rm_user = await redmine_service.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=403, detail="Not found in Redmine.")
+
+    my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+    if not my_projects:
+        return {"total": 0, "records": []}
+
+    all_member_rm_ids = set()
+    for p in my_projects:
+        members = await redmine_service.get_project_members(p.id)
+        for m in members:
+            if m.get("user_id"):
+                all_member_rm_ids.add(m["user_id"])
+
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)).all()
+    visible_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
+    if not visible_ids:
+        return {"total": 0, "records": []}
+
+    query = db.query(Attendance).filter(Attendance.keycloak_user_id.in_(visible_ids))
     if from_date:
         try:
             query = query.filter(Attendance.attendance_date >= date.fromisoformat(from_date))

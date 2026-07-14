@@ -342,7 +342,7 @@ async def get_shifts_by_range(
     if not current_email:
         raise HTTPException(status_code=400, detail="User email not found.")
 
-    allowed_roles = ["Technical Resource", "Project Manager", "Admin"]
+    allowed_roles = ["Technical Resource", "Project Manager", "Admin", "Project Coordinator"]
     if not any(role in roles for role in allowed_roles):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -360,7 +360,7 @@ async def get_shifts_by_range(
     if target_user_id != current_rm_id:
         if "Admin" in roles:
             pass
-        elif "Project Manager" in roles:
+        elif "Project Manager" in roles or "Project Coordinator" in roles:
             pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
             tr_projects = await redmine_service.get_projects_for_user(target_user_id)
             pm_project_ids = {p.id for p in pm_projects}
@@ -437,7 +437,7 @@ async def get_shift_history(
 
     if "Admin" in roles:
         pass
-    elif "Project Manager" in roles:
+    elif "Project Manager" in roles or "Project Coordinator" in roles:
         pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
         tr_projects = await redmine_service.get_projects_for_user(user_id)
         pm_project_ids = {p.id for p in pm_projects}

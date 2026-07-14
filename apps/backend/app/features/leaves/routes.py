@@ -53,10 +53,10 @@ async def list_leave_users(
     - PM: Users sharing at least one project.
     """
     roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles:
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Admins and Project Managers can view team leave history."
+            detail="Only Admin, PM, or PC can view team leave history."
         )
     return await leave_service.get_visible_leave_users(current_user)
 

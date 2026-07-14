@@ -155,6 +155,76 @@ async def list_employees(
     }
 
 
+@router.get("/my-team")
+async def list_my_team(
+    status: Optional[str] = Query(None, description="Filter by status"),
+    onboarded: Optional[bool] = Query(None, description="Filter onboarded employees"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    email = current_user.get("email")
+    rm_user = await redmine_service.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=403, detail="Not found in Redmine.")
+
+    my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+    if not my_projects:
+        return {"total": 0, "employees": []}
+
+    all_member_rm_ids = set()
+    for p in my_projects:
+        members = await redmine_service.get_project_members(p.id)
+        for m in members:
+            if m.get("user_id"):
+                all_member_rm_ids.add(m["user_id"])
+
+    query = db.query(EmployeeMaster).filter(
+        EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)
+    )
+    if status:
+        query = query.filter(EmployeeMaster.status == status)
+    if onboarded is True:
+        query = query.filter(EmployeeMaster.onboarded_at.isnot(None))
+    elif onboarded is False:
+        query = query.filter(EmployeeMaster.onboarded_at.is_(None))
+
+    employees = query.order_by(EmployeeMaster.created_at.desc()).all()
+
+    user_redmine_roles = {}
+    try:
+        for p in my_projects:
+            pname = p.name if hasattr(p, 'name') else p.get('name', '')
+            pid = p.id if hasattr(p, 'id') else p.get('id')
+            try:
+                members = await redmine_service.get_project_members(pid)
+                for m in members:
+                    uid = m.get("user_id")
+                    if uid:
+                        if uid not in user_redmine_roles:
+                            user_redmine_roles[uid] = []
+                        for role_name in m.get("roles", []):
+                            user_redmine_roles[uid].append({"project": pname, "role": role_name})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {
+        "total": len(employees),
+        "employees": [{
+            **_employee_to_dict(e),
+            "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
+            "keycloak_role": None,
+            "redmine_roles": user_redmine_roles.get(e.redmine_user_id, []),
+        } for e in employees],
+    }
+
+
 @router.post("", response_model=EmployeeResponse, status_code=status.HTTP_201_CREATED)
 async def create_employee(
     payload: EmployeeCreate,
@@ -302,9 +372,23 @@ async def update_employee(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    is_admin = "Admin" in current_user.get("roles", [])
+    roles = current_user.get("roles", [])
+    is_admin = "Admin" in roles
     is_self = current_user.get("email") == emp.user_email
-    if not is_admin and not is_self:
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+
+    if is_pm_or_pc and not is_admin and not is_self:
+        my_rm = await redmine_service.get_user_by_email(current_user.get("email"))
+        if my_rm and emp.redmine_user_id:
+            my_projects = await redmine_service.get_projects_for_user(my_rm["id"])
+            emp_projects = await redmine_service.get_projects_for_user(emp.redmine_user_id)
+            my_pids = {p.id for p in my_projects}
+            emp_pids = {p.id for p in emp_projects}
+            if not my_pids.intersection(emp_pids):
+                raise HTTPException(status_code=403, detail="Not authorized to update this employee.")
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to update this employee.")
+    elif not is_admin and not is_self:
         raise HTTPException(status_code=403, detail="Not authorized to update this employee")
 
     warnings = []
