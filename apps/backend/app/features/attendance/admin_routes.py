@@ -443,7 +443,7 @@ async def admin_delete_attendance(
 ):
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
-        raise HTTPException(status_code=404, detail="Attendance h tellrecord not found")
+        raise HTTPException(status_code=404, detail="Attendance record not found")
 
     if attendance.check_in_time is not None and attendance.keycloak_user_id and attendance.attendance_date:
         shift_rec = db.query(Shift).filter(
