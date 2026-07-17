@@ -14,8 +14,11 @@ from app.models.leave import Leave
 from app.models.leave_balance import LeaveBalance
 from app.models.holiday import Holiday
 from app.models.shift import Shift
+from app.models.shift_definition import ShiftDefinition
+from app.models.system_setting import SystemSetting
 from app.models.attendance import Attendance
-from sqlalchemy import select, and_, func
+from app.models.employee_master import EmployeeMaster
+from sqlalchemy import select, and_, or_, func
 
 class LeaveBusinessService:
     def __init__(self, leave_db: LeaveDBService, holiday_db: HolidayDBService, balance_db: LeaveBalanceService):
@@ -84,23 +87,25 @@ class LeaveBusinessService:
                 raise HTTPException(status_code=400, detail="You already have an approved or pending leave application that overlaps with these dates.")
 
         # Create leave record
-        leave_doc = {
-            "keycloak_user_id": user_id,
-            "user_email": email,
-            "start_date": start.date(),
-            "end_date": end.date(),
-            "leave_type": leave_data.leave_type.value,
-            "reason": leave_data.comment or leave_data.reason,
-            "comment": leave_data.comment,
-            "is_traveling": leave_data.is_traveling,
-            "contact_number": leave_data.contact_number,
-            "resuming_date": leave_data.resuming_date.date() if leave_data.resuming_date else None,
-            "leave_dates": [d.isoformat() for d in target_dates] if target_dates else None,
-            "approver_id": leave_data.approver_id,
-            "approval_status": LeaveStatus.PENDING.value,
-        }
-        
-        new_leave = self.leave_db.create(Leave, **leave_doc)
+        leave_ids = []
+        current_date = start.date()
+        while current_date <= end.date():
+            leave_doc = {
+                "keycloak_user_id": user_id,
+                "user_email": email,
+                "start_date": current_date,
+                "end_date": current_date,
+                "leave_type": leave_data.leave_type.value,
+                "reason": leave_data.comment or leave_data.reason,
+                "comment": leave_data.comment,
+                "is_traveling": leave_data.is_traveling,
+                "contact_number": leave_data.contact_number,
+                "approver_id": leave_data.approver_id,
+                "approval_status": LeaveStatus.PENDING.value,
+            }
+            new_leave = self.leave_db.create(Leave, **leave_doc)
+            leave_ids.append(str(new_leave.id))
+            current_date += timedelta(days=1)
 
         balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
         balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
@@ -115,7 +120,7 @@ class LeaveBusinessService:
             balance_info["remaining"] = remaining
             balance_info["will_be_negative"] = remaining < requested_days if remaining is not None else None
 
-        return {"leave_id": str(new_leave.id), "balance": balance_info}
+        return {"leave_id": leave_ids[0], "leave_ids": leave_ids, "created": len(leave_ids), "balance": balance_info}
 
     def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
         today = date.today()
@@ -134,7 +139,10 @@ class LeaveBusinessService:
         existing_attendance = self.leave_db.db.execute(
             select(Attendance).where(
                 Attendance.keycloak_user_id == user_id,
-                Attendance.attendance_date == today,
+                or_(
+                    Attendance.attendance_date == today,
+                    and_(Attendance.attendance_date == today - timedelta(days=1), Attendance.check_out_time.is_(None)),
+                ),
             )
         ).scalars().first()
         if existing_attendance:
@@ -144,12 +152,53 @@ class LeaveBusinessService:
             existing_attendance.remarks = (existing_attendance.remarks or "") + " | Emergency leave"
             self.leave_db.db.commit()
 
-        shift = self.leave_db.db.execute(
-            select(Shift).where(
-                Shift.keycloak_user_id == user_id,
-                Shift.date == today,
-            )
-        ).scalars().first()
+        if not existing_attendance:
+            has_time_passed = False
+            shift = self.leave_db.db.execute(
+                select(Shift).where(
+                    Shift.keycloak_user_id == user_id,
+                    Shift.date == today,
+                )
+            ).scalars().first()
+            if shift and shift.shift_code:
+                sd = self.leave_db.db.execute(
+                    select(ShiftDefinition).where(ShiftDefinition.shift_code == shift.shift_code)
+                ).scalars().first()
+                if sd and sd.end_time:
+                    tz = tz_str = sd.timezone or "Asia/Kolkata"
+                    try:
+                        tz = ZoneInfo(tz_str)
+                    except Exception:
+                        tz = ZoneInfo("Asia/Kolkata")
+                    end_dt = datetime.combine(today, sd.end_time, tzinfo=tz)
+                    if sd.end_time <= sd.start_time:
+                        end_dt += timedelta(days=1)
+                    if datetime.now(tz) > end_dt + timedelta(hours=2):
+                        has_time_passed = True
+            else:
+                company = self.leave_db.db.execute(
+                    select(SystemSetting).where(SystemSetting.id == "company")
+                ).scalars().first()
+                if company and company.default_shift_end_time:
+                    tz_str = company.default_timezone or "Asia/Kolkata"
+                    try:
+                        tz = ZoneInfo(tz_str)
+                    except Exception:
+                        tz = ZoneInfo("Asia/Kolkata")
+                    end_dt = datetime.combine(today, company.default_shift_end_time, tzinfo=tz)
+                    if datetime.now(tz) > end_dt + timedelta(hours=2):
+                        has_time_passed = True
+            if has_time_passed:
+                raise HTTPException(status_code=400, detail="Shift hours have ended for today.")
+
+        if not existing_attendance:
+            shift = self.leave_db.db.execute(
+                select(Shift).where(
+                    Shift.keycloak_user_id == user_id,
+                    Shift.date == today,
+                )
+            ).scalars().first()
+
         if shift:
             shift.work_location_status = "LEAVE"
             self.leave_db.db.commit()
@@ -176,13 +225,23 @@ class LeaveBusinessService:
             "end_date": today,
             "leave_type": LeaveType.EL.value,
             "reason": reason or "Emergency leave",
-            "approval_status": LeaveStatus.APPROVED.value,
+            "approval_status": LeaveStatus.EMERGENCY.value,
         }
         new_leave = self.leave_db.create(Leave, **leave_doc)
         return {"message": "Emergency leave applied", "leave_id": str(new_leave.id)}
 
     async def get_leave_history(self, user_id: str, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
         stmt = select(Leave).where(Leave.keycloak_user_id == user_id).order_by(Leave.start_date.desc()).offset(skip).limit(limit)
+        results = self.leave_db.db.execute(stmt).scalars().all()
+        return [r.to_dict() for r in results]
+
+    async def get_team_leaves(self, emails: list, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
+        stmt = select(Leave).where(Leave.user_email.in_(emails))
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        stmt = stmt.order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
         return [r.to_dict() for r in results]
 

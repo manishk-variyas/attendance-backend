@@ -18,6 +18,8 @@ class EmployeeCreate(BaseModel):
     country: Optional[str] = Field("", max_length=50)
     reports_to: Optional[int] = None
     location_id: Optional[str] = None
+    joining_date: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=10)
 
 
 class UserProfileResponse(BaseModel):
@@ -34,6 +36,7 @@ class UserProfileResponse(BaseModel):
     home_address: Optional[str] = None
     reports_to_name: Optional[str] = None
     is_active: bool
+    joined_at: Optional[str] = None
 
 
 class EmployeeResponse(BaseModel):
@@ -103,6 +106,8 @@ class EmployeeUpdate(BaseModel):
     timezone: Optional[str] = None
     location_id: Optional[str] = None
     reports_to: Optional[int] = None
+    joining_date: Optional[str] = None
+    title: Optional[str] = Field(None, max_length=10)
     project_id: Optional[int] = None
     redmine_role_name: Optional[str] = None
     keycloak_role_name: Optional[str] = None

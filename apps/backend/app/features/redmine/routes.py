@@ -7,6 +7,7 @@ from app.features.auth.dependencies import get_current_user
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.features.shifts.service import shift_service
+from app.models.employee_master import EmployeeMaster
 
 router = APIRouter()
 
@@ -277,23 +278,30 @@ async def get_my_issues(current_user: dict = Depends(get_current_user)):
 @router.get("/project-members/{project_id}", response_model=List[ProjectMember])
 async def get_project_members(
     project_id: int,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """Get all members of a project with their roles. Scoped by user role."""
     roles = current_user.get("roles", [])
     if "Admin" in roles:
-        return await redmine_service.get_project_members(project_id)
+        members = await redmine_service.get_project_members(project_id)
+    else:
+        email = current_user.get("email")
+        user = await redmine_service.get_user_by_email(email)
+        if not user:
+            raise HTTPException(status_code=403, detail="Redmine account not found")
+        user_projects = await redmine_service.get_projects_for_user(user["id"])
+        if not any(p.id == project_id for p in user_projects):
+            raise HTTPException(status_code=403, detail="You are not a member of this project")
+        members = await redmine_service.get_project_members(project_id)
 
-    email = current_user.get("email")
-    user = await redmine_service.get_user_by_email(email)
-    if not user:
-        raise HTTPException(status_code=403, detail="Redmine account not found")
+    for m in members:
+        m["email"] = m.get("email", "")
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == m.get("user_id")).first()
+        if emp:
+            m["email"] = emp.user_email
 
-    user_projects = await redmine_service.get_projects_for_user(user["id"])
-    if any(p.id == project_id for p in user_projects):
-        return await redmine_service.get_project_members(project_id)
-
-    raise HTTPException(status_code=403, detail="You are not a member of this project")
+    return members
 
 
 @router.get("/search", response_model=SearchResponse)

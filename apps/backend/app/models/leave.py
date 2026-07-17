@@ -16,6 +16,7 @@ class LeaveStatus(str, enum.Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    EMERGENCY = "emergency"
 
 
 class Leave(Base):

@@ -67,11 +67,14 @@ async def create_office_location(
     return _to_response(loc)
 
 
-@router.get("", response_model=List[OfficeLocationResponse])
+@router.get("")
 async def list_office_locations(
-    category: Optional[str] = Query(None, max_length=50),
+    category: str = None,
     db: Session = Depends(get_db),
 ):
+    if category and len(category) > 50:
+        raise HTTPException(status_code=400, detail="Category must be 50 characters or less.")
+
     svc = OfficeLocationService(db)
     if category:
         locations = db.query(OfficeLocation).filter(OfficeLocation.category == category).order_by(OfficeLocation.updated_at.desc()).all()

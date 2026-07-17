@@ -9,8 +9,8 @@ from app.features.leaves.schemas.leaves import (
 )
 from app.features.leaves.services.leave_service import LeaveBusinessService
 from app.services.database.dependencies import get_leave_business_service
-from app.features.notifications.services.notification_service import notification_service
 from app.features.redmine.service import redmine_service
+from app.models.employee_master import EmployeeMaster
 import logging
 
 logger = logging.getLogger(__name__)
@@ -60,15 +60,44 @@ async def list_leave_users(
         )
     return await leave_service.get_visible_leave_users(current_user)
 
-@router.get("/history", response_model=List[LeaveHistoryItem])
+@router.get("/history")
 async def get_history(
+    team: Optional[bool] = Query(None, description="PM/PC: view all team members' leaves"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     limit: int = Query(10, ge=1),
     skip: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     user_id = current_user.get("sub")
-    return await leave_service.get_leave_history(user_id, limit, skip)
+    email = current_user.get("email")
+    roles = current_user.get("roles", [])
+
+    if team:
+        if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+            raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+        rm_user = await redmine_service.get_user_by_email(email)
+        if not rm_user:
+            raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+        my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+        all_member_rm_ids = set()
+        for p in my_projects:
+            members = await redmine_service.get_project_members(p.id)
+            for m in members:
+                if m.get("user_id"):
+                    all_member_rm_ids.add(m["user_id"])
+        emp_q = leave_service.leave_db.db.query(EmployeeMaster).filter(
+            EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)
+        ).all()
+        member_emails = [e.user_email for e in emp_q if e.user_email]
+        if not member_emails:
+            return {"total": 0, "records": []}
+        records = await leave_service.get_team_leaves(member_emails, from_date, to_date)
+        return {"total": len(records), "records": records}
+
+    records = await leave_service.get_leave_history(user_id, limit, skip)
+    return {"total": len(records), "records": records}
 
 @router.get("/holidays", response_model=List[Holiday])
 async def get_holidays(
@@ -151,28 +180,6 @@ async def apply_leave(
     bal = result["balance"]
 
     # Notify the approver
-    if leave_data.approver_id:
-        try:
-            all_users = await redmine_service.get_all_users()
-            approver = next(
-                (u for u in all_users if str(u["id"]) == str(leave_data.approver_id)),
-                None,
-            )
-            if approver:
-                user_name = current_user.get("username") or email
-                msg = f"{user_name} applied for {leave_data.leave_type} leave ({bal['requested_days']} day(s))"
-                if bal["will_be_negative"]:
-                    msg += f" ⚠ {int(bal['requested_days'])} day(s) requested, {int(bal['remaining'])} balance remaining"
-                await notification_service.create_notification(
-                    user_id=approver["email"],
-                    type="leave_applied",
-                    message=msg,
-                    from_user=email,
-                    reference_id=leave_id,
-                )
-        except Exception as e:
-            logger.warning(f"Failed to create notification: {e}")
-
     return {"message": "Leave application submitted successfully", "leave_id": leave_id, "balance": bal}
 
 @router.post("/emergency")
@@ -231,22 +238,6 @@ async def approve_leave(
             detail="Leave application not found or unauthorized."
         )
 
-    # Notify the applicant
-    try:
-        from app.models.leave import Leave
-        leave_doc = leave_service.leave_db.fetch_one(Leave, id=leave_id)
-        if leave_doc:
-            actor_name = current_user.get("username") or current_user.get("email")
-            await notification_service.create_notification(
-                user_id=leave_doc.user_email,
-                type="leave_approved",
-                message=f"Your leave has been approved by {actor_name}",
-                from_user=current_user["email"],
-                reference_id=leave_id,
-            )
-    except Exception as e:
-        logger.warning(f"Failed to create notification: {e}")
-
     return {"message": "Leave application approved successfully"}
 
 
@@ -274,21 +265,5 @@ async def reject_leave(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Leave application not found or unauthorized."
         )
-
-    # Notify the applicant
-    try:
-        from app.models.leave import Leave
-        leave_doc = leave_service.leave_db.fetch_one(Leave, id=leave_id)
-        if leave_doc:
-            actor_name = current_user.get("username") or current_user.get("email")
-            await notification_service.create_notification(
-                user_id=leave_doc.user_email,
-                type="leave_rejected",
-                message=f"Your leave has been rejected by {actor_name}",
-                from_user=current_user["email"],
-                reference_id=leave_id,
-            )
-    except Exception as e:
-        logger.warning(f"Failed to create notification: {e}")
 
     return {"message": "Leave application rejected successfully"}

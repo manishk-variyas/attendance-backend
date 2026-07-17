@@ -103,9 +103,11 @@ class ShiftHistoryItem(BaseModel):
     userId: Optional[int] = None
     userName: Optional[str] = None
     userEmail: str
+    userDesignation: Optional[str] = None
     projectId: Optional[int] = None
     projectName: Optional[str] = None
     shift: str
+    shiftName: Optional[str] = None
     workStatus: str
     status: Optional[str] = None
     pincode: Optional[str] = None

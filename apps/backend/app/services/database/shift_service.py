@@ -16,7 +16,7 @@ class ShiftService(BaseService[Shift]):
         return list(self.db.execute(stmt).scalars().all())
 
     def fetch_by_email(self, email: str) -> List[Shift]:
-        stmt = select(Shift).where(Shift.user_email == email).order_by(Shift.created_at.desc())
+        stmt = select(Shift).where(Shift.user_email == email).order_by(Shift.date.desc())
         return list(self.db.execute(stmt).scalars().all())
 
     def fetch_current(self, redmine_user_id: int) -> Optional[Shift]:

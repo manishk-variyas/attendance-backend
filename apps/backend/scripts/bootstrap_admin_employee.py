@@ -27,7 +27,7 @@ import httpx
 import base64
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezoe
 from sqlalchemy import create_engine, text
 
 # ── Config (from env or defaults that match docker-compose) ──────────────────

@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.features.auth.dependencies import get_current_user, require_admin, require_active
 from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, DisonboardRequest, UserProfileResponse
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
@@ -44,6 +45,8 @@ async def get_my_profile(
         "home_address": emp.home_address,
         "reports_to_name": emp.reports_to_name,
         "is_active": emp.is_active,
+        "title": emp.title,
+        "joined_at": emp.joining_date.isoformat() if emp.joining_date else emp.created_at.date().isoformat() if emp.created_at else None,
     }
 
 
@@ -64,9 +67,11 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
         "contact_number": e.contact_number,
         "alt_contact_number": e.alt_contact_number,
         "country": e.country,
+        "title": e.title,
         "status": e.status,
         "is_active": e.is_active,
         "onboarded_at": e.onboarded_at,
+        "joining_date": e.joining_date.isoformat() if e.joining_date else None,
         "location_id": str(e.location_id) if e.location_id else None,
         "reports_to": e.reports_to,
         "reports_to_name": e.reports_to_name,
@@ -99,48 +104,28 @@ async def list_employees(
     # Batch fetch Redmine project roles for all employees
     user_redmine_roles = {}
     user_kc_roles = {}
+    project_managers = {}  # project_name -> {"name": "...", "designation": "..."}
     try:
         projects = await redmine_service.get_all_projects()
-        rm_roles_cache = {}  # role_id -> name
         for p in projects:
             pid = p.get("id") if isinstance(p, dict) else p.id
             try:
                 members = await redmine_service.get_project_members(pid)
                 pname = p.get("name") if isinstance(p, dict) else p.name
+                pm_names = []
                 for m in members:
                     uid = m.get("user_id")
+                    roles = m.get("roles", [])
                     if uid:
                         if uid not in user_redmine_roles:
                             user_redmine_roles[uid] = []
-                        for role_name in m.get("roles", []):
+                        for role_name in roles:
                             user_redmine_roles[uid].append({"project": pname, "role": role_name})
+                    if "Project Manager" in roles or "Project Coordinator" in roles:
+                        pm_names.append(m.get("name", ""))
+                project_managers[pname] = pm_names
             except Exception:
                 pass
-    except Exception:
-        pass
-
-    # Batch fetch Keycloak roles using service account
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as kc:
-            token_resp = await kc.post(
-                f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token",
-                data={"client_id": settings.KEYCLOAK_CLIENT_ID, "client_secret": settings.KEYCLOAK_CLIENT_SECRET, "grant_type": "client_credentials"}
-            )
-            if token_resp.status_code == 200:
-                admin_token = token_resp.json().get("access_token")
-                for e in employees:
-                    if e.keycloak_user_id:
-                        try:
-                            resp = await kc.get(
-                                f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{e.keycloak_user_id}/role-mappings/realm",
-                                headers={"Authorization": f"Bearer {admin_token}"}
-                            )
-                            realm_roles = resp.json() if resp.status_code == 200 else []
-                            display = [r["name"] for r in realm_roles if r["name"] not in ("default-roles-attendance-app", "offline_access", "uma_authorization")]
-                            user_kc_roles[e.keycloak_user_id] = display[0] if display else "Technical Resource"
-                        except Exception:
-                            pass
     except Exception:
         pass
 
@@ -149,8 +134,11 @@ async def list_employees(
         "employees": [{
             **_employee_to_dict(e),
             "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
-            "keycloak_role": user_kc_roles.get(e.keycloak_user_id, "Technical Resource"),
-            "redmine_roles": user_redmine_roles.get(e.redmine_user_id, []),
+            "keycloak_role": None,
+            "redmine_roles": [
+                {**r, "managers": project_managers.get(r["project"], [])}
+                for r in user_redmine_roles.get(e.redmine_user_id, [])
+            ],
         } for e in employees],
     }
 
@@ -196,19 +184,25 @@ async def list_my_team(
     employees = query.order_by(EmployeeMaster.created_at.desc()).all()
 
     user_redmine_roles = {}
+    project_managers_my = {}
     try:
         for p in my_projects:
             pname = p.name if hasattr(p, 'name') else p.get('name', '')
             pid = p.id if hasattr(p, 'id') else p.get('id')
             try:
                 members = await redmine_service.get_project_members(pid)
+                pm_names = []
                 for m in members:
                     uid = m.get("user_id")
+                    roles = m.get("roles", [])
                     if uid:
                         if uid not in user_redmine_roles:
                             user_redmine_roles[uid] = []
-                        for role_name in m.get("roles", []):
+                        for role_name in roles:
                             user_redmine_roles[uid].append({"project": pname, "role": role_name})
+                    if "Project Manager" in roles or "Project Coordinator" in roles:
+                        pm_names.append(m.get("name", ""))
+                project_managers_my[pname] = pm_names
             except Exception:
                 pass
     except Exception:
@@ -220,9 +214,77 @@ async def list_my_team(
             **_employee_to_dict(e),
             "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
             "keycloak_role": None,
-            "redmine_roles": user_redmine_roles.get(e.redmine_user_id, []),
+            "redmine_roles": [
+                {**r, "managers": project_managers_my.get(r["project"], [])}
+                for r in user_redmine_roles.get(e.redmine_user_id, [])
+            ],
         } for e in employees],
     }
+
+
+@router.get("/{employee_id}")
+async def get_employee(
+    employee_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    if len(employee_id) > 100 or len(employee_id) < 32:
+        raise HTTPException(status_code=400, detail="Invalid employee ID.")
+    svc = BaseService[EmployeeMaster](db)
+    emp = svc.fetch_one(EmployeeMaster, id=employee_id)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    result = _employee_to_dict(emp)
+    result["projects"] = []
+    result["keycloak_role"] = None
+    result["redmine_roles"] = []
+
+    if emp.redmine_user_id:
+        try:
+            project_managers_single = {}
+            user_projects = await redmine_service.get_projects_for_user(emp.redmine_user_id)
+            for p in user_projects:
+                pname = p.name if hasattr(p, 'name') else p.get('name', '')
+                pid = p.id if hasattr(p, 'id') else p.get('id')
+                result["projects"].append(pname)
+                members = await redmine_service.get_project_members(pid)
+                pm_names = []
+                for m in members:
+                    roles = m.get("roles", [])
+                    if m.get("user_id") == emp.redmine_user_id:
+                        for role_name in roles:
+                            result["redmine_roles"].append({"project": pname, "role": role_name})
+                    if "Project Manager" in roles or "Project Coordinator" in roles:
+                        pm_names.append(m.get("name", ""))
+                project_managers_single[pname] = pm_names
+            for r in result["redmine_roles"]:
+                r["managers"] = project_managers_single.get(r["project"], [])
+        except Exception:
+            pass
+
+    if emp.keycloak_user_id:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as kc:
+                token_resp = await kc.post(
+                    f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token",
+                    data={"client_id": settings.KEYCLOAK_CLIENT_ID, "client_secret": settings.KEYCLOAK_CLIENT_SECRET, "grant_type": "client_credentials"}
+                )
+                if token_resp.status_code == 200:
+                    admin_token = token_resp.json().get("access_token")
+                    resp = await kc.get(
+                        f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{emp.keycloak_user_id}/role-mappings/realm",
+                        headers={"Authorization": f"Bearer {admin_token}"}
+                    )
+                    realm_roles = resp.json() if resp.status_code == 200 else []
+                    display = [r["name"] for r in realm_roles if r["name"] not in ("default-roles-attendance-app", "offline_access", "uma_authorization")]
+                    result["keycloak_role"] = display[0] if display else "Technical Resource"
+        except Exception:
+            pass
+
+    return result
 
 
 @router.post("", response_model=EmployeeResponse, status_code=status.HTTP_201_CREATED)
@@ -455,6 +517,8 @@ async def update_employee(
         "location_id": "location_id",
         "reports_to": "reports_to",
         "user_email": "user_email",
+        "title": "title",
+        "joining_date": "joining_date",
     }
     update_data = {}
     for payload_key, db_col in db_fields.items():

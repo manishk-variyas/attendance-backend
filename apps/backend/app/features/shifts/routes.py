@@ -1,6 +1,7 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from datetime import datetime, timezone, date, timedelta, time
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 from sqlalchemy.orm import Session
 
@@ -12,7 +13,7 @@ from app.features.redmine.service import redmine_service
 from app.models.leave import Leave
 from app.models.shift import Shift
 from app.models.employee_master import EmployeeMaster
-from sqlalchemy import select
+from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
 
@@ -114,10 +115,33 @@ async def create_shift(
     if end < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
+    if start == today and "Admin" not in current_user.get("roles", []):
+        tz_str = payload.timezone or "Asia/Kolkata"
+        try:
+            tz = ZoneInfo(tz_str)
+        except Exception:
+            tz = ZoneInfo("Asia/Kolkata")
+        try:
+            shift_time = time.fromisoformat(payload.shiftStartTime[:5])
+            now_local = datetime.now(tz).time()
+            if shift_time <= now_local:
+                raise HTTPException(status_code=400, detail=f"Shift start time ({payload.shiftStartTime[:5]}) has already passed for today.")
+        except ValueError:
+            pass
+
     from app.models.shift_definition import ShiftDefinition
     shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
     if not shift_def:
         raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
+
+    from app.models.attendance import Attendance
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == payload.userEmail).first()
+    if emp and emp.keycloak_user_id:
+        existing_att = db.query(Attendance).filter(
+            and_(Attendance.keycloak_user_id == emp.keycloak_user_id, Attendance.attendance_date == start)
+        ).first()
+        if existing_att and existing_att.check_in_time:
+            raise HTTPException(status_code=400, detail="Cannot create shift. User has already checked in for this date.")
 
     base = payload.model_dump()
     created = []
@@ -407,7 +431,32 @@ async def get_shifts_by_range(
         ).order_by(Leave.start_date)
         leaves = [lv.to_dict() for lv in db.execute(stmt).scalars().all()]
 
-    return {"shifts": shifts, "leaves": leaves}
+    timeline = {}
+    for s in shifts:
+        d = s.get("date")
+        if not d:
+            continue
+        if d not in timeline:
+            timeline[d] = {"date": d, "shift": None, "leave": None}
+        timeline[d]["shift"] = s
+
+    for lv in leaves:
+        sd = lv.get("start_date")
+        ed = lv.get("end_date")
+        if not sd or not ed:
+            continue
+        current = date.fromisoformat(sd) if isinstance(sd, str) else sd
+        end = date.fromisoformat(ed) if isinstance(ed, str) else ed
+        while current <= end:
+            d_str = current.isoformat()
+            if d_str not in timeline:
+                timeline[d_str] = {"date": d_str, "shift": None, "leave": None}
+            if not timeline[d_str]["leave"]:
+                timeline[d_str]["leave"] = lv
+            current += timedelta(days=1)
+
+    result = sorted(timeline.values(), key=lambda x: x["date"])
+    return {"timeline": result}
 
 
 @router.get("/date/{date_str}")
@@ -422,19 +471,41 @@ async def get_shifts_by_date(
     return await shift_service.get_shifts_by_date(db, date_str, email=email)
 
 
-@router.get("/history", response_model=List[ShiftHistoryItem])
+@router.get("/history")
 async def get_shift_history(
-    limit: int = Query(10, ge=1, le=100),
-    skip: int = Query(0, ge=0),
     user_id: Optional[int] = Query(None, description="Admin/PM: view another user's shift history"),
+    team: Optional[bool] = Query(None, description="PM/PC: view all team members' shifts"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     email = current_user.get("email")
     roles = current_user.get("roles", [])
 
+    if team:
+        if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+            raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+        rm_user = await redmine_service.get_user_by_email(email)
+        if not rm_user:
+            raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+        my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+        all_member_rm_ids = set()
+        for p in my_projects:
+            members = await redmine_service.get_project_members(p.id)
+            for m in members:
+                if m.get("user_id"):
+                    all_member_rm_ids.add(m["user_id"])
+        emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)).all()
+        member_emails = [e.user_email for e in emps if e.user_email]
+        if not member_emails:
+            return {"total": 0, "records": []}
+        records = await shift_service.get_team_shifts(db, member_emails, from_date, to_date)
+        return {"total": len(records), "records": records}
+
     if user_id is None:
-        return await shift_service.get_shift_history_by_email(db, email, limit, skip)
+        records = await shift_service.get_shift_history_by_email(db, email)
+        return {"total": len(records), "records": records}
 
     current_rm_user = await redmine_service.get_user_by_email(email)
     if not current_rm_user:
@@ -442,7 +513,8 @@ async def get_shift_history(
     current_rm_id = current_rm_user["id"]
 
     if user_id == current_rm_id:
-        return await shift_service.get_shift_history_by_email(db, email, limit, skip)
+        records = await shift_service.get_shift_history_by_email(db, email)
+        return {"total": len(records), "records": records}
 
     if "Admin" in roles:
         pass
@@ -467,7 +539,8 @@ async def get_shift_history(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    return await shift_service.get_shift_history_by_email(db, target_user["email"], limit, skip)
+    records = await shift_service.get_shift_history_by_email(db, target_user["email"])
+    return {"total": len(records), "records": records}
 
 
 @router.put("/{shift_id}")

@@ -12,6 +12,7 @@ class LeaveStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    EMERGENCY = "emergency"
 
 class LeaveApplyRequest(BaseModel):
     start_date: datetime

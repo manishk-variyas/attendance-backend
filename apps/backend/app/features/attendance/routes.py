@@ -194,6 +194,17 @@ async def check_in(
     if existing:
         return JSONResponse(content=_to_response(db, existing), status_code=200)
 
+    on_leave = db.query(Leave).filter(
+        and_(
+            Leave.keycloak_user_id == keycloak_user_id,
+            Leave.approval_status.in_(["approved", "emergency"]),
+            Leave.start_date <= target_date,
+            Leave.end_date >= target_date,
+        )
+    ).first()
+    if on_leave:
+        raise HTTPException(status_code=400, detail="You are on leave today. Cannot check in.")
+
     check_in_time, is_synced = _resolve_timestamp(payload.clientTimestamp)
     server_received_at = datetime.now(timezone.utc)
     now = check_in_time
@@ -276,7 +287,7 @@ async def check_in(
         if company and company.grace_minutes:
             grace_min = company.grace_minutes
         shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=_safe_zone(shift_tz))
-        if now < shift_start_dt - timedelta(hours=2):
+        if now < shift_start_dt - timedelta(hours=1):
             raise HTTPException(
                 status_code=400,
                 detail=f"Too early to check in. Your shift starts at {shift_start_time.strftime('%H:%M')} on {target_date.isoformat()}.",
@@ -674,6 +685,8 @@ async def get_today_attendance(
 
     if picked:
         shift, sd, tz, start_dt, end_dt = picked
+        if shift.date > today:
+            return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
         shift_att = db.query(Attendance).filter(
             and_(
                 Attendance.keycloak_user_id == keycloak_user_id,
