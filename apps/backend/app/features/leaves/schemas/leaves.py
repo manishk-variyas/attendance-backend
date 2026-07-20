@@ -30,6 +30,8 @@ class LeaveHistoryItem(BaseModel):
     id: str
     user_id: Optional[str] = None
     user_email: Optional[str] = None
+    userName: Optional[str] = None
+    userDesignation: Optional[str] = None
     start_date: datetime
     end_date: datetime
     leave_type: LeaveType
@@ -70,6 +72,22 @@ class Holiday(BaseModel):
     holiday_name: str
     holiday_type: HolidayType
     is_national: bool
+
+
+class BatchLeaveRequest(BaseModel):
+    leave_ids: List[str]
+
+
+class BatchLeaveResult(BaseModel):
+    leave_id: str
+    status: str
+
+class BatchLeaveResponse(BaseModel):
+    processed: int
+    approved: int = 0
+    rejected: int = 0
+    failed: int = 0
+    results: List[BatchLeaveResult]
 
 
 class LeaveBalanceCreate(BaseModel):

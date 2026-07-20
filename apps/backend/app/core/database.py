@@ -71,6 +71,27 @@ def _run_migrations():
         """))
         conn.commit()
 
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='employee_master' AND column_name='profile_picture_url'
+                ) THEN
+                    ALTER TABLE employee_master ADD COLUMN profile_picture_url VARCHAR(500);
+                END IF;
+            END $$;
+        """))
+        conn.commit()
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leaves_approval_status ON leaves(approval_status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leaves_start_date ON leaves(start_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leaves_end_date ON leaves(end_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_shifts_end_date ON shifts(end_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_shifts_shift_code ON shifts(shift_code)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_attendance_check_out_time ON attendance(check_out_time)"))
+        conn.commit()
+
 
 def get_db():
     """

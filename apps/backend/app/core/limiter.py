@@ -18,13 +18,10 @@ from slowapi.util import get_remote_address
 
 from app.core.config import settings
 
-# Create a limiter that uses the client's IP address as the key
-# This means each IP gets its own rate limit bucket
-limiter = Limiter(key_func=get_remote_address)
+# Default rate limit for all un-decorated endpoints
+DEFAULT_RATE_LIMIT = "100/minute"
 
-# Stricter rate limit for login endpoint (prevents brute force attacks)
-# Set to half the default rate, minimum 1 per minute
+# Create a limiter with a global default limit
+limiter = Limiter(key_func=get_remote_address, default_limits=[DEFAULT_RATE_LIMIT])
+
 LOGIN_RATE_LIMIT = f"{max(1, settings.RATE_LIMIT_PER_SECOND // 2)}/minute"
-
-# Default rate limit for other endpoints
-DEFAULT_RATE_LIMIT = f"{settings.RATE_LIMIT_PER_SECOND}/second"

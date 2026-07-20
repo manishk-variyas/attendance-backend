@@ -16,7 +16,9 @@ router = APIRouter()
 #  GET /api/redmine/timezones  — Redmine-compatible timezone list    #
 # ------------------------------------------------------------------ #
 @router.get("/redmine/timezones", response_model=List[TimeZoneInfo])
-async def list_timezones():
+async def list_timezones(
+    current_user: dict = Depends(get_current_user),
+):
     """Return the full list of Redmine-compatible timezones.
     Mirrors the timezone dropdown from Redmine's user preferences form.
     Used by the onboarding screen to pick a user's timezone."""
@@ -158,33 +160,28 @@ async def get_all_user_projects(
 @router.get("/projects/all/issues", response_model=List[IssueResponse])
 async def get_all_project_issues(
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """Get issues across all projects scoped by user role.
-    Admin → all projects. PM/PC → managed projects. TR → own projects."""
     roles = current_user.get("roles", [])
     if not any(role in roles for role in ["Admin", "Project Manager", "Project Coordinator", "Technical Resource"]):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
+    from app.features.redmine.sql_service import RedmineSQLService
+    from app.models.employee_master import EmployeeMaster
+    sql = RedmineSQLService(db)
+
     email = current_user.get("email")
-    user = await redmine_service.get_user_by_email(email)
+    user = sql.get_user_by_email(email)
     if not user:
         raise HTTPException(status_code=404, detail="User not found in Redmine")
 
     is_tr = "Technical Resource" in roles and "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles
+    assigned_only = is_tr
 
     if "Admin" in roles:
-        projects = await redmine_service.get_all_projects()
+        all_issues = sql.get_all_issues_admin()
     else:
-        projects = await redmine_service.get_projects_for_user(user["id"])
-
-    all_issues = []
-    for p in projects:
-        pid = p.id if hasattr(p, 'id') else p.get("id")
-        if is_tr:
-            issues = await redmine_service.get_issues_for_project(pid, assigned_to_id=user["id"])
-        else:
-            issues = await redmine_service.get_issues_for_project(pid)
-        all_issues.extend(issues)
+        all_issues = sql.get_all_issues_for_user(user["id"], assigned_only=assigned_only)
 
     return all_issues
 

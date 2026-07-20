@@ -37,6 +37,7 @@ class UserProfileResponse(BaseModel):
     reports_to_name: Optional[str] = None
     is_active: bool
     joined_at: Optional[str] = None
+    profilePictureUrl: Optional[str] = None
 
 
 class EmployeeResponse(BaseModel):

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status as fastapi_status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request, status as fastapi_status
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import uuid
@@ -7,14 +7,57 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.limiter import limiter
 from app.features.recordings.schemas.recording import RecordingResponse, MarkPlayedRequest, DeleteRecordingRequest
 from app.utils.storage import storage_service
 from app.features.redmine.service import redmine_service
 from app.features.auth.dependencies import get_current_user
 from app.services.database.recording_service import RecordingService
 from app.models.recording import Recording
+from app.models.employee_master import EmployeeMaster
+from sqlalchemy import text
 
 router = APIRouter()
+
+
+def _enrich_recordings(db: Session, recordings: list) -> list:
+    if not recordings:
+        return []
+    emails = {r.user_email for r in recordings if r.user_email}
+    ticket_ids = {r.ticket_id for r in recordings if r.ticket_id}
+
+    emp_map = {}
+    if emails:
+        emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.in_(emails)).all()
+        emp_map = {e.user_email: e for e in emps}
+
+    issue_map = {}
+    if ticket_ids:
+        rows = db.execute(
+            text("SELECT id, subject FROM redmine.issues WHERE id = ANY(:ids)"),
+            {"ids": list(ticket_ids)},
+        ).fetchall()
+        issue_map = {r[0]: r[1] for r in rows}
+
+    result = []
+    for r in recordings:
+        emp = emp_map.get(r.user_email)
+        result.append({
+            "id": str(r.id),
+            "email": r.user_email,
+            "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else None,
+            "userDesignation": emp.designation if emp else None,
+            "ticket_id": str(r.ticket_id) if r.ticket_id else None,
+            "issue_subject": issue_map.get(r.ticket_id),
+            "project": r.project,
+            "priority": r.priority,
+            "status": r.status,
+            "filename": r.filename,
+            "recording_url": r.recording_url,
+            "is_played": r.is_played,
+            "created_at": r.created_at,
+        })
+    return result
 
 
 ALLOWED_AUDIO_TYPES = [
@@ -66,7 +109,9 @@ async def play_recording(
 
 
 @router.post("/upload", response_model=RecordingResponse)
+@limiter.limit("2/minute")
 async def upload_recording(
+    request: Request,
     email: str = Form(...),
     ticketId: Optional[str] = Form(None),
     project: Optional[str] = Form(None),
@@ -162,21 +207,7 @@ async def get_user_recordings(
 
     svc = RecordingService(db)
     recordings = svc.fetch_by_email(email)
-    return [
-        {
-            "id": str(r.id),
-            "email": r.user_email,
-            "ticket_id": str(r.ticket_id) if r.ticket_id else None,
-            "project": r.project,
-            "priority": r.priority,
-            "status": r.status,
-            "filename": r.filename,
-            "recording_url": r.recording_url,
-            "is_played": r.is_played,
-            "created_at": r.created_at,
-        }
-        for r in recordings
-    ]
+    return _enrich_recordings(db, recordings)
 
 
 @router.get("/all-recordings", response_model=List[RecordingResponse])
@@ -192,21 +223,7 @@ async def get_all_recordings(
 
     svc = RecordingService(db)
     recordings = svc.fetch_all()
-    return [
-        {
-            "id": str(r.id),
-            "email": r.user_email,
-            "ticket_id": str(r.ticket_id) if r.ticket_id else None,
-            "project": r.project,
-            "priority": r.priority,
-            "status": r.status,
-            "filename": r.filename,
-            "recording_url": r.recording_url,
-            "is_played": r.is_played,
-            "created_at": r.created_at,
-        }
-        for r in recordings
-    ]
+    return _enrich_recordings(db, recordings)
 
 
 @router.post("/mark-played")

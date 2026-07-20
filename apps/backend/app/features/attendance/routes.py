@@ -19,8 +19,7 @@ from app.models.location import UserLocation
 from app.models.holiday import Holiday
 from app.models.leave_balance import LeaveBalance
 from app.models.leave import Leave
-from app.models.shift import Shift
-from app.features.redmine.service import redmine_service
+from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
 
 logger = logging.getLogger(__name__)
@@ -669,6 +668,14 @@ async def get_today_attendance(
         s = "overnight" if open_att.attendance_date < today else "in_progress"
         return _build_status_response(db, open_att, today, s)
 
+    # 1b. Check if user is on leave today (approved or emergency)
+    on_leave_today = db.query(Leave).filter(
+        Leave.keycloak_user_id == keycloak_user_id,
+        Leave.approval_status.in_(["approved", "emergency"]),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+    ).first()
+
     # 2. Find shifts covering today (single-day: date==today, multi-day: date<=today AND end_date>=today)
     shifts_today = db.query(Shift).filter(
         and_(
@@ -698,6 +705,9 @@ async def get_today_attendance(
             s = "completed" if shift_att.check_out_time else "in_progress"
             return _build_status_response(db, shift_att, today, s)
 
+        if on_leave_today or shift.work_location_status == "LEAVE":
+            return _no_attendance_response("on_leave", shift, sd, tz, today)
+
         if end_dt and now > end_dt:
             return _no_attendance_response("missed", shift, sd, tz, today)
 
@@ -716,6 +726,8 @@ async def get_today_attendance(
         return _build_status_response(db, att_today, today, s)
 
     # 5. Nothing at all
+    if on_leave_today:
+        return {"status": "on_leave", "shift": None, "attendance": None, "remainingHours": None}
     return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
 
 
@@ -771,6 +783,13 @@ def _build_status_response(db: Session, att: Attendance, today: date, status: st
                 "start_time": shift_start_dt.isoformat() if shift_start_dt else None,
                 "end_time": shift_end_dt.isoformat() if shift_end_dt else None,
             }
+            srec = db.query(Shift).filter(
+                Shift.keycloak_user_id == att.keycloak_user_id,
+                Shift.date == att.attendance_date,
+            ).first()
+            if srec:
+                shift_info["project_id"] = srec.project_id
+                shift_info["project_name"] = srec.project_name
 
     remaining = 0.0
     if att.check_out_time:
@@ -798,6 +817,8 @@ def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: 
             "work_location_status": shift.work_location_status,
             "start_time": datetime.combine(target_date, sd.start_time, tzinfo=tz).isoformat() if sd.start_time else None,
             "end_time": _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
+            "project_id": shift.project_id,
+            "project_name": shift.project_name,
         }
     return {
         "status": status,
@@ -864,16 +885,19 @@ async def get_project_attendance(
     if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+
     if "Admin" not in roles:
         email = current_user.get("email")
-        rm_user = await redmine_service.get_user_by_email(email)
+        rm_user = sql.get_user_by_email(email)
         if not rm_user:
             raise HTTPException(status_code=403, detail="Not found in Redmine.")
-        my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+        my_projects = sql.get_projects_for_user(rm_user["id"])
         if not any(p.id == project_id for p in my_projects):
             raise HTTPException(status_code=403, detail="You are not a member of this project.")
 
-    members = await redmine_service.get_project_members(project_id)
+    members = sql.get_project_members(project_id)
     if not members:
         return {"total": 0, "records": []}
 
@@ -971,22 +995,20 @@ async def get_my_projects_attendance(
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
     email = current_user.get("email")
-    rm_user = await redmine_service.get_user_by_email(email)
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+
+    rm_user = sql.get_user_by_email(email)
     if not rm_user:
         raise HTTPException(status_code=403, detail="Not found in Redmine.")
 
-    my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
-    if not my_projects:
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    if not member_rm_ids:
         return {"total": 0, "records": []}
 
-    all_member_rm_ids = set()
-    for p in my_projects:
-        members = await redmine_service.get_project_members(p.id)
-        for m in members:
-            if m.get("user_id"):
-                all_member_rm_ids.add(m["user_id"])
-
-    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)).all()
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
     visible_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
     if not visible_ids:
         return {"total": 0, "records": []}

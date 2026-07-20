@@ -41,6 +41,9 @@ app = FastAPI(
     docs_url=None, redoc_url=None, openapi_url=None,
 )
 
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
 # Add rate limiting middleware to track and limit requests per IP
 app.add_middleware(SlowAPIMiddleware)
 app.state.limiter = limiter
@@ -74,14 +77,14 @@ app.middleware("http")(active_employee_middleware)
 
 
 @app.get("/")
+@limiter.exempt
 def root():
-    """Root endpoint - returns basic API status info."""
     return {"message": "Backend API", "status": "running"}
 
 
 @app.get("/health")
+@limiter.exempt
 def health_check():
-    """Health check endpoint - used by Docker/load balancers to check if API is alive."""
     return {"status": "ok"}
 
 

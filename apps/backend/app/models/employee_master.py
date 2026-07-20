@@ -37,5 +37,6 @@ class EmployeeMaster(Base):
     location_id = Column(UUID(as_uuid=True), nullable=True)
     reports_to = Column(Integer, nullable=True)
     reports_to_name = Column(String(255), nullable=True)
+    profile_picture_url = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))

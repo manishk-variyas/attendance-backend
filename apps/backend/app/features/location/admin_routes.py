@@ -71,6 +71,7 @@ async def create_office_location(
 async def list_office_locations(
     category: str = None,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     if category and len(category) > 50:
         raise HTTPException(status_code=400, detail="Category must be 50 characters or less.")
@@ -87,6 +88,7 @@ async def list_office_locations(
 async def get_office_location(
     location_id: str,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     svc = OfficeLocationService(db)
     loc = svc.fetch_one(OfficeLocation, id=location_id)

@@ -94,6 +94,8 @@ class TodayShiftInfo(BaseModel):
     work_location_status: Optional[str] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
 
 
 class TodayAttendance(BaseModel):

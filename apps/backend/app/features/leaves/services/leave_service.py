@@ -7,7 +7,7 @@ import openpyxl
 from pydantic import ValidationError
 
 from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema
-from app.features.redmine.service import redmine_service
+from app.features.redmine.sql_service import RedmineSQLService
 from app.services.database.leave_service import LeaveService as LeaveDBService, LeaveBalanceService
 from app.services.database.holiday_service import HolidayService as HolidayDBService
 from app.models.leave import Leave
@@ -18,13 +18,90 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.system_setting import SystemSetting
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
-from sqlalchemy import select, and_, or_, func
+from sqlalchemy import select, and_, or_, func, insert
 
 class LeaveBusinessService:
     def __init__(self, leave_db: LeaveDBService, holiday_db: HolidayDBService, balance_db: LeaveBalanceService):
         self.leave_db = leave_db
         self.holiday_db = holiday_db
         self.balance_db = balance_db
+
+    async def validate_leave_dates(self, start_date: datetime, end_date: datetime, user_id: str = None, leave_dates: list = None) -> dict:
+        IST = ZoneInfo("Asia/Kolkata")
+
+        def _to_ist_date(dt):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(IST).date()
+
+        if leave_dates:
+            dates = sorted({_to_ist_date(d) for d in leave_dates})
+            if not dates:
+                return {"valid": False, "total_days": 0, "working_days": 0, "weekends": 0, "holidays": 0, "warnings": []}
+            sd = dates[0]
+            ed = dates[-1]
+        else:
+            sd = _to_ist_date(start_date)
+            ed = _to_ist_date(end_date)
+            dates = None
+
+        holidays_in_range = self.leave_db.db.execute(
+            select(Holiday).where(Holiday.holiday_date.between(sd, ed))
+        ).scalars().all()
+        holiday_map = {h.holiday_date: h.holiday_name for h in holidays_in_range}
+
+        warnings = []
+        weekend_count = 0
+        holiday_count = 0
+        no_shift_count = 0
+
+        shift_dates = set()
+        if user_id:
+            shifts = self.leave_db.db.execute(
+                select(Shift.date).where(
+                    Shift.keycloak_user_id == user_id,
+                    Shift.date.between(sd, ed),
+                )
+            ).scalars().all()
+            shift_dates = set(shifts)
+
+        if leave_dates:
+            total_days = len(dates)
+            for d in dates:
+                if d.weekday() == 6:
+                    warnings.append({"date": d.isoformat(), "type": "weekend", "label": "Sunday"})
+                    weekend_count += 1
+                elif d in holiday_map:
+                    warnings.append({"date": d.isoformat(), "type": "holiday", "label": holiday_map[d]})
+                    holiday_count += 1
+                elif shift_dates and d not in shift_dates:
+                    warnings.append({"date": d.isoformat(), "type": "no_shift", "label": "No shift assigned"})
+                    no_shift_count += 1
+        else:
+            total_days = (ed - sd).days + 1
+            current = sd
+            while current <= ed:
+                if current.weekday() == 6:
+                    warnings.append({"date": current.isoformat(), "type": "weekend", "label": "Sunday"})
+                    weekend_count += 1
+                elif current in holiday_map:
+                    warnings.append({"date": current.isoformat(), "type": "holiday", "label": holiday_map[current]})
+                    holiday_count += 1
+                elif shift_dates and current not in shift_dates:
+                    warnings.append({"date": current.isoformat(), "type": "no_shift", "label": "No shift assigned"})
+                    no_shift_count += 1
+                current += timedelta(days=1)
+
+        working_days = total_days - weekend_count - holiday_count
+        return {
+            "valid": working_days > 0,
+            "total_days": total_days,
+            "working_days": working_days,
+            "weekends": weekend_count,
+            "holidays": holiday_count,
+            "no_shift": no_shift_count,
+            "warnings": warnings,
+        }
 
     async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> dict:
         """Submit a new leave application with overlap protection."""
@@ -45,9 +122,22 @@ class LeaveBusinessService:
         if leave_data.leave_dates:
             target_dates = [d.astimezone(IST).date() if d.tzinfo else d.replace(tzinfo=timezone.utc).astimezone(IST).date() for d in leave_data.leave_dates]
             requested_days = len(target_dates)
+            overlap_start = min(target_dates)
+            overlap_end = max(target_dates)
         else:
             target_dates = None
             requested_days = (end.date() - start.date()).days + 1
+            overlap_start = start.date()
+            overlap_end = end.date()
+
+        if leave_data.resuming_date:
+            resume = leave_data.resuming_date
+            if isinstance(resume, datetime) and resume.tzinfo is None:
+                resume = resume.replace(tzinfo=timezone.utc)
+            resume_date = resume.astimezone(IST).date() if isinstance(resume, datetime) else resume
+            last_leave = max(target_dates) if target_dates else end.date()
+            if resume_date <= last_leave:
+                raise HTTPException(status_code=400, detail="Resuming date must be after the last leave day.")
 
         # Check for completed attendance on requested dates
         completed_att = self.leave_db.db.execute(
@@ -69,8 +159,8 @@ class LeaveBusinessService:
             select(Leave).where(
                 Leave.keycloak_user_id == user_id,
                 Leave.approval_status.in_([LeaveStatus.APPROVED.value, LeaveStatus.PENDING.value]),
-                Leave.start_date <= end.date(),
-                Leave.end_date >= start.date()
+                Leave.start_date <= overlap_end,
+                Leave.end_date >= overlap_start
             )
         ).scalars().all()
 
@@ -86,11 +176,19 @@ class LeaveBusinessService:
             else:
                 raise HTTPException(status_code=400, detail="You already have an approved or pending leave application that overlaps with these dates.")
 
-        # Create leave record
-        leave_ids = []
-        current_date = start.date()
-        while current_date <= end.date():
-            leave_doc = {
+        # Create leave records — one INSERT for all days
+        leave_docs = []
+        if leave_data.leave_dates:
+            dates = sorted({d.astimezone(IST).date() if d.tzinfo else d.replace(tzinfo=timezone.utc).astimezone(IST).date() for d in leave_data.leave_dates})
+        else:
+            current = start.date()
+            dates = []
+            while current <= end.date():
+                dates.append(current)
+                current += timedelta(days=1)
+
+        for current_date in dates:
+            leave_docs.append({
                 "keycloak_user_id": user_id,
                 "user_email": email,
                 "start_date": current_date,
@@ -100,12 +198,16 @@ class LeaveBusinessService:
                 "comment": leave_data.comment,
                 "is_traveling": leave_data.is_traveling,
                 "contact_number": leave_data.contact_number,
+                "resuming_date": leave_data.resuming_date.date() if isinstance(leave_data.resuming_date, datetime) else leave_data.resuming_date,
                 "approver_id": leave_data.approver_id,
                 "approval_status": LeaveStatus.PENDING.value,
-            }
-            new_leave = self.leave_db.create(Leave, **leave_doc)
-            leave_ids.append(str(new_leave.id))
+            })
             current_date += timedelta(days=1)
+
+        stmt = insert(Leave).returning(Leave.id)
+        result = self.leave_db.db.execute(stmt, leave_docs)
+        self.leave_db.db.commit()
+        leave_ids = [str(row.id) for row in result]
 
         balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
         balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
@@ -230,10 +332,10 @@ class LeaveBusinessService:
         new_leave = self.leave_db.create(Leave, **leave_doc)
         return {"message": "Emergency leave applied", "leave_id": str(new_leave.id)}
 
-    async def get_leave_history(self, user_id: str, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
-        stmt = select(Leave).where(Leave.keycloak_user_id == user_id).order_by(Leave.start_date.desc()).offset(skip).limit(limit)
+    async def get_leave_history(self, user_id: str) -> List[Dict[str, Any]]:
+        stmt = select(Leave).where(Leave.keycloak_user_id == user_id).order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
-        return [r.to_dict() for r in results]
+        return self._enrich_leaves_with_employee(results)
 
     async def get_team_leaves(self, emails: list, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
         stmt = select(Leave).where(Leave.user_email.in_(emails))
@@ -243,60 +345,82 @@ class LeaveBusinessService:
             stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
         stmt = stmt.order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
-        return [r.to_dict() for r in results]
+        return self._enrich_leaves_with_employee(results)
 
-    async def get_user_leave_history(self, email: str, current_user: dict, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
+    def _enrich_leaves_with_employee(self, results) -> List[Dict[str, Any]]:
+        if not results:
+            return []
+        emails = {r.user_email for r in results if r.user_email}
+        emails.update({r.approved_by for r in results if r.approved_by})
+        emails.update({r.rejected_by for r in results if r.rejected_by})
+        emp_map = {}
+        if emails:
+            emps = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email.in_(emails))
+            ).scalars().all()
+            for e in emps:
+                emp_map[e.user_email] = e
+        records = []
+        for r in results:
+            d = r.to_dict()
+            emp = emp_map.get(r.user_email)
+            d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
+            d["userDesignation"] = emp.designation if emp else None
+
+            if r.approved_by:
+                app_emp = emp_map.get(r.approved_by)
+                if app_emp:
+                    name = f"{app_emp.first_name} {app_emp.last_name}".strip()
+                    desig = app_emp.designation or ""
+                    d["approved_by"] = f"{name} ({desig})" if desig else name
+
+            if r.rejected_by:
+                rej_emp = emp_map.get(r.rejected_by)
+                if rej_emp:
+                    name = f"{rej_emp.first_name} {rej_emp.last_name}".strip()
+                    desig = rej_emp.designation or ""
+                    d["rejected_by"] = f"{name} ({desig})" if desig else name
+
+            records.append(d)
+        return records
+
+    async def get_user_leave_history(self, email: str, current_user: dict) -> List[Dict[str, Any]]:
         roles = current_user.get("roles", [])
+        sql = RedmineSQLService(self.leave_db.db)
 
-        tr_user = await redmine_service.get_user_by_email(email)
+        tr_user = sql.get_user_by_email(email)
         if not tr_user:
             raise HTTPException(status_code=404, detail="User not found in Redmine")
 
         if "Admin" not in roles:
             pm_email = current_user.get("email")
-            pm_user = await redmine_service.get_user_by_email(pm_email)
+            pm_user = sql.get_user_by_email(pm_email)
             if not pm_user:
                 raise HTTPException(status_code=403, detail="Unauthorized")
 
-            pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
-            pm_project_ids = {p.id for p in pm_projects}
-            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
-            tr_project_ids = {p.id for p in tr_projects}
-
-            if not pm_project_ids.intersection(tr_project_ids):
+            if not sql.check_project_access(pm_user["id"], tr_user["id"]):
                 raise HTTPException(status_code=403, detail="You can only view leaves for users in your projects.")
 
-        stmt = select(Leave).where(Leave.user_email == email).order_by(Leave.start_date.desc()).offset(skip).limit(limit)
+        stmt = select(Leave).where(Leave.user_email == email).order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
-        return [r.to_dict() for r in results]
+        return self._enrich_leaves_with_employee(results)
 
     async def get_visible_leave_users(self, current_user: dict) -> list:
-        """Return users whose leaves the current user can view."""
         roles = current_user.get("roles", [])
-        all_users = await redmine_service.get_all_users()
+        sql = RedmineSQLService(self.leave_db.db)
+
+        all_users = sql.get_all_users()
 
         if "Admin" in roles:
             return all_users
 
         pm_email = current_user.get("email")
-        pm_user = await redmine_service.get_user_by_email(pm_email)
+        pm_user = sql.get_user_by_email(pm_email)
         if not pm_user:
             return []
 
-        pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
-        pm_project_ids = {p.id for p in pm_projects}
-
-        visible = []
-        for u in all_users:
-            tr_user = await redmine_service.get_user_by_email(u["email"])
-            if not tr_user:
-                continue
-            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
-            tr_project_ids = {p.id for p in tr_projects}
-            if pm_project_ids.intersection(tr_project_ids):
-                visible.append(u)
-
-        return visible
+        visible_ids = sql.get_team_member_ids(pm_user["id"])
+        return [u for u in all_users if u["id"] in visible_ids]
 
     async def get_holidays(self, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
         stmt = select(Holiday).order_by(Holiday.holiday_date.asc()).offset(skip).limit(limit)
@@ -434,26 +558,21 @@ class LeaveBusinessService:
 
         roles = current_user.get("roles", [])
         if "Admin" not in roles:
+            sql = RedmineSQLService(self.leave_db.db)
             pm_email = current_user.get("email")
-            pm_user = await redmine_service.get_user_by_email(pm_email)
+            pm_user = sql.get_user_by_email(pm_email)
             if not pm_user:
                 return False
-                
-            pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
-            pm_project_ids = {p.id for p in pm_projects}
 
             tr_email = leave.user_email
             if not tr_email:
                 return False
-                
-            tr_user = await redmine_service.get_user_by_email(tr_email)
+
+            tr_user = sql.get_user_by_email(tr_email)
             if not tr_user:
                 return False
-                
-            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
-            tr_project_ids = {p.id for p in tr_projects}
 
-            if not pm_project_ids.intersection(tr_project_ids):
+            if not sql.check_project_access(pm_user["id"], tr_user["id"]):
                 raise HTTPException(status_code=403, detail="You can only approve leaves for resources in your projects.")
 
         # ── Calculate requested leave days ─────────────────────────────────
@@ -492,26 +611,21 @@ class LeaveBusinessService:
 
         roles = current_user.get("roles", [])
         if "Admin" not in roles:
+            sql = RedmineSQLService(self.leave_db.db)
             pm_email = current_user.get("email")
-            pm_user = await redmine_service.get_user_by_email(pm_email)
+            pm_user = sql.get_user_by_email(pm_email)
             if not pm_user:
                 return False
-
-            pm_projects = await redmine_service.get_projects_for_user(pm_user["id"])
-            pm_project_ids = {p.id for p in pm_projects}
 
             tr_email = leave.user_email
             if not tr_email:
                 return False
 
-            tr_user = await redmine_service.get_user_by_email(tr_email)
+            tr_user = sql.get_user_by_email(tr_email)
             if not tr_user:
                 return False
 
-            tr_projects = await redmine_service.get_projects_for_user(tr_user["id"])
-            tr_project_ids = {p.id for p in tr_projects}
-
-            if not pm_project_ids.intersection(tr_project_ids):
+            if not sql.check_project_access(pm_user["id"], tr_user["id"]):
                 raise HTTPException(status_code=403, detail="You can only reject leaves for resources in your projects.")
 
         now = datetime.utcnow()
@@ -526,6 +640,90 @@ class LeaveBusinessService:
         )
         return True
 
+    async def batch_approve_leaves(self, leave_ids: list, current_user: dict) -> dict:
+        return await self._batch_process_leaves(leave_ids, current_user, action="approve")
+
+    async def batch_reject_leaves(self, leave_ids: list, current_user: dict) -> dict:
+        return await self._batch_process_leaves(leave_ids, current_user, action="reject")
+
+    async def _batch_process_leaves(self, leave_ids: list, current_user: dict, action: str) -> dict:
+        if len(leave_ids) > 50:
+            raise HTTPException(status_code=400, detail="Maximum 50 leave IDs per batch request.")
+
+        import uuid as _uuid
+        for lid in leave_ids:
+            try:
+                _uuid.UUID(lid)
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=400, detail="Invalid leave ID(s). Must be valid UUID.")
+        roles = current_user.get("roles", [])
+        pm_email = current_user.get("email")
+        is_admin = "Admin" in roles
+
+        pm_redmine_id = None
+        if not is_admin:
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == pm_email)
+            ).scalars().first()
+            pm_redmine_id = pm_emp.redmine_user_id if pm_emp else None
+
+        processed = 0
+        success = 0
+        results = []
+        for leave_id in leave_ids:
+            processed += 1
+            leave = self.leave_db.fetch_one(Leave, id=leave_id)
+            if not leave:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": "Not found"})
+                continue
+            if leave.approval_status != LeaveStatus.PENDING.value:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
+                continue
+            if not is_admin and leave.approver_id != pm_redmine_id:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
+                continue
+
+            if action == "approve":
+                await self._do_approve(leave_id, leave, current_user)
+                results.append({"leave_id": leave_id, "status": "approved"})
+            else:
+                await self._do_reject(leave_id, leave, current_user)
+                results.append({"leave_id": leave_id, "status": "rejected"})
+            success += 1
+
+        failed = processed - success
+        return {
+            "processed": processed,
+            "approved" if action == "approve" else "rejected": success,
+            "failed": failed,
+            "results": results,
+        }
+
+    async def _do_approve(self, leave_id: str, leave, current_user: dict) -> None:
+        requested_days = (leave.end_date - leave.start_date).days + 1
+        now = datetime.utcnow()
+        actor_email = current_user.get("email")
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.APPROVED.value,
+            updated_at=now, approved_at=now, approved_by=actor_email,
+        )
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+        if balance:
+            if leave.leave_type == LeaveType.EL.value:
+                self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
+            elif leave.leave_type == LeaveType.PL.value:
+                self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
+
+    async def _do_reject(self, leave_id: str, leave, current_user: dict) -> None:
+        now = datetime.utcnow()
+        actor_email = current_user.get("email")
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.REJECTED.value,
+            updated_at=now, rejected_at=now, rejected_by=actor_email,
+        )
+
     async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
         """Fetch all pending leaves with balance info."""
         roles = current_user.get("roles", [])
@@ -534,7 +732,8 @@ class LeaveBusinessService:
             stmt = select(Leave).where(Leave.approval_status == LeaveStatus.PENDING.value).order_by(Leave.created_at.desc())
             results = self.leave_db.db.execute(stmt).scalars().all()
         else:
-            pm_user = await redmine_service.get_user_by_email(current_user.get("email"))
+            sql = RedmineSQLService(self.leave_db.db)
+            pm_user = sql.get_user_by_email(current_user.get("email"))
             if not pm_user:
                 return []
             stmt = select(Leave).where(
@@ -549,19 +748,23 @@ class LeaveBusinessService:
             balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=r.keycloak_user_id)
             requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
             d["requested_days"] = requested_days
-            d["balance_remaining"] = None
-            d["balance_warning"] = None
-            if balance and r.leave_type in (LeaveType.EL.value, LeaveType.PL.value):
-                if r.leave_type == LeaveType.EL.value:
-                    if balance.total_earned is None:
-                        remaining = None
-                    else:
-                        remaining = balance.total_earned - (balance.used_earned or 0.0)
-                else:
-                    remaining = (balance.accrued_compoff or 0.0) - (balance.consumed_compoff or 0.0)
-                d["balance_remaining"] = remaining
-                if remaining is not None and remaining < requested_days:
-                    d["balance_warning"] = f"{int(requested_days)} day(s) requested, {int(remaining)} balance remaining"
+            d["balance"] = {
+                "EL": {
+                    "total": balance.total_earned if balance else 0,
+                    "used": balance.used_earned if balance else 0,
+                    "remaining": (balance.total_earned or 0) - (balance.used_earned or 0) if balance else 0,
+                },
+                "CompOff": {
+                    "total": balance.accrued_compoff if balance else 0,
+                    "used": balance.consumed_compoff if balance else 0,
+                    "remaining": (balance.accrued_compoff or 0) - (balance.consumed_compoff or 0) if balance else 0,
+                },
+                "Unpaid": {
+                    "total": 0,
+                    "used": balance.unpaid if balance else 0,
+                    "remaining": 0,
+                },
+            }
             pending.append(d)
 
         return pending

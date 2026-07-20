@@ -1,0 +1,17 @@
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: always
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    depends_on:
+      - postgres
+    networks:
+      - infra-network
+
+networks:
+  infra-network:
+    driver: bridge

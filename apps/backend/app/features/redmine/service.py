@@ -183,13 +183,6 @@ class RedmineService:
             response.raise_for_status()
             projects_data = response.json().get("projects", [])
 
-            # --- OLD LOGIC (BACKUP) ---
-            # # Previous logic returned all projects visible to user (including public ones)
-            # response = await client.get(f"{self.url}/projects.json?user_id={user_id}&include=custom_fields", headers=self.headers)
-            # response.raise_for_status()
-            # projects_data = response.json().get("projects", [])
-            # --------------------------
-            
             projects = []
             for p in projects_data:
                 # 3. STRICT FILTER: Only include if the user has an explicit membership

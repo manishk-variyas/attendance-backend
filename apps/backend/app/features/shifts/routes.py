@@ -291,7 +291,9 @@ async def get_current_shift(
 ):
     target_user = None
     if "Admin" not in current_user.get("roles", []):
-        users = await redmine_service.get_all_users()
+        from app.features.redmine.sql_service import RedmineSQLService
+        sql = RedmineSQLService(db)
+        users = sql.get_all_users()
         target_user = next((u for u in users if u["id"] == user_id), None)
         if not target_user:
              raise HTTPException(status_code=404, detail="User not found.")
@@ -358,7 +360,9 @@ async def get_shifts_by_email(
 
 
 @router.get("/work-locations")
-async def get_work_locations():
+async def get_work_locations(
+    current_user: dict = Depends(get_current_user),
+):
     return ["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "LEAVE"]
 
 
@@ -382,7 +386,9 @@ async def get_shifts_by_range(
             detail="You are not authorized to access this feature.",
         )
 
-    current_rm_user = await redmine_service.get_user_by_email(current_email)
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    current_rm_user = sql.get_user_by_email(current_email)
     if not current_rm_user:
         raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
     current_rm_id = current_rm_user["id"]
@@ -394,8 +400,8 @@ async def get_shifts_by_range(
         if "Admin" in roles:
             pass
         elif "Project Manager" in roles or "Project Coordinator" in roles:
-            pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
-            tr_projects = await redmine_service.get_projects_for_user(target_user_id)
+            pm_projects = sql.get_projects_for_user(current_rm_id)
+            tr_projects = sql.get_projects_for_user(target_user_id)
             pm_project_ids = {p.id for p in pm_projects}
             tr_project_ids = {p.id for p in tr_projects}
             if not pm_project_ids.intersection(tr_project_ids):
@@ -486,17 +492,14 @@ async def get_shift_history(
     if team:
         if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
             raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
-        rm_user = await redmine_service.get_user_by_email(email)
+        from app.features.redmine.sql_service import RedmineSQLService
+        sql = RedmineSQLService(db)
+        rm_user = sql.get_user_by_email(email)
         if not rm_user:
             raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
-        my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
-        all_member_rm_ids = set()
-        for p in my_projects:
-            members = await redmine_service.get_project_members(p.id)
-            for m in members:
-                if m.get("user_id"):
-                    all_member_rm_ids.add(m["user_id"])
-        emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)).all()
+        member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+        member_rm_ids.add(rm_user["id"])
+        emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
         member_emails = [e.user_email for e in emps if e.user_email]
         if not member_emails:
             return {"total": 0, "records": []}
@@ -507,7 +510,9 @@ async def get_shift_history(
         records = await shift_service.get_shift_history_by_email(db, email)
         return {"total": len(records), "records": records}
 
-    current_rm_user = await redmine_service.get_user_by_email(email)
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    current_rm_user = sql.get_user_by_email(email)
     if not current_rm_user:
         raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
     current_rm_id = current_rm_user["id"]
@@ -519,8 +524,8 @@ async def get_shift_history(
     if "Admin" in roles:
         pass
     elif "Project Manager" in roles or "Project Coordinator" in roles:
-        pm_projects = await redmine_service.get_projects_for_user(current_rm_id)
-        tr_projects = await redmine_service.get_projects_for_user(user_id)
+        pm_projects = sql.get_projects_for_user(current_rm_id)
+        tr_projects = sql.get_projects_for_user(user_id)
         pm_project_ids = {p.id for p in pm_projects}
         tr_project_ids = {p.id for p in tr_projects}
         if not pm_project_ids.intersection(tr_project_ids):
@@ -534,7 +539,9 @@ async def get_shift_history(
             detail="Not authorized to view other users' shift history."
         )
 
-    all_users = await redmine_service.get_all_users()
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    all_users = sql.get_all_users()
     target_user = next((u for u in all_users if u["id"] == user_id), None)
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found.")

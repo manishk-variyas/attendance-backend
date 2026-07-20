@@ -17,5 +17,6 @@ include:
   - redmine/docker-compose.yml
   - minio/docker-compose.yml
   - postgres/docker-compose.yml
+  - pgbouncer/docker-compose.yml
 
 

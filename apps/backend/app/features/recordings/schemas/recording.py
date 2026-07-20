@@ -21,6 +21,9 @@ class RecordingResponse(RecordingBase):
     recording_url: str
     is_played: bool
     created_at: datetime
+    userName: Optional[str] = None
+    userDesignation: Optional[str] = None
+    issue_subject: Optional[str] = None
 
     class Config:
         from_attributes = True

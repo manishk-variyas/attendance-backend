@@ -232,22 +232,32 @@ class ShiftService:
         grace_min = company.grace_minutes if company and company.grace_minutes else 2
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
-        dates = list({s.date for s in shifts if s.date})
+        shift_codes = list({s.shift_code for s in shifts if s.shift_code})
+        min_date = min(s.date for s in shifts)
+        max_date = max(s.date for s in shifts)
+
         att_query = db.query(Attendance).filter(
             Attendance.keycloak_user_id.in_(user_ids),
-            Attendance.attendance_date.in_(dates),
+            Attendance.attendance_date.between(min_date, max_date),
         ).all()
         att_map = {(a.keycloak_user_id, a.attendance_date): a for a in att_query}
 
+        sd_map = {}
+        if shift_codes:
+            sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+            sd_map = {s.shift_code: s for s in sds}
+
+        leaves = db.query(Leave).filter(
+            Leave.keycloak_user_id.in_(user_ids),
+            Leave.approval_status == "approved",
+            Leave.start_date <= max_date,
+            Leave.end_date >= min_date,
+        ).all()
+
         result = []
         for s in shifts:
-            sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == s.shift_code).first()
-            leave = db.query(Leave).filter(
-                Leave.keycloak_user_id == s.keycloak_user_id,
-                Leave.approval_status == "approved",
-                Leave.start_date <= s.date,
-                Leave.end_date >= s.date,
-            ).first()
+            sd = sd_map.get(s.shift_code)
+            leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
             att = att_map.get((s.keycloak_user_id, s.date))
 
             derived_status = s.status
@@ -368,23 +378,39 @@ class ShiftService:
         grace_min = company.grace_minutes if company and company.grace_minutes else 2
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
-        dates = list({s.date for s in shifts if s.date})
+        shift_user_emails = list({s.user_email for s in shifts if s.user_email})
+        shift_codes = list({s.shift_code for s in shifts if s.shift_code})
+        min_date = min(s.date for s in shifts)
+        max_date = max(s.date for s in shifts)
+
         att_query = db.query(Attendance).filter(
             Attendance.keycloak_user_id.in_(user_ids),
-            Attendance.attendance_date.in_(dates),
+            Attendance.attendance_date.between(min_date, max_date),
         ).all()
         att_map = {(a.keycloak_user_id, a.attendance_date): a for a in att_query}
 
+        emp_map = {}
+        if shift_user_emails:
+            emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.in_(shift_user_emails)).all()
+            emp_map = {e.user_email: e for e in emps}
+
+        sd_map = {}
+        if shift_codes:
+            sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+            sd_map = {s.shift_code: s for s in sds}
+
+        leaves = db.query(Leave).filter(
+            Leave.keycloak_user_id.in_(user_ids),
+            Leave.approval_status == "approved",
+            Leave.start_date <= max_date,
+            Leave.end_date >= min_date,
+        ).all()
+
         result = []
         for s in shifts:
-            emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == s.user_email).first()
-            sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == s.shift_code).first()
-            leave = db.query(Leave).filter(
-                Leave.keycloak_user_id == s.keycloak_user_id,
-                Leave.approval_status == "approved",
-                Leave.start_date <= s.date,
-                Leave.end_date >= s.date,
-            ).first()
+            emp = emp_map.get(s.user_email)
+            sd = sd_map.get(s.shift_code)
+            leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
             att = att_map.get((s.keycloak_user_id, s.date))
 
             derived_status = s.status

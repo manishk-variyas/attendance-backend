@@ -26,11 +26,11 @@ class Settings(BaseSettings):
     KEYCLOAK_URL: str = "http://keycloak:8080"  # Keycloak server URL (internal Docker network)
     REALM: str = "attendance-app"  # Keycloak realm name
     KEYCLOAK_CLIENT_ID: str = "backend-client"  # Client ID for this backend app
-    KEYCLOAK_CLIENT_SECRET: str = "best-practice-secret-12345"  # Client secret (CHANGE IN PRODUCTION!)
+    KEYCLOAK_CLIENT_SECRET: str = ""  # Set via .env — no hardcoded default
 
     # Session settings
     # Sessions are stored in Redis with these settings
-    SECRET_KEY: str = "change-me-in-production-use-strong-random-key"  # Used for signing (CHANGE IN PRODUCTION!)
+    SECRET_KEY: str = ""  # Set via .env — no hardcoded default
     ALGORITHM: str = "HS256"  # JWT signing algorithm
     SESSION_EXPIRE_HOURS: int = 24  # How long sessions last in hours
 
@@ -52,12 +52,12 @@ class Settings(BaseSettings):
 
     # Redmine integration settings
     REDMINE_URL: str = "http://redmine:3000" # Internal Docker network address
-    REDMINE_API_KEY: str = "c2ffc5526ca3ec90d0359742c48aee46f6ec1688"
+    REDMINE_API_KEY: str = ""  # Set via .env
     
     # MinIO / S3 Settings
     MINIO_URL: str = "http://minio:9000"
-    MINIO_ACCESS_KEY: str = "minioadmin"
-    MINIO_SECRET_KEY: str = "minioadmin"
+    MINIO_ACCESS_KEY: str = ""  # Set via .env
+    MINIO_SECRET_KEY: str = ""  # Set via .env
     MINIO_BUCKET_NAME: str = "recordings"
     MINIO_ASSETS_BUCKET: str = "company-assets"
     MINIO_REGION: str = "us-east-1"

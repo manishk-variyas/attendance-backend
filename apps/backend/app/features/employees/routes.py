@@ -1,6 +1,8 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi.responses import StreamingResponse
 from typing import List, Optional
+import io
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ from app.features.redmine.service import redmine_service
 from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user, get_user_realm_roles
 from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
+from app.utils.storage import storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +49,56 @@ async def get_my_profile(
         "reports_to_name": emp.reports_to_name,
         "is_active": emp.is_active,
         "title": emp.title,
+        "profilePictureUrl": f"/api/employees/me/profile-picture" if emp.profile_picture_url else None,
         "joined_at": emp.joining_date.isoformat() if emp.joining_date else emp.created_at.date().isoformat() if emp.created_at else None,
     }
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+MAX_PROFILE_PIC_SIZE = 5 * 1024 * 1024  # 5MB
+ASSETS_BUCKET = "company-assets"
+
+
+@router.get("/me/profile-picture")
+async def get_profile_picture(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    email = current_user.get("email")
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+    if not emp or not emp.profile_picture_url:
+        raise HTTPException(status_code=404, detail="No profile picture found")
+
+    content, content_type = await storage_service.get_file(emp.profile_picture_url, ASSETS_BUCKET)
+    return StreamingResponse(io.BytesIO(content), media_type=content_type)
+
+
+@router.post("/me/profile-picture")
+async def upload_profile_picture(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    if not file.content_type or file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, and WebP images are allowed.")
+    contents = await file.read()
+    if len(contents) > MAX_PROFILE_PIC_SIZE:
+        raise HTTPException(status_code=400, detail="Image must be under 5MB.")
+
+    email = current_user.get("email")
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee record not found")
+
+    ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else "jpg"
+    object_name = f"profile-pictures/{emp.id}.{ext}"
+    await storage_service.upload_file(contents, object_name, bucket_name=ASSETS_BUCKET, content_type=file.content_type)
+
+    emp.profile_picture_url = object_name
+    db.commit()
+
+    return {"message": "Profile picture uploaded", "profilePictureUrl": "/api/employees/me/profile-picture"}
 
 
 def _employee_to_dict(e: EmployeeMaster) -> dict:
@@ -75,6 +126,7 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
         "location_id": str(e.location_id) if e.location_id else None,
         "reports_to": e.reports_to,
         "reports_to_name": e.reports_to_name,
+        "profile_picture_url": e.profile_picture_url,
         "created_at": e.created_at,
         "updated_at": e.updated_at,
     }
@@ -156,20 +208,38 @@ async def list_my_team(
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
     email = current_user.get("email")
-    rm_user = await redmine_service.get_user_by_email(email)
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+
+    rm_user = sql.get_user_by_email(email)
     if not rm_user:
         raise HTTPException(status_code=403, detail="Not found in Redmine.")
 
-    my_projects = await redmine_service.get_projects_for_user(rm_user["id"])
+    my_projects = sql.get_projects_for_user(rm_user["id"])
     if not my_projects:
         return {"total": 0, "employees": []}
 
     all_member_rm_ids = set()
+    user_redmine_roles = {}
+    project_managers_my = {}
     for p in my_projects:
-        members = await redmine_service.get_project_members(p.id)
+        pname = p.name if hasattr(p, 'name') else p.get('name', '')
+        pid = p.id if hasattr(p, 'id') else p.get('id')
+        members = sql.get_project_members(pid)
+        pm_names = []
         for m in members:
-            if m.get("user_id"):
-                all_member_rm_ids.add(m["user_id"])
+            uid = m.get("user_id")
+            if uid:
+                all_member_rm_ids.add(uid)
+                roles = m.get("roles", [])
+                if uid not in user_redmine_roles:
+                    user_redmine_roles[uid] = []
+                for role_name in roles:
+                    user_redmine_roles[uid].append({"project": pname, "role": role_name})
+                if any(r in ("Project Manager", "Project Coordinator") for r in roles):
+                    pm_names.append(m.get("name", ""))
+        project_managers_my[pname] = pm_names
 
     query = db.query(EmployeeMaster).filter(
         EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)
@@ -182,31 +252,6 @@ async def list_my_team(
         query = query.filter(EmployeeMaster.onboarded_at.is_(None))
 
     employees = query.order_by(EmployeeMaster.created_at.desc()).all()
-
-    user_redmine_roles = {}
-    project_managers_my = {}
-    try:
-        for p in my_projects:
-            pname = p.name if hasattr(p, 'name') else p.get('name', '')
-            pid = p.id if hasattr(p, 'id') else p.get('id')
-            try:
-                members = await redmine_service.get_project_members(pid)
-                pm_names = []
-                for m in members:
-                    uid = m.get("user_id")
-                    roles = m.get("roles", [])
-                    if uid:
-                        if uid not in user_redmine_roles:
-                            user_redmine_roles[uid] = []
-                        for role_name in roles:
-                            user_redmine_roles[uid].append({"project": pname, "role": role_name})
-                    if "Project Manager" in roles or "Project Coordinator" in roles:
-                        pm_names.append(m.get("name", ""))
-                project_managers_my[pname] = pm_names
-            except Exception:
-                pass
-    except Exception:
-        pass
 
     return {
         "total": len(employees),
