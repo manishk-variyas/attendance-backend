@@ -17,6 +17,7 @@ class LeaveStatus(str, enum.Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EMERGENCY = "emergency"
+    CANCELLED = "cancelled"
 
 
 class Leave(Base):
@@ -40,6 +41,8 @@ class Leave(Base):
     approved_by = Column(String(255), nullable=True)
     rejected_at = Column(DateTime(timezone=True), nullable=True)
     rejected_by = Column(String(255), nullable=True)
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    cancelled_by = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
@@ -63,6 +66,8 @@ class Leave(Base):
             "approved_by": self.approved_by,
             "rejected_at": self.rejected_at,
             "rejected_by": self.rejected_by,
+            "cancelled_at": self.cancelled_at,
+            "cancelled_by": self.cancelled_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

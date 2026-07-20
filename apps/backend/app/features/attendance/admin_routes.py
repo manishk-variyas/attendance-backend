@@ -225,6 +225,20 @@ async def admin_create_attendance(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid check_out_time format")
 
+    shift_rec = None
+    if payload.shift_code and emp.keycloak_user_id:
+        sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift_code).first()
+        if not sd:
+            raise HTTPException(status_code=400, detail=f"Invalid shift code: {payload.shift_code}")
+        shift_rec = db.query(Shift).filter(
+            Shift.keycloak_user_id == emp.keycloak_user_id,
+            Shift.date == att_date,
+        ).first()
+        if not shift_rec:
+            raise HTTPException(status_code=400, detail=f"No shift assigned for this employee on {att_date}.")
+        if shift_rec.shift_code != payload.shift_code:
+            raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift_code}' does not match assigned shift '{shift_rec.shift_code}'.")
+
     attendance = Attendance(
         keycloak_user_id=emp.keycloak_user_id,
         attendance_date=att_date,
@@ -239,20 +253,14 @@ async def admin_create_attendance(
         is_manual_entry=True,
         modified_by=current_user["sub"],
         remarks=payload.remarks,
+        location_id=payload.location_id,
     )
     db.add(attendance)
     db.commit()
     db.refresh(attendance)
 
-    if payload.shift_code and emp.keycloak_user_id:
-        shift_rec = db.query(Shift).filter(
-            Shift.keycloak_user_id == emp.keycloak_user_id,
-            Shift.date == att_date,
-            Shift.shift_code == payload.shift_code,
-        ).first()
-        if shift_rec:
-            shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
-            db.commit()
+    if payload.shift_code and shift_rec:
+        shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
 
     logger.info(f"Admin {current_user['email']} created attendance for {payload.user_email} on {att_date}")
     return _to_response(db, attendance)

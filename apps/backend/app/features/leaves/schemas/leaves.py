@@ -13,6 +13,7 @@ class LeaveStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EMERGENCY = "emergency"
+    CANCELLED = "cancelled"
 
 class LeaveApplyRequest(BaseModel):
     start_date: datetime

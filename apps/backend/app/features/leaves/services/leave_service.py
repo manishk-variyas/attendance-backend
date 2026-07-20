@@ -332,8 +332,13 @@ class LeaveBusinessService:
         new_leave = self.leave_db.create(Leave, **leave_doc)
         return {"message": "Emergency leave applied", "leave_id": str(new_leave.id)}
 
-    async def get_leave_history(self, user_id: str) -> List[Dict[str, Any]]:
-        stmt = select(Leave).where(Leave.keycloak_user_id == user_id).order_by(Leave.start_date.desc())
+    async def get_leave_history(self, user_id: str, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
+        stmt = select(Leave).where(Leave.keycloak_user_id == user_id)
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        stmt = stmt.order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
         return self._enrich_leaves_with_employee(results)
 
@@ -353,6 +358,7 @@ class LeaveBusinessService:
         emails = {r.user_email for r in results if r.user_email}
         emails.update({r.approved_by for r in results if r.approved_by})
         emails.update({r.rejected_by for r in results if r.rejected_by})
+        emails.update({r.cancelled_by for r in results if r.cancelled_by})
         emp_map = {}
         if emails:
             emps = self.leave_db.db.execute(
@@ -381,10 +387,17 @@ class LeaveBusinessService:
                     desig = rej_emp.designation or ""
                     d["rejected_by"] = f"{name} ({desig})" if desig else name
 
+            if r.cancelled_by:
+                can_emp = emp_map.get(r.cancelled_by)
+                if can_emp:
+                    name = f"{can_emp.first_name} {can_emp.last_name}".strip()
+                    desig = can_emp.designation or ""
+                    d["cancelled_by"] = f"{name} ({desig})" if desig else name
+
             records.append(d)
         return records
 
-    async def get_user_leave_history(self, email: str, current_user: dict) -> List[Dict[str, Any]]:
+    async def get_user_leave_history(self, email: str, current_user: dict, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
         roles = current_user.get("roles", [])
         sql = RedmineSQLService(self.leave_db.db)
 
@@ -401,7 +414,12 @@ class LeaveBusinessService:
             if not sql.check_project_access(pm_user["id"], tr_user["id"]):
                 raise HTTPException(status_code=403, detail="You can only view leaves for users in your projects.")
 
-        stmt = select(Leave).where(Leave.user_email == email).order_by(Leave.start_date.desc())
+        stmt = select(Leave).where(Leave.user_email == email)
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        stmt = stmt.order_by(Leave.start_date.desc())
         results = self.leave_db.db.execute(stmt).scalars().all()
         return self._enrich_leaves_with_employee(results)
 
@@ -660,6 +678,8 @@ class LeaveBusinessService:
         pm_email = current_user.get("email")
         is_admin = "Admin" in roles
 
+        sql = RedmineSQLService(self.leave_db.db)
+        pm_emp = None
         pm_redmine_id = None
         if not is_admin:
             pm_emp = self.leave_db.db.execute(
@@ -667,6 +687,7 @@ class LeaveBusinessService:
             ).scalars().first()
             pm_redmine_id = pm_emp.redmine_user_id if pm_emp else None
 
+        today = date.today()
         processed = 0
         success = 0
         results = []
@@ -676,25 +697,94 @@ class LeaveBusinessService:
             if not leave:
                 results.append({"leave_id": leave_id, "status": "failed", "reason": "Not found"})
                 continue
-            if leave.approval_status != LeaveStatus.PENDING.value:
-                results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
-                continue
-            if not is_admin and leave.approver_id != pm_redmine_id:
-                results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
-                continue
+
+            if action == "cancel":
+                if leave.approval_status == LeaveStatus.EMERGENCY.value:
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": "Emergency leaves cannot be cancelled"})
+                    continue
+                if leave.approval_status not in (LeaveStatus.PENDING.value, LeaveStatus.APPROVED.value):
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
+                    continue
+                if leave.start_date < today:
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": "Leave date has already passed"})
+                    continue
+                if leave.start_date == today:
+                    shift = self.leave_db.db.execute(
+                        select(Shift).where(
+                            Shift.keycloak_user_id == leave.keycloak_user_id,
+                            Shift.date == today,
+                        )
+                    ).scalars().first()
+                    if not shift:
+                        results.append({"leave_id": leave_id, "status": "failed", "reason": "No shift assigned for today"})
+                        continue
+                    start_time = None
+                    tz_str = "Asia/Kolkata"
+                    if shift.shift_code:
+                        sd = self.leave_db.db.execute(
+                            select(ShiftDefinition).where(ShiftDefinition.shift_code == shift.shift_code)
+                        ).scalars().first()
+                        if sd:
+                            start_time = sd.start_time
+                            tz_str = sd.timezone or "Asia/Kolkata"
+                    if not start_time:
+                        company = self.leave_db.db.execute(
+                            select(SystemSetting).where(SystemSetting.id == "company")
+                        ).scalars().first()
+                        if company and company.default_shift_start_time:
+                            start_time = company.default_shift_start_time
+                            tz_str = company.default_timezone or "Asia/Kolkata"
+                    if not start_time:
+                        results.append({"leave_id": leave_id, "status": "failed", "reason": "No shift timings configured"})
+                        continue
+                    try:
+                        tz = ZoneInfo(tz_str)
+                    except Exception:
+                        tz = ZoneInfo("Asia/Kolkata")
+                    start_dt = datetime.combine(today, start_time, tzinfo=tz)
+                    if datetime.now(tz) >= start_dt:
+                        results.append({"leave_id": leave_id, "status": "failed", "reason": "Shift has already started today"})
+                        continue
+            else:
+                if leave.approval_status != LeaveStatus.PENDING.value:
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
+                    continue
+
+            if not is_admin:
+                if action == "cancel":
+                    if pm_email == leave.user_email:
+                        pass
+                    elif "Project Manager" in roles or "Project Coordinator" in roles:
+                        tr_emp = self.leave_db.db.execute(
+                            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == leave.keycloak_user_id)
+                        ).scalars().first()
+                        if not tr_emp or not sql.check_project_access(pm_redmine_id, tr_emp.redmine_user_id):
+                            results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
+                            continue
+                    else:
+                        results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
+                        continue
+                else:
+                    if leave.approver_id != pm_redmine_id:
+                        results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
+                        continue
 
             if action == "approve":
                 await self._do_approve(leave_id, leave, current_user)
                 results.append({"leave_id": leave_id, "status": "approved"})
-            else:
+            elif action == "reject":
                 await self._do_reject(leave_id, leave, current_user)
                 results.append({"leave_id": leave_id, "status": "rejected"})
+            elif action == "cancel":
+                await self._do_cancel(leave_id, leave, current_user)
+                results.append({"leave_id": leave_id, "status": "cancelled"})
             success += 1
 
         failed = processed - success
+        action_label = {"approve": "approved", "reject": "rejected", "cancel": "cancelled"}[action]
         return {
             "processed": processed,
-            "approved" if action == "approve" else "rejected": success,
+            action_label: success,
             "failed": failed,
             "results": results,
         }
@@ -723,6 +813,33 @@ class LeaveBusinessService:
             approval_status=LeaveStatus.REJECTED.value,
             updated_at=now, rejected_at=now, rejected_by=actor_email,
         )
+
+    async def batch_cancel_leaves(self, leave_ids: list, current_user: dict) -> dict:
+        return await self._batch_process_leaves(leave_ids, current_user, action="cancel")
+
+    async def _do_cancel(self, leave_id: str, leave, current_user: dict) -> None:
+        now = datetime.utcnow()
+        actor_email = current_user.get("email")
+
+        if leave.approval_status == LeaveStatus.APPROVED.value:
+            self._reverse_balance(leave)
+
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.CANCELLED.value,
+            updated_at=now, cancelled_at=now, cancelled_by=actor_email,
+        )
+
+    def _reverse_balance(self, leave) -> None:
+        requested_days = (leave.end_date - leave.start_date).days + 1
+        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+        if not balance:
+            return
+        now = datetime.utcnow()
+        if leave.leave_type == LeaveType.EL.value:
+            self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) - requested_days, updated_at=now)
+        elif leave.leave_type == LeaveType.PL.value:
+            self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) - requested_days, updated_at=now)
 
     async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
         """Fetch all pending leaves with balance info."""

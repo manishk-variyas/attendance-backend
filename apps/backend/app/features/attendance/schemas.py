@@ -62,6 +62,7 @@ class AdminAttendanceCreate(BaseModel):
     conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
     is_late: bool = False
     remarks: Optional[str] = None
+    location_id: Optional[str] = None
 
 
 class AdminAttendanceUpdate(BaseModel):

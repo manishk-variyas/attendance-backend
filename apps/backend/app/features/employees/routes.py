@@ -267,6 +267,22 @@ async def list_my_team(
     }
 
 
+@router.get("/suggest")
+async def suggest_employees(
+    q: str = Query(..., min_length=1, description="Search prefix for email or name"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    emps = db.query(EmployeeMaster).filter(
+        EmployeeMaster.user_email.ilike(f"{q}%")
+    ).limit(10).all()
+    return [
+        {"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation}
+        for e in emps
+    ]
+
+
 @router.get("/{employee_id}")
 async def get_employee(
     employee_id: str,
@@ -753,19 +769,3 @@ async def get_employee_by_email(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
     return _employee_to_dict(emp)
-
-
-@router.get("/suggest")
-async def suggest_employees(
-    q: str = Query(..., min_length=1, description="Search prefix for email or name"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
-):
-    emps = db.query(EmployeeMaster).filter(
-        EmployeeMaster.user_email.ilike(f"{q}%")
-    ).limit(10).all()
-    return [
-        {"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation}
-        for e in emps
-    ]

@@ -33,6 +33,8 @@ async def get_stats(
 @router.get("/admin/{email}", response_model=List[LeaveHistoryItem])
 async def get_user_leave_history(
     email: str,
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
@@ -42,7 +44,7 @@ async def get_user_leave_history(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Admin, PM, or PC can view leave history."
         )
-    return await leave_service.get_user_leave_history(email, current_user)
+    return await leave_service.get_user_leave_history(email, current_user, from_date, to_date)
 
 @router.get("/users")
 async def list_leave_users(
@@ -92,7 +94,7 @@ async def get_history(
         records = await leave_service.get_team_leaves(member_emails, from_date, to_date)
         return {"total": len(records), "records": records}
 
-    records = await leave_service.get_leave_history(user_id)
+    records = await leave_service.get_leave_history(user_id, from_date, to_date)
     return {"total": len(records), "records": records}
 
 @router.get("/holidays", response_model=List[Holiday])
@@ -224,6 +226,15 @@ async def batch_reject_leaves(
     if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only Admin, PM, or PC can reject leaves.")
     return await leave_service.batch_reject_leaves(payload.leave_ids, current_user)
+
+
+@router.post("/batch/cancel")
+async def batch_cancel_leaves(
+    payload: BatchLeaveRequest,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    return await leave_service.batch_cancel_leaves(payload.leave_ids, current_user)
 
 
 @router.post("/{leave_id}/approve")

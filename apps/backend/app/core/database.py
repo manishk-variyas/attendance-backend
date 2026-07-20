@@ -92,6 +92,19 @@ def _run_migrations():
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_attendance_check_out_time ON attendance(check_out_time)"))
         conn.commit()
 
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancelled_at') THEN
+                    ALTER TABLE leaves ADD COLUMN cancelled_at TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancelled_by') THEN
+                    ALTER TABLE leaves ADD COLUMN cancelled_by VARCHAR(255);
+                END IF;
+            END $$;
+        """))
+        conn.commit()
+
 
 def get_db():
     """
