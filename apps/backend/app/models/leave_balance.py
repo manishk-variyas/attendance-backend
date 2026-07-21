@@ -10,11 +10,13 @@ class LeaveBalance(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     keycloak_user_id = Column(String(255), nullable=False, index=True)
     year = Column(Integer, nullable=False, server_default=text("EXTRACT(year FROM now())"))
+    month = Column(Integer, nullable=True)
     total_earned = Column(Float, nullable=False, server_default=text("12.0"))
     used_earned = Column(Float, nullable=False, server_default=text("0.0"))
     accrued_compoff = Column(Float, nullable=False, server_default=text("0.0"))
     consumed_compoff = Column(Float, nullable=False, server_default=text("0.0"))
     unpaid = Column(Float, nullable=False, server_default=text("0.0"))
+    modified_by = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 

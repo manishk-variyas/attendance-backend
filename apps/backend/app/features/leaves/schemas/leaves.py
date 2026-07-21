@@ -92,8 +92,9 @@ class BatchLeaveResponse(BaseModel):
 
 
 class LeaveBalanceCreate(BaseModel):
-    user_email: str = Field(..., description="Employee's email — resolves to their keycloak_user_id")
+    user_email: str = Field(..., description="Employee email — resolves to keycloak_user_id")
     year: int = Field(default_factory=lambda: datetime.now().year)
+    month: Optional[int] = Field(None, ge=1, le=12)
     total_earned: float = 12.0
     used_earned: float = 0.0
     accrued_compoff: float = 0.0
@@ -103,6 +104,7 @@ class LeaveBalanceCreate(BaseModel):
 
 class LeaveBalanceUpdate(BaseModel):
     year: Optional[int] = None
+    month: Optional[int] = Field(None, ge=1, le=12)
     total_earned: Optional[float] = None
     used_earned: Optional[float] = None
     accrued_compoff: Optional[float] = None
@@ -114,11 +116,13 @@ class LeaveBalanceResponse(BaseModel):
     id: str
     keycloak_user_id: str
     year: int
+    month: Optional[int] = None
     total_earned: float
     used_earned: float
     accrued_compoff: float
     consumed_compoff: float
     unpaid: float
+    modified_by: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

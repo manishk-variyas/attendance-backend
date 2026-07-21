@@ -21,11 +21,13 @@ def _to_response(b: LeaveBalance) -> dict:
         "id": str(b.id),
         "keycloak_user_id": b.keycloak_user_id,
         "year": b.year,
+        "month": b.month,
         "total_earned": b.total_earned,
         "used_earned": b.used_earned,
         "accrued_compoff": b.accrued_compoff,
         "consumed_compoff": b.consumed_compoff,
         "unpaid": b.unpaid,
+        "modified_by": b.modified_by,
         "created_at": b.created_at,
         "updated_at": b.updated_at,
     }
@@ -51,22 +53,25 @@ async def create_leave_balance(
         LeaveBalance,
         keycloak_user_id=emp.keycloak_user_id,
         year=payload.year,
+        month=payload.month,
     )
     if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Leave balance already exists for {payload.user_email} in year {payload.year}",
-        )
+        update_data = payload.model_dump(exclude={"user_email"})
+        update_data["modified_by"] = current_user.get("email")
+        updated = bal_svc.update(LeaveBalance, existing.id, **update_data)
+        return _to_response(updated)
 
     bal = bal_svc.create(
         LeaveBalance,
         keycloak_user_id=emp.keycloak_user_id,
         year=payload.year,
+        month=payload.month,
         total_earned=payload.total_earned,
         used_earned=payload.used_earned,
         accrued_compoff=payload.accrued_compoff,
         consumed_compoff=payload.consumed_compoff,
         unpaid=payload.unpaid,
+        modified_by=current_user.get("email"),
     )
     return _to_response(bal)
 
@@ -131,6 +136,7 @@ async def update_leave_balance_by_user(
     if not update_data:
         return _to_response(bal)
 
+    update_data["modified_by"] = current_user.get("email")
     updated = bal_svc.update(LeaveBalance, bal.id, **update_data)
     return _to_response(updated)
 
@@ -152,6 +158,7 @@ async def update_leave_balance(
     if not update_data:
         return _to_response(existing)
 
+    update_data["modified_by"] = current_user.get("email")
     bal = svc.update(LeaveBalance, balance_id, **update_data)
     return _to_response(bal)
 

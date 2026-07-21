@@ -186,6 +186,8 @@ async def emergency_leave(
 
 @router.get("/pending")
 async def get_pending_leaves(
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
@@ -201,7 +203,7 @@ async def get_pending_leaves(
             detail="Only Admin, PM, or PC can view pending leaves."
         )
 
-    pending_list = await leave_service.get_pending_leaves(current_user)
+    pending_list = await leave_service.get_pending_leaves(current_user, from_date, to_date)
     return pending_list
 
 @router.post("/batch/approve")

@@ -51,21 +51,16 @@ def _run_migrations():
                 END IF;
             END $$;
         """))
+        conn.commit()
 
         conn.execute(text("""
             DO $$
             BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='attendance' AND column_name='is_synced'
-                ) THEN
-                    ALTER TABLE attendance ADD COLUMN is_synced BOOLEAN NOT NULL DEFAULT false;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leave_balances' AND column_name='month') THEN
+                    ALTER TABLE leave_balances ADD COLUMN month INTEGER;
                 END IF;
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='attendance' AND column_name='server_received_at'
-                ) THEN
-                    ALTER TABLE attendance ADD COLUMN server_received_at TIMESTAMPTZ;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leave_balances' AND column_name='modified_by') THEN
+                    ALTER TABLE leave_balances ADD COLUMN modified_by VARCHAR(255);
                 END IF;
             END $$;
         """))

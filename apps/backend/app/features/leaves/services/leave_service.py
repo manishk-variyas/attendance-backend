@@ -109,14 +109,14 @@ class LeaveBusinessService:
         from_ist = leave_data.start_date
         if from_ist.tzinfo is None:
             from_ist = from_ist.replace(tzinfo=timezone.utc)
-        from_ist = from_ist.astimezone(IST)
         to_ist = leave_data.end_date
         if to_ist.tzinfo is None:
             to_ist = to_ist.replace(tzinfo=timezone.utc)
-        to_ist = to_ist.astimezone(IST)
 
-        start = from_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-        end   = to_ist.replace(hour=23, minute=59, second=59, microsecond=999999)
+        sd = from_ist.date()
+        ed = to_ist.date()
+        start = datetime.combine(sd, datetime.min.time(), tzinfo=timezone.utc).astimezone(IST)
+        end   = datetime.combine(ed, datetime.min.time(), tzinfo=timezone.utc).astimezone(IST)
 
         # Determine requested days and overlap check dates
         if leave_data.leave_dates:
@@ -151,7 +151,7 @@ class LeaveBusinessService:
         if completed_att:
             raise HTTPException(
                 status_code=400,
-                detail=f"Shift already completed on {completed_att.attendance_date}. Cannot apply for leave."
+                detail=f"You have already completed your shift on {completed_att.attendance_date}. Leave cannot be applied for a completed work day."
             )
 
         # Check for overlaps
@@ -841,13 +841,12 @@ class LeaveBusinessService:
         elif leave.leave_type == LeaveType.PL.value:
             self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) - requested_days, updated_at=now)
 
-    async def get_pending_leaves(self, current_user: dict) -> List[Dict[str, Any]]:
+    async def get_pending_leaves(self, current_user: dict, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
         """Fetch all pending leaves with balance info."""
         roles = current_user.get("roles", [])
 
         if "Admin" in roles:
-            stmt = select(Leave).where(Leave.approval_status == LeaveStatus.PENDING.value).order_by(Leave.created_at.desc())
-            results = self.leave_db.db.execute(stmt).scalars().all()
+            stmt = select(Leave).where(Leave.approval_status == LeaveStatus.PENDING.value)
         else:
             sql = RedmineSQLService(self.leave_db.db)
             pm_user = sql.get_user_by_email(current_user.get("email"))
@@ -856,12 +855,29 @@ class LeaveBusinessService:
             stmt = select(Leave).where(
                 Leave.approval_status == LeaveStatus.PENDING.value,
                 Leave.approver_id == int(pm_user["id"])
-            ).order_by(Leave.created_at.desc())
-            results = self.leave_db.db.execute(stmt).scalars().all()
+            )
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        stmt = stmt.order_by(Leave.created_at.desc())
+        results = self.leave_db.db.execute(stmt).scalars().all()
+
+        emails = {r.user_email for r in results if r.user_email}
+        emp_map = {}
+        if emails:
+            emps = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email.in_(emails))
+            ).scalars().all()
+            for e in emps:
+                emp_map[e.user_email] = e
 
         pending = []
         for r in results:
             d = r.to_dict()
+            emp = emp_map.get(r.user_email)
+            d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
+            d["userDesignation"] = emp.designation if emp else None
             balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=r.keycloak_user_id)
             requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
             d["requested_days"] = requested_days
