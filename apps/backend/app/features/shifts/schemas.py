@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 
 
 class ShiftCreate(BaseModel):
@@ -26,6 +27,11 @@ class ShiftCreate(BaseModel):
     pincode: Optional[str] = Field(None, max_length=10)
     perDiemEligible: bool = False
     conveyanceEligible: bool = False
+
+    @field_validator("timezone")
+    @classmethod
+    def coerce_timezone(cls, v: str) -> str:
+        return REDMINE_TO_IANA_TZ.get(v, v)
 
 
 class ShiftBulkCreate(BaseModel):
@@ -129,6 +135,11 @@ class ShiftDefinitionCreate(BaseModel):
     endTime: str
     timezone: str = "Asia/Kolkata"
     country: str = ""
+
+    @field_validator("timezone")
+    @classmethod
+    def coerce_timezone(cls, v: str) -> str:
+        return REDMINE_TO_IANA_TZ.get(v, v)
 
 
 class ShiftDefinitionResponse(BaseModel):

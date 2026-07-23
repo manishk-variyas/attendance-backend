@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 
 
 class EmployeeCreate(BaseModel):
@@ -12,7 +13,8 @@ class EmployeeCreate(BaseModel):
     employee_id: Optional[str] = Field(None, max_length=50)
     work_location_status: Optional[str] = None
     work_address: Optional[str] = "N/A"
-    home_address: Optional[str] = None
+    current_address: Optional[str] = None
+    permanent_address: Optional[str] = None
     contact_number: Optional[str] = Field(None, max_length=15)
     alt_contact_number: Optional[str] = Field(None, max_length=15)
     country: Optional[str] = Field("", max_length=50)
@@ -33,7 +35,8 @@ class UserProfileResponse(BaseModel):
     contact_number: Optional[str] = None
     alt_contact_number: Optional[str] = None
     work_address: Optional[str] = None
-    home_address: Optional[str] = None
+    current_address: Optional[str] = None
+    permanent_address: Optional[str] = None
     reports_to_name: Optional[str] = None
     is_active: bool
     joined_at: Optional[str] = None
@@ -52,7 +55,8 @@ class EmployeeResponse(BaseModel):
     employee_id: Optional[str] = None
     work_location_status: Optional[str] = None
     work_address: Optional[str] = None
-    home_address: Optional[str] = None
+    current_address: Optional[str] = None
+    permanent_address: Optional[str] = None
     contact_number: Optional[str] = None
     alt_contact_number: Optional[str] = None
     country: Optional[str] = None
@@ -61,6 +65,7 @@ class EmployeeResponse(BaseModel):
     location_id: Optional[str] = None
     reports_to: Optional[int] = None
     reports_to_name: Optional[str] = None
+    joining_date: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -101,7 +106,8 @@ class EmployeeUpdate(BaseModel):
     contact_number: Optional[str] = Field(None, max_length=15)
     alt_contact_number: Optional[str] = Field(None, max_length=15)
     work_address: Optional[str] = None
-    home_address: Optional[str] = None
+    current_address: Optional[str] = None
+    permanent_address: Optional[str] = None
     work_location_status: Optional[str] = None
     country: Optional[str] = Field(None, max_length=50)
     timezone: Optional[str] = None
@@ -112,6 +118,11 @@ class EmployeeUpdate(BaseModel):
     project_id: Optional[int] = None
     redmine_role_name: Optional[str] = None
     keycloak_role_name: Optional[str] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def coerce_timezone(cls, v: str) -> str:
+        return REDMINE_TO_IANA_TZ.get(v, v) if v else v
 
 
 class DisonboardRequest(BaseModel):

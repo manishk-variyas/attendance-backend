@@ -15,7 +15,6 @@ How it works:
 5. Backend sets an HTTP-only cookie with the session ID
 6. Browser only gets the session cookie, not the actual JWTs
 """
-import json
 import logging
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Form, BackgroundTasks
@@ -25,7 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit
+from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.models.employee_master import EmployeeMaster
@@ -197,7 +196,6 @@ async def refresh_session_endpoint(
 
 
 @router.post("/logout")
-@router.get("/logout")
 async def logout(request: Request):
     """
     Logout endpoint - ends the user's session.
@@ -288,6 +286,7 @@ async def signup(
     request: Request,
     signup_data: SignupRequest,
     background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
     # Enforce admin-only access — the dependency chain resolves
     # get_current_user first, then checks for the "admin" realm role.
     current_user: dict = Depends(get_current_user),
@@ -304,8 +303,7 @@ async def signup(
 
     try:
         logger.info(f"Admin {current_user.get('username')} is creating user {signup_data.username}")
-        # Pass timezone so Keycloak embeds it as a user attribute → JWT claim
-        user_id = await create_keycloak_user(signup_data.username, signup_data.email, signup_data.timezone)
+        user_id = await create_keycloak_user(signup_data.username, signup_data.email)
         await set_keycloak_password(user_id, signup_data.password)
 
         # Assign Keycloak realm role (defaults to "Technical Resource")
@@ -320,19 +318,19 @@ async def signup(
             extra={"username": signup_data.username, "client_ip": client_ip},
         )
 
-        # Note: Sync to Redmine in the background
-        # This keeps the signup request fast and responsive
-        # Pass the password so Redmine credentials match Keycloak
-        # Pass the timezone so Redmine's user preferences.time_zone is in sync
+        # Sync to Redmine in the background
         background_tasks.add_task(
             redmine_service.create_user,
             username=signup_data.username,
             email=signup_data.email,
             password=signup_data.password,
-            timezone=signup_data.timezone,
         )
-        # Original call (no password passed):
-        # background_tasks.add_task(redmine_service.create_user, signup_data.username, signup_data.email)
+
+        # Store timezone in our own employee_master table
+        svc = BaseService[EmployeeMaster](db)
+        emp = svc.fetch_one(EmployeeMaster, user_email=signup_data.email)
+        if emp:
+            svc.update(EmployeeMaster, emp.id, timezone=signup_data.timezone)
 
         return SignupResponse(
             message="User created successfully",

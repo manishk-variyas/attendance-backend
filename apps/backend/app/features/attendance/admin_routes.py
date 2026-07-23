@@ -17,14 +17,17 @@ from app.models.leave import Leave
 from app.services.database.base_service import BaseService
 from zoneinfo import ZoneInfo
 
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/attendance", tags=["admin-attendance"])
 
 
 def _safe_zone(tz_str: str) -> ZoneInfo:
+    iana = REDMINE_TO_IANA_TZ.get(tz_str, tz_str)
     try:
-        return ZoneInfo(tz_str)
+        return ZoneInfo(iana)
     except Exception:
         return ZoneInfo("Asia/Kolkata")
 

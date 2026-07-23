@@ -14,6 +14,7 @@ Schemas vs Models:
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List
 from zoneinfo import available_timezones
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 
 class UserResponse(BaseModel):
     """
@@ -63,12 +64,10 @@ class SignupRequest(BaseModel):
             raise ValueError("Password must be at most 20 characters")
         return v
 
-    # @field_validator("timezone")
-    # @classmethod
-    # def validate_timezone(cls, v: str) -> str:
-    #     if v not in available_timezones():
-    #         raise ValueError(f"'{v}' is not a valid IANA timezone name")
-    #     return v
+    @field_validator("timezone")
+    @classmethod
+    def coerce_timezone(cls, v: str) -> str:
+        return REDMINE_TO_IANA_TZ.get(v, v)
 
 
 # class SignupRequest(BaseModel):

@@ -22,12 +22,13 @@ router = APIRouter(prefix="/leaves", tags=["leaves"])
 
 @router.get("/stats", response_model=LeaveStats)
 async def get_stats(
+    year: Optional[int] = Query(None, ge=2000, description="Year (default: current)"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Filter by month"),
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    """Get summarized leave stats for the dashboard cards."""
     user_id = current_user.get("sub")
-    stats = await leave_service.get_leave_stats(user_id)
+    stats = await leave_service.get_leave_stats(user_id, year, month)
     return stats
 
 @router.get("/admin/{email}", response_model=List[LeaveHistoryItem])

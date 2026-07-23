@@ -45,7 +45,8 @@ async def get_my_profile(
         "contact_number": emp.contact_number,
         "alt_contact_number": emp.alt_contact_number,
         "work_address": emp.work_address,
-        "home_address": emp.home_address,
+        "current_address": emp.current_address,
+        "permanent_address": emp.permanent_address,
         "reports_to_name": emp.reports_to_name,
         "is_active": emp.is_active,
         "title": emp.title,
@@ -114,7 +115,8 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
         "employee_id": e.employee_id,
         "work_location_status": e.work_location_status,
         "work_address": e.work_address,
-        "home_address": e.home_address,
+        "current_address": e.current_address,
+        "permanent_address": e.permanent_address,
         "contact_number": e.contact_number,
         "alt_contact_number": e.alt_contact_number,
         "country": e.country,
@@ -265,6 +267,36 @@ async def list_my_team(
             ],
         } for e in employees],
     }
+
+
+@router.get("/my-team/emails")
+async def list_my_team_emails(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" in roles:
+        emps = db.query(EmployeeMaster).order_by(EmployeeMaster.first_name).all()
+        return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
+
+    if "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    pm_user = sql.get_user_by_email(current_user.get("email"))
+    if not pm_user:
+        raise HTTPException(status_code=403, detail="Not found in Redmine.")
+
+    member_ids = sql.get_team_member_ids(pm_user["id"])
+    member_ids.add(pm_user["id"])
+
+    emps = db.query(EmployeeMaster).filter(
+        EmployeeMaster.redmine_user_id.in_(member_ids)
+    ).order_by(EmployeeMaster.first_name).all()
+
+    return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
 
 
 @router.get("/suggest")
@@ -572,7 +604,8 @@ async def update_employee(
         "contact_number": "contact_number",
         "alt_contact_number": "alt_contact_number",
         "work_address": "work_address",
-        "home_address": "home_address",
+        "current_address": "current_address",
+        "permanent_address": "permanent_address",
         "work_location_status": "work_location_status",
         "country": "country",
         "location_id": "location_id",
@@ -580,6 +613,7 @@ async def update_employee(
         "user_email": "user_email",
         "title": "title",
         "joining_date": "joining_date",
+        "timezone": "timezone",
     }
     update_data = {}
     for payload_key, db_col in db_fields.items():
@@ -599,9 +633,6 @@ async def update_employee(
             kc_data["lastName"] = changes["last_name"]
         if "user_email" in changes:
             kc_data["email"] = changes["user_email"]
-        if "timezone" in changes:
-            kc_data["attributes"] = {"timezone": [changes["timezone"]]}
-
         if kc_data:
             try:
                 ok = await update_keycloak_user(emp.keycloak_user_id, kc_data)

@@ -19,6 +19,7 @@ from app.models.location import UserLocation
 from app.models.holiday import Holiday
 from app.models.leave_balance import LeaveBalance
 from app.models.leave import Leave
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
 
@@ -56,8 +57,9 @@ def _determine_work_location(db: Session, user_lat: float, user_lng: float, loca
 
 
 def _safe_zone(tz_str: str) -> ZoneInfo:
+    iana = REDMINE_TO_IANA_TZ.get(tz_str, tz_str)
     try:
-        return ZoneInfo(tz_str)
+        return ZoneInfo(iana)
     except Exception:
         return ZoneInfo("Asia/Kolkata")
 
@@ -127,6 +129,30 @@ def _resolve_timestamp(client_timestamp: Optional[datetime]) -> tuple[datetime, 
     if now - client_timestamp > timedelta(hours=24):
         return now, False
     return client_timestamp, True
+
+
+def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
+                         check_in_time: datetime) -> Optional[Shift]:
+    """Return the shift whose active window contains check_in_time.
+    Uses shift_master.timezone for timezone-aware window computation.
+    Falls back to the latest shift by date if no window matches."""
+    sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == shift_code).first()
+    if not sd:
+        return None
+    candidates = db.query(Shift).filter(
+        Shift.keycloak_user_id == keycloak_user_id,
+        Shift.shift_code == shift_code,
+    ).all()
+    tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+    for c in candidates:
+        win_start = datetime.combine(c.date, sd.start_time, tzinfo=tz)
+        win_end = _shift_end_datetime(c.date, sd.start_time, sd.end_time, tz)
+        if win_start <= check_in_time <= win_end:
+            return c
+    if candidates:
+        candidates.sort(key=lambda x: x.date)
+        return candidates[-1]
+    return None
 
 
 def _shift_end_datetime(shift_date: date, start_time, end_time, tz: ZoneInfo) -> datetime:
@@ -216,12 +242,17 @@ async def check_in(
     shift_start_time = None
     shift_tz = "Asia/Kolkata"
 
+    # Widen date range so overnight / timezone-crossing shifts are visible
+    # when the server runs on UTC (same fix as /today endpoint).
+    q_start = target_date - timedelta(days=1)
+    q_end = target_date + timedelta(days=1)
+
     all_shifts_today = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
             or_(
-                Shift.date == target_date,
-                and_(Shift.end_date.is_not(None), Shift.end_date >= target_date),
+                Shift.date.in_([q_start, target_date, q_end]),
+                and_(Shift.end_date.is_not(None), Shift.end_date >= q_start),
             ),
         )
     ).all()
@@ -247,8 +278,9 @@ async def check_in(
             if not sd:
                 continue
             tz = _safe_zone(sd.timezone or "Asia/Kolkata")
-            start_dt = datetime.combine(target_date, sd.start_time, tzinfo=tz)
-            end_dt = _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz)
+            # Use the shift's own calendar date — same timezone-aware fix as _pick_shift
+            start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
+            end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
 
             if earliest_dt is None or start_dt < earliest_dt:
                 earliest_dt = start_dt
@@ -420,6 +452,18 @@ async def check_out(
     if payload.remarks:
         attendance.remarks = payload.remarks
 
+    # Determine effective shift date (timezone-aware) for early-leave check.
+    # Look up the matching shift first so we use shift.date (e.g. July 22 IST)
+    # instead of att.attendance_date (UTC July 21) for the end-time comparison.
+    eff_date = attendance.attendance_date
+    if attendance.shift_code and attendance.keycloak_user_id:
+        shift_rec = _find_matching_shift(
+            db, attendance.keycloak_user_id, attendance.shift_code, attendance.check_in_time
+        )
+        if shift_rec:
+            eff_date = shift_rec.date
+            shift_rec.status = "Ended"
+
     shift_start_time = None
     shift_end_time = None
     end_tz = "Asia/Kolkata"
@@ -435,7 +479,7 @@ async def check_out(
             shift_end_time = company.default_shift_end_time
             end_tz = company.default_timezone or "Asia/Kolkata"
     if shift_end_time and attendance.check_out_time.tzinfo:
-        shift_end_dt = _shift_end_datetime(attendance.attendance_date, shift_start_time, shift_end_time, _safe_zone(end_tz))
+        shift_end_dt = _shift_end_datetime(eff_date, shift_start_time, shift_end_time, _safe_zone(end_tz))
         if attendance.check_out_time < shift_end_dt:
             attendance.remarks = (attendance.remarks or "") + " | Early leave"
 
@@ -450,24 +494,6 @@ async def check_out(
         else:
             db.add(UserLocation(email=user_email, latitude=payload.latitude, longitude=payload.longitude, location_name=attendance.check_out_location_name, updated_at=attendance.check_out_time))
         db.commit()
-
-    if attendance.shift_code and attendance.keycloak_user_id and attendance.attendance_date:
-        shift_rec = db.query(Shift).filter(
-            and_(
-                Shift.keycloak_user_id == attendance.keycloak_user_id,
-                Shift.date == attendance.attendance_date,
-            )
-        ).first()
-        if not shift_rec:
-            shift_rec = db.query(Shift).filter(
-                and_(
-                    Shift.keycloak_user_id == attendance.keycloak_user_id,
-                    Shift.end_date.is_not(None),
-                    Shift.end_date >= attendance.attendance_date,
-                )
-            ).first()
-        if shift_rec:
-            shift_rec.status = "Ended"
 
     db.commit()
     db.refresh(attendance)
@@ -676,13 +702,18 @@ async def get_today_attendance(
         Leave.end_date >= today,
     ).first()
 
-    # 2. Find shifts covering today (single-day: date==today, multi-day: date<=today AND end_date>=today)
+    # 2. Find shifts covering today (±1 calendar day to handle any timezone).
+    #    A night shift at 00:00 IST on "July 22" has UTC start ~July 21 18:30.
+    #    Querying only date==today(UTC) would miss it.  Widening by one day on
+    #    each side lets _pick_shift (which uses the shift's own timezone from
+    #    shift_master.timezone) correctly decide which shift is active right now.
+    tomorrow = today + timedelta(days=1)
     shifts_today = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
             or_(
-                Shift.date == today,
-                and_(Shift.end_date.is_not(None), Shift.end_date >= today),
+                Shift.date.in_([yesterday, today, tomorrow]),
+                and_(Shift.end_date.is_not(None), Shift.end_date >= yesterday),
             ),
         )
     ).order_by(Shift.date.asc()).all()
@@ -692,12 +723,17 @@ async def get_today_attendance(
 
     if picked:
         shift, sd, tz, start_dt, end_dt = picked
-        if shift.date > today:
+        if shift.date > tomorrow:
             return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
+        # Attendance may be stored with a UTC date that differs from shift.date
+        # when the shift crosses the UTC midnight boundary (e.g. 00-07 IST on
+        # July 22 has check-in at UTC July 21).  Check ±1 day around shift.date.
+        date_before = shift.date - timedelta(days=1)
+        date_after  = shift.date + timedelta(days=1)
         shift_att = db.query(Attendance).filter(
             and_(
                 Attendance.keycloak_user_id == keycloak_user_id,
-                Attendance.attendance_date == today,
+                Attendance.attendance_date.in_([date_before, shift.date, date_after]),
             )
         ).first()
 
@@ -746,8 +782,11 @@ def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> 
         if not sd:
             continue
         tz = _safe_zone(sd.timezone or "Asia/Kolkata")
-        start_dt = datetime.combine(target_date, sd.start_time, tzinfo=tz)
-        end_dt = _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz)
+        # Use the shift's own calendar date (e.g. July 22 IST) so overnight
+        # shifts that cross the UTC date boundary produce correct start/end
+        # datetimes rather than being pinned to a UTC "today" they don't belong to.
+        start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
+        end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
 
         if earliest_dt is None or start_dt < earliest_dt:
             earliest_dt = start_dt
@@ -767,35 +806,43 @@ def _build_status_response(db: Session, att: Attendance, today: date, status: st
     shift_info = None
     shift_start_dt = None
     shift_end_dt = None
+    sd = None
     if att.shift_code:
         sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == att.shift_code).first()
         if sd:
+            # Use the shared helper to find which shift's window contains the
+            # check-in time — handles night shifts crossing UTC midnight correctly.
+            srec = _find_matching_shift(
+                db, att.keycloak_user_id, att.shift_code, att.check_in_time
+            )
+            effective_date = srec.date if srec else att.attendance_date
+
             tz = _safe_zone(sd.timezone or "Asia/Kolkata")
             if sd.start_time:
-                shift_start_dt = datetime.combine(att.attendance_date, sd.start_time, tzinfo=tz)
+                shift_start_dt = datetime.combine(effective_date, sd.start_time, tzinfo=tz)
             if sd.end_time:
-                shift_end_dt = _shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, tz)
+                shift_end_dt = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
             shift_info = {
                 "shift_code": att.shift_code,
                 "shift_name": sd.shift_name,
-                "date": att.attendance_date.isoformat(),
+                "date": effective_date.isoformat(),
                 "work_location_status": att.work_location_status,
                 "start_time": shift_start_dt.isoformat() if shift_start_dt else None,
                 "end_time": shift_end_dt.isoformat() if shift_end_dt else None,
             }
-            srec = db.query(Shift).filter(
-                Shift.keycloak_user_id == att.keycloak_user_id,
-                Shift.date == att.attendance_date,
-            ).first()
             if srec:
                 shift_info["project_id"] = srec.project_id
                 shift_info["project_name"] = srec.project_name
 
+    rem_tz = _safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
+    rem_end = None
+    if sd and sd.end_time:
+        rem_end = _shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, rem_tz)
     remaining = 0.0
     if att.check_out_time:
         remaining = 0.0
-    elif shift_end_dt:
-        remaining = round(max((shift_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600, 0), 2)
+    elif rem_end:
+        remaining = round(max((rem_end - datetime.now(timezone.utc)).total_seconds() / 3600, 0), 2)
     else:
         remaining = None
 
@@ -810,13 +857,17 @@ def _build_status_response(db: Session, att: Attendance, today: date, status: st
 def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: ZoneInfo, target_date: date) -> dict:
     shift_info = None
     if sd:
+        # Use the shift's own calendar date so overnight / timezone-crossing
+        # shifts show their correct date instead of the UTC "today" that was
+        # used to widen the query window.
+        effective_date = shift.date
         shift_info = {
             "shift_code": shift.shift_code,
             "shift_name": sd.shift_name,
-            "date": target_date.isoformat(),
+            "date": effective_date.isoformat(),
             "work_location_status": shift.work_location_status,
-            "start_time": datetime.combine(target_date, sd.start_time, tzinfo=tz).isoformat() if sd.start_time else None,
-            "end_time": _shift_end_datetime(target_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
+            "start_time": datetime.combine(effective_date, sd.start_time, tzinfo=tz).isoformat() if sd.start_time else None,
+            "end_time": _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
             "project_id": shift.project_id,
             "project_name": shift.project_name,
         }

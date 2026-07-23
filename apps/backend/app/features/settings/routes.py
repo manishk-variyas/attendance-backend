@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.features.auth.dependencies import require_admin
 from app.utils.storage import storage_service
 from app.services.database.system_setting_service import SystemSettingService
+from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from datetime import datetime, timezone
 import logging
 
@@ -82,7 +83,7 @@ async def update_settings(
         logo_content_type=logo_content_type,
         default_shift_start_time=default_shift_start_time,
         default_shift_end_time=default_shift_end_time,
-        default_timezone=default_timezone,
+        default_timezone=REDMINE_TO_IANA_TZ.get(default_timezone, default_timezone) if default_timezone else default_timezone,
         grace_minutes=grace_minutes,
     )
     settings = svc.fetch()

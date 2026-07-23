@@ -151,7 +151,7 @@ class LeaveBusinessService:
         if completed_att:
             raise HTTPException(
                 status_code=400,
-                detail=f"You have already completed your shift on {completed_att.attendance_date}. Leave cannot be applied for a completed work day."
+                detail=f"You already worked on {completed_att.attendance_date}. Leave can only be applied before your shift starts."
             )
 
         # Check for overlaps
@@ -209,7 +209,14 @@ class LeaveBusinessService:
         self.leave_db.db.commit()
         leave_ids = [str(row.id) for row in result]
 
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+        balance = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == user_id,
+                LeaveBalance.year == leave_data.start_date.year,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
+
         balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
         if balance and leave_data.leave_type in (LeaveType.EL, LeaveType.PL):
             if leave_data.leave_type == LeaveType.EL:
@@ -305,7 +312,13 @@ class LeaveBusinessService:
             shift.work_location_status = "LEAVE"
             self.leave_db.db.commit()
 
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+        balance = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == leave_data.keycloak_user_id,
+                LeaveBalance.year == leave_data.start_date.year,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
         if not balance:
             self.balance_db.create(LeaveBalance,
                 keycloak_user_id=user_id,
@@ -530,9 +543,33 @@ class LeaveBusinessService:
             "total_processed": len(parsed_holidays)
         }
 
-    async def get_leave_stats(self, user_id: str) -> Dict[str, Any]:
-        """Calculate and fetch dashboard stats with used/total breakdown."""
-        balance_doc = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=user_id)
+    async def get_leave_stats(self, user_id: str, year: int = None, month: int = None) -> Dict[str, Any]:
+        yr = year or date.today().year
+        mo = month or date.today().month
+        if mo:
+            balance_doc = self.balance_db.db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.keycloak_user_id == user_id,
+                    LeaveBalance.year == yr,
+                    LeaveBalance.month == mo,
+                )
+            ).scalars().first()
+            if not balance_doc:
+                balance_doc = self.balance_db.db.execute(
+                    select(LeaveBalance).where(
+                        LeaveBalance.keycloak_user_id == user_id,
+                        LeaveBalance.year == yr,
+                        LeaveBalance.month.is_(None),
+                    )
+                ).scalars().first()
+        else:
+            balance_doc = self.balance_db.db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.keycloak_user_id == user_id,
+                    LeaveBalance.year == yr,
+                    LeaveBalance.month.is_(None),
+                )
+            ).scalars().first()
         
         stmt = select(Leave.leave_type, func.count(Leave.id)).where(
             Leave.keycloak_user_id == user_id, 
@@ -555,7 +592,9 @@ class LeaveBusinessService:
             "used_paid": balance_doc.consumed_compoff if balance_doc else 0.0,
             "total_unpaid": 0,
             "used_unpaid": used_map.get(LeaveType.UPL.value, 0.0),
-            "pending_applications": pending_count or 0
+            "pending_applications": pending_count or 0,
+            "year": yr,
+            "month": month or mo,
         }
         return stats
 
@@ -595,7 +634,12 @@ class LeaveBusinessService:
 
         # ── Calculate requested leave days ─────────────────────────────────
         requested_days = (leave.end_date - leave.start_date).days + 1
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+        balance = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
 
         # ── Balance check (info only, no block) ────────────────────────────
         leave_type = leave.leave_type
@@ -715,36 +759,21 @@ class LeaveBusinessService:
                             Shift.date == today,
                         )
                     ).scalars().first()
-                    if not shift:
-                        results.append({"leave_id": leave_id, "status": "failed", "reason": "No shift assigned for today"})
-                        continue
-                    start_time = None
-                    tz_str = "Asia/Kolkata"
-                    if shift.shift_code:
+                    if shift and shift.shift_code:
                         sd = self.leave_db.db.execute(
                             select(ShiftDefinition).where(ShiftDefinition.shift_code == shift.shift_code)
                         ).scalars().first()
-                        if sd:
+                        if sd and sd.start_time:
                             start_time = sd.start_time
                             tz_str = sd.timezone or "Asia/Kolkata"
-                    if not start_time:
-                        company = self.leave_db.db.execute(
-                            select(SystemSetting).where(SystemSetting.id == "company")
-                        ).scalars().first()
-                        if company and company.default_shift_start_time:
-                            start_time = company.default_shift_start_time
-                            tz_str = company.default_timezone or "Asia/Kolkata"
-                    if not start_time:
-                        results.append({"leave_id": leave_id, "status": "failed", "reason": "No shift timings configured"})
-                        continue
-                    try:
-                        tz = ZoneInfo(tz_str)
-                    except Exception:
-                        tz = ZoneInfo("Asia/Kolkata")
-                    start_dt = datetime.combine(today, start_time, tzinfo=tz)
-                    if datetime.now(tz) >= start_dt:
-                        results.append({"leave_id": leave_id, "status": "failed", "reason": "Shift has already started today"})
-                        continue
+                            try:
+                                tz = ZoneInfo(tz_str)
+                            except Exception:
+                                tz = ZoneInfo("Asia/Kolkata")
+                            start_dt = datetime.combine(today, start_time, tzinfo=tz)
+                            if datetime.now(tz) >= start_dt:
+                                results.append({"leave_id": leave_id, "status": "failed", "reason": "Shift has already started today"})
+                                continue
             else:
                 if leave.approval_status != LeaveStatus.PENDING.value:
                     results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
@@ -798,7 +827,13 @@ class LeaveBusinessService:
             approval_status=LeaveStatus.APPROVED.value,
             updated_at=now, approved_at=now, approved_by=actor_email,
         )
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+        balance = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
+                LeaveBalance.year == leave.start_date.year,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
         if balance:
             if leave.leave_type == LeaveType.EL.value:
                 self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
@@ -832,7 +867,13 @@ class LeaveBusinessService:
 
     def _reverse_balance(self, leave) -> None:
         requested_days = (leave.end_date - leave.start_date).days + 1
-        balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=leave.keycloak_user_id)
+        balance = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
+                LeaveBalance.year == leave.start_date.year,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
         if not balance:
             return
         now = datetime.utcnow()
@@ -878,7 +919,13 @@ class LeaveBusinessService:
             emp = emp_map.get(r.user_email)
             d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
             d["userDesignation"] = emp.designation if emp else None
-            balance = self.balance_db.fetch_one(LeaveBalance, keycloak_user_id=r.keycloak_user_id)
+            balance = self.balance_db.db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.keycloak_user_id == r.keycloak_user_id,
+                    LeaveBalance.year == r.start_date.year,
+                    LeaveBalance.month.is_(None),
+                )
+            ).scalars().first()
             requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
             d["requested_days"] = requested_days
             d["balance"] = {

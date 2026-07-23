@@ -20,6 +20,22 @@ from sqlalchemy import update as sql_update, delete as sql_delete
 logger = logging.getLogger(__name__)
 
 
+def _shift_end_datetime(shift_date, start_time, end_time, tz):
+    if start_time and end_time and end_time <= start_time:
+        shift_date += timedelta(days=1)
+    return datetime.combine(shift_date, end_time, tzinfo=tz)
+
+
+def _lookup_attendance(att_map: dict, keycloak_user_id: str, shift_date: date):
+    """Look up attendance with ±1 day tolerance to handle night shifts
+    whose check-in UTC date differs from the shift's calendar date."""
+    for delta in (0, 1, -1):
+        a = att_map.get((keycloak_user_id, shift_date + timedelta(days=delta)))
+        if a:
+            return a
+    return None
+
+
 class ShiftService:
     """Business logic for shift management now backed by PostgreSQL."""
 
@@ -236,9 +252,12 @@ class ShiftService:
         min_date = min(s.date for s in shifts)
         max_date = max(s.date for s in shifts)
 
+        # Widen attendance query by one day on each side to catch night shifts
+        # whose check-in UTC date differs from the shift's calendar date
+        # (e.g. SMNI July 22 IST → check-in stored as UTC July 21).
         att_query = db.query(Attendance).filter(
             Attendance.keycloak_user_id.in_(user_ids),
-            Attendance.attendance_date.between(min_date, max_date),
+            Attendance.attendance_date.between(min_date - timedelta(days=1), max_date + timedelta(days=1)),
         ).all()
         att_map = {(a.keycloak_user_id, a.attendance_date): a for a in att_query}
 
@@ -258,7 +277,7 @@ class ShiftService:
         for s in shifts:
             sd = sd_map.get(s.shift_code)
             leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
-            att = att_map.get((s.keycloak_user_id, s.date))
+            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date)
 
             derived_status = s.status
             if att and att.check_out_time:
@@ -274,7 +293,8 @@ class ShiftService:
                     tz = ZoneInfo("Asia/Kolkata")
                 start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
                 if datetime.now(tz) > start_dt:
-                    derived_status = "Missed"
+                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
                 else:
                     derived_status = "Yet to start"
 
@@ -304,6 +324,7 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
                 "conveyanceEligible": s.conveyance_eligible,
                 "date": s.date.isoformat() if s.date else None,
@@ -385,14 +406,9 @@ class ShiftService:
 
         att_query = db.query(Attendance).filter(
             Attendance.keycloak_user_id.in_(user_ids),
-            Attendance.attendance_date.between(min_date, max_date),
+            Attendance.attendance_date.between(min_date - timedelta(days=1), max_date + timedelta(days=1)),
         ).all()
         att_map = {(a.keycloak_user_id, a.attendance_date): a for a in att_query}
-
-        emp_map = {}
-        if shift_user_emails:
-            emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.in_(shift_user_emails)).all()
-            emp_map = {e.user_email: e for e in emps}
 
         sd_map = {}
         if shift_codes:
@@ -406,12 +422,17 @@ class ShiftService:
             Leave.end_date >= min_date,
         ).all()
 
+        emp_map = {}
+        if shift_user_emails:
+            emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.in_(shift_user_emails)).all()
+            emp_map = {e.user_email: e for e in emps}
+
         result = []
         for s in shifts:
             emp = emp_map.get(s.user_email)
             sd = sd_map.get(s.shift_code)
             leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
-            att = att_map.get((s.keycloak_user_id, s.date))
+            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date)
 
             derived_status = s.status
             if att and att.check_out_time:
@@ -427,7 +448,8 @@ class ShiftService:
                     tz = ZoneInfo("Asia/Kolkata")
                 start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
                 if datetime.now(tz) > start_dt:
-                    derived_status = "Missed"
+                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
                 else:
                     derived_status = "Yet to start"
 
@@ -457,6 +479,7 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
                 "conveyanceEligible": s.conveyance_eligible,
                 "date": s.date.isoformat() if s.date else None,
@@ -501,6 +524,7 @@ class ShiftService:
                             "shift": None, "workStatus": None, "status": "on_leave",
                             "workAddress": None, "pincode": None,
                             "leaveType": lv.leave_type,
+                            "leaveStatus": "on_leave",
                             "perDiemEligible": False, "conveyanceEligible": False,
                             "date": current.isoformat(),
                             "dayName": current.strftime("%A"),

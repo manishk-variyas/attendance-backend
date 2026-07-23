@@ -110,12 +110,8 @@ async def get_admin_token() -> str:
     return response.json()["access_token"]
 
 
-async def create_keycloak_user(username: str, email: str, timezone: str = "UTC") -> str:
-    """Create a user in Keycloak. Returns user ID.
-    
-    Stores timezone as a user attribute so it gets embedded in the JWT token
-    (requires a 'User Attribute' mapper named 'timezone' on the Keycloak client).
-    """
+async def create_keycloak_user(username: str, email: str) -> str:
+    """Create a user in Keycloak. Returns user ID."""
     admin_token = await get_admin_token()
 
     async with httpx.AsyncClient() as client:
@@ -126,10 +122,6 @@ async def create_keycloak_user(username: str, email: str, timezone: str = "UTC")
                 "email": email,
                 "enabled": True,
                 "emailVerified": False,
-                # Keycloak stores attributes as lists
-                "attributes": {
-                    "timezone": [timezone],
-                },
             },
             headers={
                 "Authorization": f"Bearer {admin_token}",

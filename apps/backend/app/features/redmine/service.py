@@ -20,38 +20,24 @@ class RedmineService:
             response.raise_for_status()
             return response.json().get("custom_fields", [])
 
-    async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: Optional[str] = None, lastname: str = "", timezone: str = "UTC"):
-        """
-        Creates a user in Redmine. If the user already exists, returns the existing user.
-        Uses the username as the default firstname if none is provided.
-
-        timezone: IANA timezone name (e.g. 'Asia/Kolkata') stored in Redmine's
-                  user preferences.time_zone. Must match Keycloak's timezone attribute
-                  so that the value is consistent across both systems.
-        """
-        # Use provided firstname or fall back to username so we can identify them
+    async def create_user(self, username: str, email: str, password: Optional[str] = None, firstname: Optional[str] = None, lastname: str = ""):
+        """Creates a user in Redmine. If already exists, returns existing user."""
         fname = firstname or username
         lname = lastname or "-"
 
-        # 1. Check for existing user (idempotency — avoid duplicates on retry)
         existing_user = await self.get_user_by_email(email)
         if existing_user:
             logger.info(f"User {email} already exists in Redmine. Sync skipped.")
             return existing_user
 
-        # 2. Create in Redmine with timezone in preferences so Redmine's
-        #    timesheet / date displays match the user's configured timezone.
         async with httpx.AsyncClient() as client:
             payload = {
-                    "user": {
+                "user": {
                     "login": username,
                     "mail": email,
                     "firstname": fname,
                     "lastname": lname,
                     "password": password or secrets.token_urlsafe(16),
-                    },
-               "pref": {
-                    "time_zone": timezone, 
                 },
             }
             # payload = {

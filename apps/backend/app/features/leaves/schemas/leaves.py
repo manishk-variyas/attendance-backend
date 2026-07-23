@@ -61,6 +61,8 @@ class LeaveStats(BaseModel):
     total_unpaid: float = 0.0
     used_unpaid: float = 0.0
     pending_applications: int = 0
+    year: Optional[int] = None
+    month: Optional[int] = None
 
 class HolidayType(str, Enum):
     GAZETTED = "GAZETTED"
@@ -92,8 +94,9 @@ class BatchLeaveResponse(BaseModel):
 
 
 class LeaveBalanceCreate(BaseModel):
-    user_email: str = Field(..., description="Employee email — resolves to keycloak_user_id")
-    year: int = Field(default_factory=lambda: datetime.now().year)
+    user_email: Optional[str] = Field(None, description="Employee email")
+    keycloak_user_id: Optional[str] = Field(None, description="Employee keycloak ID")
+    year: int = Field(default_factory=lambda: datetime.now().year, ge=2000)
     month: Optional[int] = Field(None, ge=1, le=12)
     total_earned: float = 12.0
     used_earned: float = 0.0
@@ -117,6 +120,8 @@ class LeaveBalanceResponse(BaseModel):
     keycloak_user_id: str
     year: int
     month: Optional[int] = None
+    userName: Optional[str] = None
+    userDesignation: Optional[str] = None
     total_earned: float
     used_earned: float
     accrued_compoff: float
