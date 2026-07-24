@@ -15,7 +15,10 @@ import time
 import os
 import signal
 import sys
+from datetime import datetime, timedelta
 from collections import defaultdict, deque, Counter
+
+IST = timedelta(hours=5, minutes=30)
 
 BACKEND_CONTAINER = "infra-backend-1"
 LOG_DIR = "/app/logs"
@@ -260,7 +263,7 @@ def access_entries(tail=200, search=None, cid=None):
         meta = e.get("metadata", {})
         t = e.get("time", "")
         entry = {
-            "time": t[11:19] if len(t) >= 19 else t,
+            "time": _format_ist_time(t),
             "full_time": t,
             "method": meta.get("method", msg.split(" ")[0] if msg else "-"),
             "path": meta.get("path", "-"),
@@ -303,12 +306,13 @@ def audit_entries(tail=200, search=None, cid=None):
         if _match(e, search, cid):
             t = e.get("time", "")
             entries.append({
-                "time": t[11:23] if len(t) >= 23 else "",
+                "time": _format_ist_time(t),
                 "message": e.get("message", ""),
                 "level": e.get("level", "INFO"),
                 "source": e.get("source", ""),
                 "correlation_id": e.get("correlation_id", "-"),
             })
+    entries.reverse()
     return entries
 
 
@@ -423,6 +427,14 @@ def status_distribution(tail=500):
 
 # ─── helpers ─────────────────────────────────────────────────────
 
+def _format_ist_time(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        ist = dt + IST
+        return ist.strftime("%H:%M:%S")
+    except (ValueError, TypeError):
+        return iso_str[11:19] if len(iso_str) > 19 else iso_str
+
 def _match(entry, search, cid):
     if cid and entry.get("correlation_id") != cid: return False
     if search and search.lower() not in json.dumps(entry).lower(): return False
@@ -437,7 +449,7 @@ def _to_line(entry, source):
     t = entry.get("time", "")
     return {
         "time": t,
-        "time_short": t[11:19] if len(t) >= 19 else "",
+        "time_short": _format_ist_time(t),
         "level": entry.get("level", "INFO"),
         "source": source,
         "message": entry.get("message", ""),
