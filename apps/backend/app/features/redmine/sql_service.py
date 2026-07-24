@@ -54,6 +54,50 @@ class RedmineSQLService:
             for r in rows
         ]
 
+    def get_projects_for_user_rich(self, user_id: int) -> list:
+        """Get projects with custom fields (city, office, type) for direct
+        ProjectResponse construction. Returns list of dicts."""
+        rows = self.db.execute(
+            text("""
+                SELECT p.id, p.name, p.identifier, p.status,
+                       cf.name as cf_name, cv.value as cf_value
+                FROM redmine.members m
+                JOIN redmine.projects p ON p.id = m.project_id AND p.status = 1
+                LEFT JOIN redmine.custom_values cv ON cv.customized_id = p.id
+                    AND cv.customized_type = 'Project'
+                LEFT JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                WHERE m.user_id = :user_id
+            """),
+            {"user_id": user_id},
+        ).fetchall()
+
+        _STATUS_MAP = {1: "active", 5: "closed"}
+
+        projects = {}
+        for r in rows:
+            pid = r[0]
+            if pid not in projects:
+                projects[pid] = {
+                    "id": r[0],
+                    "name": r[1],
+                    "identifier": r[2],
+                    "status": _STATUS_MAP.get(r[3], "archived"),
+                    "customerName": r[1],
+                    "city": "",
+                    "customerOfficeLocation": "",
+                    "projectType": "",
+                }
+            cf_name = r[4]
+            cf_value = r[5] or ""
+            if cf_name == "City":
+                projects[pid]["city"] = cf_value
+            elif cf_name == "Customer Office Location":
+                projects[pid]["customerOfficeLocation"] = cf_value
+            elif cf_name == "Project Type":
+                projects[pid]["projectType"] = cf_value
+
+        return list(projects.values())
+
     def get_project_members(self, project_id: int) -> list:
         rows = self.db.execute(
             text("""
@@ -183,6 +227,6 @@ class RedmineSQLService:
             """),
         ).fetchall()
         return [
-            type("Project", (), {"id": r[0], "name": r[1], "identifier": r[2], "status": r[3]})
+            {"id": r[0], "name": r[1], "identifier": r[2], "status": r[3]}
             for r in rows
         ]

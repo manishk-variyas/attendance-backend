@@ -26,6 +26,7 @@ from app.core.limiter import limiter
 from app.middleware.correlation import set_correlation_id
 from app.middleware.logging import log_requests
 from app.middleware.active_employee import active_employee_middleware
+from app.middleware.csrf import origin_validation_middleware
 from app.features.auth.routes import router as auth_router
 from app.features.auth.dependencies import get_current_user, require_active
 from app.features.redmine.routes import router as redmine_router
@@ -41,12 +42,9 @@ app = FastAPI(
     docs_url=None, redoc_url=None, openapi_url=None,
 )
 
-app.state.limiter = limiter
-app.add_middleware(SlowAPIMiddleware)
-
 # Add rate limiting middleware to track and limit requests per IP
-app.add_middleware(SlowAPIMiddleware)
 app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -74,6 +72,9 @@ app.middleware("http")(set_correlation_id)
 
 # Active-employee guard — blocks deactivated accounts globally (before any route)
 app.middleware("http")(active_employee_middleware)
+
+# CSRF Protection: Validate Origin/Referer headers for state-changing requests
+# app.middleware("http")(origin_validation_middleware)
 
 
 @app.get("/")

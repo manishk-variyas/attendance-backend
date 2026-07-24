@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://keycloak:keycloak@keycloak-db:5432/keycloak"  # PostgreSQL for Keycloak
 
     # CORS - list of allowed frontend origins
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000", "http://95.216.39.97:8086"]
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000", "http://95.216.39.97:8086", "https://attendance.variyaslabs.com"]
 
     # Rate limiting - max requests per second per IP
     RATE_LIMIT_PER_SECOND: int = 100

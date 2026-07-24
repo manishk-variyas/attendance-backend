@@ -735,11 +735,14 @@ async def get_today_attendance(
                 Attendance.keycloak_user_id == keycloak_user_id,
                 Attendance.attendance_date.in_([date_before, shift.date, date_after]),
             )
-        ).first()
+        ).order_by(Attendance.attendance_date.desc()).first()
 
         if shift_att:
-            s = "completed" if shift_att.check_out_time else "in_progress"
-            return _build_status_response(db, shift_att, today, s)
+            if shift_att.attendance_date < today and shift_att.check_out_time:
+                shift_att = None
+            else:
+                s = "completed" if shift_att.check_out_time else "in_progress"
+                return _build_status_response(db, shift_att, today, s)
 
         if on_leave_today or shift.work_location_status == "LEAVE":
             return _no_attendance_response("on_leave", shift, sd, tz, today)

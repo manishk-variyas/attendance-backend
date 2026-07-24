@@ -1,0 +1,26 @@
+[Unit]
+Description=logdash — internal log dashboard
+Documentation=https://github.com/your-org/backend-monorepo/scripts/logdash.py
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=app-backend
+WorkingDirectory=/home/app-backend/backend-monorepo/scripts
+ExecStart=/usr/bin/python3 /home/app-backend/backend-monorepo/scripts/logdash.py
+Restart=always
+RestartSec=5
+
+# Security hardening (free, safe)
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Log to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logdash
+
+[Install]
+WantedBy=multi-user.target
