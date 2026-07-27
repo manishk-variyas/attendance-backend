@@ -31,6 +31,7 @@ from app.models.employee_master import EmployeeMaster
 from app.services.database.base_service import BaseService
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
+from app.middleware.logging import _get_client_ip
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse
 from app.features.redmine.service import redmine_service
 
@@ -55,7 +56,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     import httpx
 
     correlation_id = request.state.correlation_id
-    client_ip = request.client.host if request.client else "-"
+    client_ip = _get_client_ip(request)
 
     # Send credentials to Keycloak to verify
     async with httpx.AsyncClient() as client:
@@ -136,7 +137,7 @@ async def refresh_session_endpoint(
     6. Sets a new session cookie
     """
     correlation_id = request.state.correlation_id
-    client_ip = request.client.host if request.client else "-"
+    client_ip = _get_client_ip(request)
 
     # Get the session cookie from the request
     old_session_id = request.cookies.get("session_id")
@@ -208,7 +209,7 @@ async def logout(request: Request):
     5. Clears the session cookie
     """
     correlation_id = request.state.correlation_id
-    client_ip = request.client.host if request.client else "-"
+    client_ip = _get_client_ip(request)
     username = "-"
 
     session_id = request.cookies.get("session_id")
@@ -299,7 +300,7 @@ async def signup(
     Requires a valid session with the "admin" realm role.
     """
     correlation_id = request.state.correlation_id
-    client_ip = request.client.host if request.client else "-"
+    client_ip = _get_client_ip(request)
 
     try:
         logger.info(f"Admin {current_user.get('username')} is creating user {signup_data.username}")

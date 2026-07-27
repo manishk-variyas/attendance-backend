@@ -8,6 +8,7 @@ from app.utils.storage import storage_service
 from app.services.database.system_setting_service import SystemSettingService
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from datetime import datetime, timezone
+import io
 import logging
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,9 @@ async def get_logo(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error reading logo from MinIO: {e}")
         raise HTTPException(status_code=404, detail="Logo not found.")
-    return Response(content=content, media_type=doc.logo_content_type)
+    response = Response(content=content, media_type=doc.logo_content_type)
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return response
 
 
 @router.put("", status_code=status.HTTP_200_OK)
@@ -71,7 +74,18 @@ async def update_settings(
         content = await logo.read()
         if len(content) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File size must not exceed 5MB.")
-        logo_content_type = logo.content_type
+
+        # Resize to max 600x200 (logo proportions), preserve aspect ratio, optimize JPEG
+        from PIL import Image
+        img = Image.open(io.BytesIO(content))
+        img.thumbnail((600, 200), Image.LANCZOS)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85, optimize=True)
+        content = out.getvalue()
+        logo_content_type = "image/jpeg"
+
         await storage_service.upload_file(
             content, LOGO_OBJECT_NAME,
             bucket_name=ASSETS_BUCKET,

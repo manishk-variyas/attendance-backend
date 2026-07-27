@@ -230,3 +230,26 @@ class RedmineSQLService:
             {"id": r[0], "name": r[1], "identifier": r[2], "status": r[3]}
             for r in rows
         ]
+
+    def get_trackers(self) -> list[dict]:
+        rows = self.db.execute(
+            text("SELECT id, name FROM redmine.trackers ORDER BY id"),
+        ).fetchall()
+        return [{"id": r[0], "name": r[1]} for r in rows]
+
+    def get_priorities(self) -> list[dict]:
+        rows = self.db.execute(
+            text("SELECT id, name FROM redmine.enumerations WHERE type = 'IssuePriority' ORDER BY id"),
+        ).fetchall()
+        return [{"id": r[0], "name": r[1]} for r in rows]
+
+    def is_project_member(self, user_id: int, project_id: int) -> bool:
+        row = self.db.execute(
+            text("""
+                SELECT 1 FROM redmine.members
+                WHERE user_id = :user_id AND project_id = :project_id
+                LIMIT 1
+            """),
+            {"user_id": user_id, "project_id": project_id},
+        ).fetchone()
+        return row is not None

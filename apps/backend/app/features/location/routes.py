@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, and_
 
 from app.core.database import get_db
 from app.features.location.schemas.location import LocationSaveRequest, LocationSaveResponse, LocationGetResponse
@@ -9,8 +9,22 @@ from app.features.auth.dependencies import get_current_user
 from app.services.database.location_service import LocationService
 from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
+from app.models.shift import Shift
+
+from typing import Optional
 
 router = APIRouter()
+
+
+def _active_office_for(db: Session, emp: EmployeeMaster) -> Optional[OfficeLocation]:
+    """Return the office for today's active shift, falling back to employee's home office."""
+    shift = db.query(Shift).filter(
+        and_(Shift.keycloak_user_id == emp.keycloak_user_id, Shift.date == date.today())
+    ).first()
+    location_id = shift.location_id if (shift and shift.location_id) else emp.location_id
+    if not location_id:
+        return None
+    return db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
 
 GEOFENCE_SQL = text("""
     SELECT
@@ -66,15 +80,13 @@ async def save_location(
     svc = LocationService(db)
     email = payload.email
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
-    office = None
+    office = _active_office_for(db, emp) if emp else None
     geo = None
-    if emp and emp.location_id:
-        office = db.query(OfficeLocation).filter(OfficeLocation.id == emp.location_id).first()
-        if office and office.geom is not None:
-            geo = db.execute(
-                GEOFENCE_SQL,
-                {"lng": payload.longitude, "lat": payload.latitude, "office_id": str(office.id)},
-            ).first()
+    if office and office.geom is not None:
+        geo = db.execute(
+            GEOFENCE_SQL,
+            {"lng": payload.longitude, "lat": payload.latitude, "office_id": str(office.id)},
+        ).first()
     if geo and geo.inside:
         loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
     else:
@@ -125,18 +137,17 @@ async def get_location(
     }
 
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
-    if emp and emp.location_id:
-        office = db.query(OfficeLocation).filter(OfficeLocation.id == emp.location_id).first()
-        if office and office.geom is not None:
-            result["office_name"] = office.name
-            result["office_lat"] = office.latitude
-            result["office_lng"] = office.longitude
-            geo = db.execute(
-                GEOFENCE_SQL,
-                {"lng": loc.longitude, "lat": loc.latitude, "office_id": str(office.id)},
-            ).first()
-            if geo:
-                result["is_inside_office"] = geo.inside
-                result["distance_km"] = round(geo.distance_m / 1000.0, 2)
+    office = _active_office_for(db, emp) if emp else None
+    if office and office.geom is not None:
+        result["office_name"] = office.name
+        result["office_lat"] = office.latitude
+        result["office_lng"] = office.longitude
+        geo = db.execute(
+            GEOFENCE_SQL,
+            {"lng": loc.longitude, "lat": loc.latitude, "office_id": str(office.id)},
+        ).first()
+        if geo:
+            result["is_inside_office"] = geo.inside
+            result["distance_km"] = round(geo.distance_m / 1000.0, 2)
 
     return result

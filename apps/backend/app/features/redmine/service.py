@@ -437,6 +437,16 @@ class RedmineService:
                     return r["id"]
         return 0
 
+    async def create_issue(self, issue_attrs: dict) -> dict:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.url}/issues.json",
+                json={"issue": issue_attrs},
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            return resp.json().get("issue")
+
 
 redmine_service = RedmineService()
 

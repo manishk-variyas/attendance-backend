@@ -26,6 +26,13 @@ from fastapi.responses import Response
 logger = logging.getLogger("app.access")
 
 
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "-"
+
+
 async def log_requests(request: Request, call_next) -> Response:
     """
     FastAPI middleware that logs HTTP requests with timing.
@@ -58,7 +65,7 @@ async def log_requests(request: Request, call_next) -> Response:
                 "path": request.url.path,
                 "status": response.status_code,
                 "duration_ms": round(process_time * 1000, 2),
-                "client_ip": request.client.host if request.client else "-",
+                "client_ip": _get_client_ip(request),
             },
         },
     )

@@ -186,7 +186,7 @@ async def check_in(
     _: None = Depends(require_active),
 ):
     keycloak_user_id = current_user["sub"]
-    today = date.today()
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
     target_date = today
     if payload.date:
@@ -300,21 +300,14 @@ async def check_in(
                 detail="All shifts for today have ended. No active or upcoming shift.",
             )
         s, sd, tz, start_dt, end_dt = picked
+        today = datetime.now(tz).date()
         shift_code = s.shift_code
         shift_start_time = sd.start_time
         shift_tz = sd.timezone or "Asia/Kolkata"
 
-    company = None
-    if not shift_start_time:
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        if company and company.default_shift_start_time:
-            shift_start_time = company.default_shift_start_time
-            shift_tz = company.default_timezone or "Asia/Kolkata"
-
-    if shift_start_time and now.tzinfo:
+    if shift_code and shift_start_time and now.tzinfo:
         grace_min = 0
-        if not company:
-            company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
         if company and company.grace_minutes:
             grace_min = company.grace_minutes
         shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=_safe_zone(shift_tz))
@@ -679,7 +672,7 @@ async def get_today_attendance(
 ):
     keycloak_user_id = current_user["sub"]
     now = datetime.now(timezone.utc)
-    today = date.today()
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     yesterday = today - timedelta(days=1)
 
     # 1. Open (unchecked-out) session takes priority
@@ -692,6 +685,8 @@ async def get_today_attendance(
 
     if open_att:
         s = "overnight" if open_att.attendance_date < today else "in_progress"
+        if s == "in_progress" and _shift_has_ended(db, open_att):
+            s = "shift_ended"
         return _build_status_response(db, open_att, today, s)
 
     # 1b. Check if user is on leave today (approved or emergency)
@@ -723,6 +718,9 @@ async def get_today_attendance(
 
     if picked:
         shift, sd, tz, start_dt, end_dt = picked
+        today = datetime.now(tz).date()
+        yesterday = today - timedelta(days=1)
+        tomorrow = today + timedelta(days=1)
         if shift.date > tomorrow:
             return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
         # Attendance may be stored with a UTC date that differs from shift.date
@@ -742,6 +740,8 @@ async def get_today_attendance(
                 shift_att = None
             else:
                 s = "completed" if shift_att.check_out_time else "in_progress"
+                if s == "in_progress" and end_dt and now > end_dt:
+                    s = "shift_ended"
                 return _build_status_response(db, shift_att, today, s)
 
         if on_leave_today or shift.work_location_status == "LEAVE":
@@ -803,6 +803,17 @@ def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> 
             next_upcoming = (s, sd, tz, start_dt, end_dt)
 
     return active or next_upcoming or earliest
+
+
+def _shift_has_ended(db: Session, att: Attendance) -> bool:
+    """Check if the shift associated with an open attendance has ended."""
+    if not att.shift_code or not att.check_in_time:
+        return False
+    sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == att.shift_code).first()
+    if not sd or not sd.end_time:
+        return False
+    end_dt = _shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, _safe_zone(sd.timezone or "Asia/Kolkata"))
+    return datetime.now(timezone.utc) > end_dt
 
 
 def _build_status_response(db: Session, att: Attendance, today: date, status: str) -> dict:

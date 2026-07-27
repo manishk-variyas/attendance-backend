@@ -71,7 +71,9 @@ async def get_profile_picture(
         raise HTTPException(status_code=404, detail="No profile picture found")
 
     content, content_type = await storage_service.get_file(emp.profile_picture_url, ASSETS_BUCKET)
-    return StreamingResponse(io.BytesIO(content), media_type=content_type)
+    response = StreamingResponse(io.BytesIO(content), media_type=content_type)
+    response.headers["Cache-Control"] = "private, max-age=300"
+    return response
 
 
 @router.post("/me/profile-picture")
@@ -93,8 +95,18 @@ async def upload_profile_picture(
         raise HTTPException(status_code=404, detail="Employee record not found")
 
     ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else "jpg"
-    object_name = f"profile-pictures/{emp.id}.{ext}"
-    await storage_service.upload_file(contents, object_name, bucket_name=ASSETS_BUCKET, content_type=file.content_type)
+
+    # Resize to max 500x500, preserve aspect ratio, convert to optimized JPEG
+    from PIL import Image
+    img = Image.open(io.BytesIO(contents))
+    img.thumbnail((500, 500), Image.LANCZOS)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=85, optimize=True)
+    contents = out.getvalue()
+    object_name = f"profile-pictures/{emp.id}.jpg"
+    await storage_service.upload_file(contents, object_name, bucket_name=ASSETS_BUCKET, content_type="image/jpeg")
 
     emp.profile_picture_url = object_name
     db.commit()

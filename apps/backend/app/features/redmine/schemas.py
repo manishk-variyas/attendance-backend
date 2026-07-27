@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 
 class ProjectBase(BaseModel):
@@ -88,3 +88,12 @@ class SearchResults(BaseModel):
 class SearchResponse(BaseModel):
     query: str
     results: SearchResults
+
+
+class IssueCreate(BaseModel):
+    project_id: int
+    subject: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    tracker_id: int | None = None
+    priority_id: int | None = None
+    assigned_to_id: int | None = None

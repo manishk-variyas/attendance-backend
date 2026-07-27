@@ -1,6 +1,7 @@
+import httpx
 from fastapi import APIRouter, HTTPException, Depends, status, Query
 from typing import List, Optional
-from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from .schemas import IssueCreate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
@@ -175,6 +176,7 @@ async def get_all_user_projects(
 
 @router.get("/projects/all/issues", response_model=List[IssueResponse])
 async def get_all_project_issues(
+    team: Optional[bool] = Query(False, description="Set to true to view your team's issues. Admin/PM/PC only."),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -183,23 +185,41 @@ async def get_all_project_issues(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     from app.features.redmine.sql_service import RedmineSQLService
-    from app.models.employee_master import EmployeeMaster
     sql = RedmineSQLService(db)
 
     email = current_user.get("email")
-    user = sql.get_user_by_email(email)
-    if not user:
+    current_rm_user = sql.get_user_by_email(email)
+    if not current_rm_user:
         raise HTTPException(status_code=404, detail="User not found in Redmine")
 
-    is_tr = "Technical Resource" in roles and "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles
-    assigned_only = is_tr
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+    is_tr = not is_admin and not is_pm_or_pc
 
-    if "Admin" in roles:
-        all_issues = sql.get_all_issues_admin()
-    else:
-        all_issues = sql.get_all_issues_for_user(user["id"], assigned_only=assigned_only)
+    # Own issues (default) — all roles see only assigned issues
+    if not team:
+        return sql.get_all_issues_for_user(current_rm_user["id"], assigned_only=True)
 
-    return all_issues
+    # Team issues
+    if is_admin:
+        return sql.get_all_issues_admin()
+
+    if not is_pm_or_pc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Admin, PM, or PC can view team issues.",
+        )
+
+    team_ids = sql.get_team_member_ids(current_rm_user["id"])
+    team_ids.add(current_rm_user["id"])
+    seen = set()
+    issues = []
+    for tid in team_ids:
+        for issue in sql.get_all_issues_for_user(tid, assigned_only=False):
+            if issue["id"] not in seen:
+                seen.add(issue["id"])
+                issues.append(issue)
+    return issues
 
 
 @router.get("/projects/{project_id}/issues", response_model=List[IssueResponse])
@@ -393,3 +413,79 @@ async def global_search(
             shifts=[ShiftSearchItem(**s) for s in shifts],
         ),
     )
+
+
+@router.get("/redmine/trackers")
+async def list_trackers(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all Redmine issue trackers (Bug, Feature, Support, etc.)"""
+    sql = RedmineSQLService(db)
+    return sql.get_trackers()
+
+
+@router.get("/redmine/priorities")
+async def list_priorities(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all Redmine issue priorities (Low, Normal, High, etc.)"""
+    sql = RedmineSQLService(db)
+    return sql.get_priorities()
+
+
+@router.post("/redmine/issues", status_code=201)
+async def create_redmine_issue(
+    data: IssueCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    sql = RedmineSQLService(db)
+    user = sql.get_user_by_email(email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Redmine user not found. Contact admin to sync your account.",
+        )
+
+    redmine_user_id = user["id"]
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+    is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
+
+    # Project membership check (skip for Admin)
+    if not is_admin:
+        if not sql.is_project_member(redmine_user_id, data.project_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this project",
+            )
+
+    # Build issue payload
+    issue_attrs = data.model_dump(exclude_none=True)
+    issue_attrs["author_id"] = redmine_user_id
+
+    # TR: forced self-assign (frontend handles hiding the assignee field)
+    if is_tr:
+        issue_attrs["assigned_to_id"] = redmine_user_id
+
+    try:
+        issue = await redmine_service.create_issue(issue_attrs)
+        return {"status": "success", "issue": issue}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Redmine error: {e.response.text}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to create issue: {e}",
+        )
