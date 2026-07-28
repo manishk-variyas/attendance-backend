@@ -127,12 +127,25 @@ async def list_all_projects(
 @router.post("/projects", response_model=dict)
 async def create_project(
     data: ProjectCreate,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     # Admin only
     if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
-        
+
+    # Rate limit: max 5 projects per admin per day
+    sql = RedmineSQLService(db)
+    email = current_user.get("email")
+    user = sql.get_user_by_email(email)
+    if user:
+        daily = sql.count_daily_projects(user["id"])
+        if daily >= 5:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="You can create up to 5 projects per day. Please try again tomorrow.",
+            )
+
     try:
         project = await redmine_service.create_or_update_project(data)
         return {"status": "success", "project": project}
@@ -575,12 +588,12 @@ async def create_redmine_issue(
 
     redmine_user_id = user["id"]
 
-    # Rate limit: max 5 issues per user per day
+    # Rate limit: max 50 issues per user per day
     daily_count = sql.count_daily_issues(redmine_user_id)
-    if daily_count >= 5:
+    if daily_count >= 50:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="You can create up to 5 tickets per day. Please try again tomorrow.",
+            detail="You can create up to 50 tickets per day. Please try again tomorrow.",
         )
 
     is_admin = "Admin" in roles
@@ -600,10 +613,7 @@ async def create_redmine_issue(
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": "An issue with this subject already exists in this project",
-                "existing_issue_id": existing,
-            },
+            detail="An issue with this subject already exists in this project",
         )
 
     # Build issue payload
@@ -737,6 +747,15 @@ async def update_redmine_issue(
         )
 
     redmine_user_id = user["id"]
+
+    # Rate limit: max 20 updates per user per day
+    daily = sql.count_daily_updates(redmine_user_id)
+    if daily >= 20:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="You can update up to 20 tickets per day. Please try again tomorrow.",
+        )
+
     is_admin = "Admin" in roles
     is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
     is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc

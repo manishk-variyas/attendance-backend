@@ -337,6 +337,29 @@ class RedmineSQLService:
         ).fetchone()
         return row[0] if row else 0
 
+    def count_daily_updates(self, user_id: int) -> int:
+        row = self.db.execute(
+            text("""
+                SELECT count(*) FROM redmine.journals
+                WHERE user_id = :user_id
+                  AND journalized_type = 'Issue'
+                  AND created_on::date = CURRENT_DATE
+            """),
+            {"user_id": user_id},
+        ).fetchone()
+        return row[0] if row else 0
+
+    def count_daily_projects(self, user_id: int) -> int:
+        row = self.db.execute(
+            text("""
+                SELECT count(*) FROM redmine.projects
+                WHERE author_id = :user_id
+                  AND created_on::date = CURRENT_DATE
+            """),
+            {"user_id": user_id},
+        ).fetchone()
+        return row[0] if row else 0
+
     def is_project_member(self, user_id: int, project_id: int) -> bool:
         row = self.db.execute(
             text("""
