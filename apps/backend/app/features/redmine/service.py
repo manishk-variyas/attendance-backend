@@ -437,6 +437,19 @@ class RedmineService:
                     return r["id"]
         return 0
 
+    async def upload_file(self, file_bytes: bytes, filename: str, content_type: str) -> dict:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.url}/uploads.json",
+                content=file_bytes,
+                headers={
+                    "X-Redmine-API-Key": settings.REDMINE_API_KEY,
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json().get("upload")
+
     async def create_issue(self, issue_attrs: dict) -> dict:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -446,6 +459,20 @@ class RedmineService:
             )
             resp.raise_for_status()
             return resp.json().get("issue")
+
+    async def update_issue(self, issue_id: int, issue_attrs: dict) -> dict:
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{self.url}/issues/{issue_id}.json",
+                json={"issue": issue_attrs},
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            # Redmine returns 204 No Content on success, re-fetch the issue
+            issue = await self.get_issue_by_id(issue_id)
+            if not issue:
+                return {"id": issue_id}
+            return issue
 
 
 redmine_service = RedmineService()

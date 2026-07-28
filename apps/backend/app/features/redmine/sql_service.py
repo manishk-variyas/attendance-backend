@@ -11,6 +11,19 @@ def _issue_row_to_dict(r) -> dict:
         assigned_to_name=r[8],
         created_on=r[9].isoformat() if r[9] else None,
         updated_on=r[10].isoformat() if r[10] else None,
+        start_date=r[11].isoformat() if r[11] else None,
+        due_date=r[12].isoformat() if r[12] else None,
+        estimated_hours=float(r[13]) if r[13] is not None else None,
+        done_ratio=r[14],
+        is_private=r[15],
+        status_id=r[16],
+        priority_id=r[17],
+        tracker_id=r[18],
+        assigned_to_id=r[19],
+        author_id=r[20],
+        author_name=r[21] or "",
+        attachments=r[22] if r[22] else [],
+        custom_fields=r[23] if r[23] else [],
     )
 
 
@@ -163,11 +176,34 @@ class RedmineSQLService:
                        p.name as priority, t.name as tracker,
                        i.project_id, pr.name as project_name,
                        u.firstname || ' ' || u.lastname as assigned_to,
-                       i.created_on, i.updated_on
+                       i.created_on, i.updated_on,
+                       i.start_date, i.due_date, i.estimated_hours,
+                       i.done_ratio, i.is_private,
+                       st.id as status_id, p.id as priority_id, t.id as tracker_id,
+                       i.assigned_to_id,
+                       i.author_id, auth.firstname || ' ' || auth.lastname as author_name,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', a.id, 'filename', a.filename,
+                               'content_type', a.content_type, 'filesize', a.filesize
+                           )) FROM redmine.attachments a
+                           WHERE a.container_id = i.id AND a.container_type = 'Issue'),
+                           '[]'::json
+                       ) as attachments,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', cf.id, 'name', cf.name, 'value', cv.value
+                           ) ORDER BY cf.id)
+                           FROM redmine.custom_values cv
+                           JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                           WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                           '[]'::json
+                       ) as custom_fields
                 FROM redmine.issues i
                 JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
                 JOIN redmine.members m ON m.project_id = pr.id {clauses}
                 LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+                LEFT JOIN redmine.users auth ON auth.id = i.author_id
                 JOIN redmine.issue_statuses st ON st.id = i.status_id
                 JOIN redmine.enumerations p ON p.id = i.priority_id
                 JOIN redmine.trackers t ON t.id = i.tracker_id
@@ -184,10 +220,33 @@ class RedmineSQLService:
                        p.name as priority, t.name as tracker,
                        i.project_id, pr.name as project_name,
                        u.firstname || ' ' || u.lastname as assigned_to,
-                       i.created_on, i.updated_on
+                       i.created_on, i.updated_on,
+                       i.start_date, i.due_date, i.estimated_hours,
+                       i.done_ratio, i.is_private,
+                       st.id as status_id, p.id as priority_id, t.id as tracker_id,
+                       i.assigned_to_id,
+                       i.author_id, auth.firstname || ' ' || auth.lastname as author_name,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', a.id, 'filename', a.filename,
+                               'content_type', a.content_type, 'filesize', a.filesize
+                           )) FROM redmine.attachments a
+                           WHERE a.container_id = i.id AND a.container_type = 'Issue'),
+                           '[]'::json
+                       ) as attachments,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', cf.id, 'name', cf.name, 'value', cv.value
+                           ) ORDER BY cf.id)
+                           FROM redmine.custom_values cv
+                           JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                           WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                           '[]'::json
+                       ) as custom_fields
                 FROM redmine.issues i
                 JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
                 LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+                LEFT JOIN redmine.users auth ON auth.id = i.author_id
                 JOIN redmine.issue_statuses st ON st.id = i.status_id
                 JOIN redmine.enumerations p ON p.id = i.priority_id
                 JOIN redmine.trackers t ON t.id = i.tracker_id
@@ -195,6 +254,18 @@ class RedmineSQLService:
             """),
         ).fetchall()
         return [_issue_row_to_dict(r) for r in rows]
+
+
+    def get_duplicate_issue(self, subject: str, project_id: int) -> int | None:
+        row = self.db.execute(
+            text("""
+                SELECT id FROM redmine.issues
+                WHERE subject = :subject AND project_id = :project_id
+                LIMIT 1
+            """),
+            {"subject": subject, "project_id": project_id},
+        ).fetchone()
+        return row[0] if row else None
 
 
     def get_all_users(self) -> list:
@@ -243,6 +314,29 @@ class RedmineSQLService:
         ).fetchall()
         return [{"id": r[0], "name": r[1]} for r in rows]
 
+    def get_statuses(self) -> list[dict]:
+        rows = self.db.execute(
+            text("SELECT id, name, is_closed FROM redmine.issue_statuses ORDER BY id"),
+        ).fetchall()
+        return [{"id": r[0], "name": r[1], "is_closed": r[2]} for r in rows]
+
+    def get_custom_fields(self) -> list[dict]:
+        rows = self.db.execute(
+            text("SELECT id, name, field_format FROM redmine.custom_fields WHERE type = 'IssueCustomField' ORDER BY id"),
+        ).fetchall()
+        return [{"id": r[0], "name": r[1], "field_format": r[2]} for r in rows]
+
+    def count_daily_issues(self, author_id: int) -> int:
+        row = self.db.execute(
+            text("""
+                SELECT count(*) FROM redmine.issues
+                WHERE author_id = :author_id
+                  AND created_on::date = CURRENT_DATE
+            """),
+            {"author_id": author_id},
+        ).fetchone()
+        return row[0] if row else 0
+
     def is_project_member(self, user_id: int, project_id: int) -> bool:
         row = self.db.execute(
             text("""
@@ -253,3 +347,68 @@ class RedmineSQLService:
             {"user_id": user_id, "project_id": project_id},
         ).fetchone()
         return row is not None
+
+    def search_issues(self, q: str, project_id: int | None = None, limit: int = 20) -> list[dict]:
+        q_param = f"%{q}%"
+        where = "i.subject ILIKE :q"
+        params = {"q": q_param}
+        if project_id is not None:
+            where += " AND i.project_id = :project_id"
+            params["project_id"] = project_id
+        rows = self.db.execute(
+            text(f"""
+                SELECT i.id, i.subject, t.id as tracker_id, t.name as tracker_name,
+                       s.id as status_id, s.name as status_name
+                FROM redmine.issues i
+                JOIN redmine.trackers t ON t.id = i.tracker_id
+                JOIN redmine.issue_statuses s ON s.id = i.status_id
+                WHERE {where}
+                ORDER BY i.updated_on DESC
+                LIMIT :limit
+            """),
+            {**params, "limit": limit},
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "subject": r[1],
+                "tracker_id": r[2],
+                "tracker_name": r[3],
+                "status_id": r[4],
+                "status_name": r[5],
+            }
+            for r in rows
+        ]
+
+    def get_versions(self, project_id: int) -> list[dict]:
+        rows = self.db.execute(
+            text("""
+                SELECT id, name, status, due_date, description
+                FROM redmine.versions
+                WHERE project_id = :project_id
+                ORDER BY name
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "status": r[2],
+                "due_date": r[3].isoformat() if r[3] else None,
+                "description": r[4],
+            }
+            for r in rows
+        ]
+
+    def get_categories(self, project_id: int) -> list[dict]:
+        rows = self.db.execute(
+            text("""
+                SELECT id, name
+                FROM redmine.issue_categories
+                WHERE project_id = :project_id
+                ORDER BY name
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+        return [{"id": r[0], "name": r[1]} for r in rows]

@@ -1,7 +1,12 @@
+import json
+import os
+import logging
 import httpx
-from fastapi import APIRouter, HTTPException, Depends, status, Query
+from fastapi import APIRouter, HTTPException, Depends, status, Query, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
-from .schemas import IssueCreate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
@@ -10,6 +15,34 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.features.shifts.service import shift_service
 from app.models.employee_master import EmployeeMaster
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png",
+    ".pdf",
+    ".txt", ".csv", ".log",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".webm",
+}
+
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_COUNT = 2
+
+
+def _validation_errors(e: PydanticValidationError) -> list[dict]:
+    return [
+        {"field": err["loc"][-1] if err["loc"] else "__root__", "message": err["msg"]}
+        for err in e.errors()
+    ]
+
+
+def _validate_uploaded_file(f: UploadFile):
+    ext = os.path.splitext(f.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{ext}' is not allowed. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
 
 router = APIRouter()
 
@@ -435,9 +468,84 @@ async def list_priorities(
     return sql.get_priorities()
 
 
+@router.get("/redmine/statuses")
+async def list_statuses(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all Redmine issue statuses (New, In Progress, Closed, etc.)"""
+    sql = RedmineSQLService(db)
+    return sql.get_statuses()
+
+
+@router.get("/redmine/users")
+async def list_users(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all active Redmine users for assignee/watcher dropdowns."""
+    sql = RedmineSQLService(db)
+    return sql.get_all_users()
+
+
+@router.get("/redmine/custom_fields")
+async def list_custom_fields(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all Redmine issue custom field definitions."""
+    sql = RedmineSQLService(db)
+    return sql.get_custom_fields()
+
+
+@router.get("/redmine/issues/search")
+async def search_redmine_issues(
+    q: str = Query(..., min_length=1, description="Search query"),
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Search issues by subject (ILIKE). Optionally filter by project."""
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    sql = RedmineSQLService(db)
+    return sql.search_issues(q, project_id, limit)
+
+
+@router.get("/redmine/versions")
+async def list_versions(
+    project_id: int = Query(..., description="Project ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all versions (sprint/milestones) for a project."""
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    sql = RedmineSQLService(db)
+    return sql.get_versions(project_id)
+
+
+@router.get("/redmine/categories")
+async def list_categories(
+    project_id: int = Query(..., description="Project ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return all issue categories for a project."""
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    sql = RedmineSQLService(db)
+    return sql.get_categories(project_id)
+
+
 @router.post("/redmine/issues", status_code=201)
 async def create_redmine_issue(
-    data: IssueCreate,
+    data: str = Form(...),
+    files: list[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -446,6 +554,179 @@ async def create_redmine_issue(
 
     if not roles:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    # Parse JSON data
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in data field")
+    try:
+        issue_data = IssueCreate(**parsed)
+    except PydanticValidationError as e:
+        raise HTTPException(status_code=422, detail=_validation_errors(e))
+
+    sql = RedmineSQLService(db)
+    user = sql.get_user_by_email(email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Redmine user not found. Contact admin to sync your account.",
+        )
+
+    redmine_user_id = user["id"]
+
+    # Rate limit: max 5 issues per user per day
+    daily_count = sql.count_daily_issues(redmine_user_id)
+    if daily_count >= 5:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="You can create up to 5 tickets per day. Please try again tomorrow.",
+        )
+
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+    is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
+
+    # Project membership check (skip for Admin)
+    if not is_admin:
+        if not sql.is_project_member(redmine_user_id, issue_data.project_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this project",
+            )
+
+    # Duplicate check: same subject + same project
+    existing = sql.get_duplicate_issue(issue_data.subject, issue_data.project_id)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "An issue with this subject already exists in this project",
+                "existing_issue_id": existing,
+            },
+        )
+
+    # Build issue payload
+    issue_attrs = issue_data.model_dump(exclude_none=True)
+    issue_attrs["author_id"] = redmine_user_id
+
+    # TR: forced self-assign (frontend handles hiding the assignee field)
+    if is_tr:
+        issue_attrs["assigned_to_id"] = redmine_user_id
+
+    # Validate assignee is a project member (TR already self-assigned above)
+    if "assigned_to_id" in issue_attrs and issue_attrs["assigned_to_id"] != redmine_user_id:
+        if not sql.is_project_member(issue_attrs["assigned_to_id"], issue_data.project_id):
+            del issue_attrs["assigned_to_id"]
+
+    # Upload files to Redmine and get tokens
+    uploads = []
+    if files:
+        if len(files) > MAX_FILE_COUNT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum {MAX_FILE_COUNT} files allowed per request",
+            )
+        for f in files:
+            _validate_uploaded_file(f)
+            file_bytes = await f.read()
+            if len(file_bytes) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail=f"File {f.filename} exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit")
+            upload_result = await redmine_service.upload_file(file_bytes, f.filename, f.content_type)
+            uploads.append({
+                "token": upload_result["token"],
+                "filename": f.filename or "attachment",
+                "content_type": f.content_type or "application/octet-stream",
+                "description": "",
+            })
+
+    if uploads:
+        issue_attrs["uploads"] = uploads
+
+    try:
+        issue = await redmine_service.create_issue(issue_attrs)
+        return {"status": "success", "message": "Issue created successfully", "id": issue["id"]}
+    except httpx.HTTPStatusError as e:
+        logger.error("Redmine error (create issue): status=%s body=%s", e.response.status_code, e.response.text)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Redmine error: {e.response.text}",
+        )
+    except Exception as e:
+        logger.error("Failed to create issue: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to create issue: {e}",
+        )
+
+
+@router.get("/redmine/attachments/{attachment_id}")
+async def download_attachment(
+    attachment_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{redmine_service.url}/attachments/download/{attachment_id}",
+            headers={"X-Redmine-API-Key": redmine_service.headers["X-Redmine-API-Key"]},
+        )
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        return StreamingResponse(
+            resp.iter_bytes(),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="attachment-{attachment_id}"',
+                "Content-Length": resp.headers.get("content-length", ""),
+            },
+        )
+
+
+@router.get("/redmine/issues/{issue_id}")
+async def get_redmine_issue(
+    issue_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    issue = await redmine_service.get_issue_by_id(issue_id)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    return {"status": "success", "issue": issue}
+
+
+@router.put("/redmine/issues/{issue_id}")
+async def update_redmine_issue(
+    issue_id: int,
+    data: str = Form(...),
+    files: list[UploadFile] = File(None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    # Parse JSON data
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON in data field")
+    try:
+        issue_data = IssueUpdate(**parsed)
+    except PydanticValidationError as e:
+        raise HTTPException(status_code=422, detail=_validation_errors(e))
 
     sql = RedmineSQLService(db)
     user = sql.get_user_by_email(email)
@@ -460,32 +741,59 @@ async def create_redmine_issue(
     is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
     is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
 
-    # Project membership check (skip for Admin)
-    if not is_admin:
-        if not sql.is_project_member(redmine_user_id, data.project_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You are not a member of this project",
-            )
-
     # Build issue payload
-    issue_attrs = data.model_dump(exclude_none=True)
-    issue_attrs["author_id"] = redmine_user_id
+    issue_attrs = issue_data.model_dump(exclude_none=True)
+    notes = issue_attrs.pop("notes", None)
+    private_notes = issue_attrs.pop("private_notes", None)
 
-    # TR: forced self-assign (frontend handles hiding the assignee field)
+    if notes:
+        issue_attrs["notes"] = notes
+    if private_notes is not None:
+        issue_attrs["private_notes"] = private_notes
+
+    # TR: forced self-assign
     if is_tr:
         issue_attrs["assigned_to_id"] = redmine_user_id
 
+    # Validate assignee is a project member
+    if "assigned_to_id" in issue_attrs and issue_attrs["assigned_to_id"] != redmine_user_id:
+        existing = await redmine_service.get_issue_by_id(issue_id)
+        if existing:
+            pid = existing["project"]["id"]
+            if not sql.is_project_member(issue_attrs["assigned_to_id"], pid):
+                del issue_attrs["assigned_to_id"]
+
+    # Upload files to Redmine and get tokens
+    uploads = []
+    if files:
+        for f in files:
+            _validate_uploaded_file(f)
+            file_bytes = await f.read()
+            if len(file_bytes) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail=f"File {f.filename} exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit")
+            upload_result = await redmine_service.upload_file(file_bytes, f.filename, f.content_type)
+            uploads.append({
+                "token": upload_result["token"],
+                "filename": f.filename or "attachment",
+                "content_type": f.content_type or "application/octet-stream",
+                "description": "",
+            })
+
+    if uploads:
+        issue_attrs["uploads"] = uploads
+
     try:
-        issue = await redmine_service.create_issue(issue_attrs)
-        return {"status": "success", "issue": issue}
+        issue = await redmine_service.update_issue(issue_id, issue_attrs)
+        return {"status": "success", "message": "Issue updated successfully", "id": issue_id}
     except httpx.HTTPStatusError as e:
+        logger.error("Redmine error (update issue): status=%s body=%s", e.response.status_code, e.response.text)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Redmine error: {e.response.text}",
         )
     except Exception as e:
+        logger.error("Failed to update issue: %s", e)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to create issue: {e}",
+            detail=f"Failed to update issue: {e}",
         )
