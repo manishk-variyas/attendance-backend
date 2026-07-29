@@ -6,7 +6,7 @@ from fastapi import HTTPException
 import openpyxl
 from pydantic import ValidationError
 
-from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema
+from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest
 from app.features.redmine.sql_service import RedmineSQLService
 from app.services.database.leave_service import LeaveService as LeaveDBService, LeaveBalanceService
 from app.services.database.holiday_service import HolidayService as HolidayDBService
@@ -372,6 +372,8 @@ class LeaveBusinessService:
         emails.update({r.approved_by for r in results if r.approved_by})
         emails.update({r.rejected_by for r in results if r.rejected_by})
         emails.update({r.cancelled_by for r in results if r.cancelled_by})
+        emails.update({r.cancellation_requested_by for r in results if r.cancellation_requested_by})
+        emails.update({r.cancellation_rejected_by for r in results if r.cancellation_rejected_by})
         emp_map = {}
         if emails:
             emps = self.leave_db.db.execute(
@@ -406,6 +408,20 @@ class LeaveBusinessService:
                     name = f"{can_emp.first_name} {can_emp.last_name}".strip()
                     desig = can_emp.designation or ""
                     d["cancelled_by"] = f"{name} ({desig})" if desig else name
+
+            if r.cancellation_requested_by:
+                cr_emp = emp_map.get(r.cancellation_requested_by)
+                if cr_emp:
+                    name = f"{cr_emp.first_name} {cr_emp.last_name}".strip()
+                    desig = cr_emp.designation or ""
+                    d["cancellation_requested_by"] = f"{name} ({desig})" if desig else name
+
+            if r.cancellation_rejected_by:
+                rej_emp = emp_map.get(r.cancellation_rejected_by)
+                if rej_emp:
+                    name = f"{rej_emp.first_name} {rej_emp.last_name}".strip()
+                    desig = rej_emp.designation or ""
+                    d["cancellation_rejected_by"] = f"{name} ({desig})" if desig else name
 
             records.append(d)
         return records
@@ -746,7 +762,10 @@ class LeaveBusinessService:
                 if leave.approval_status == LeaveStatus.EMERGENCY.value:
                     results.append({"leave_id": leave_id, "status": "failed", "reason": "Emergency leaves cannot be cancelled"})
                     continue
-                if leave.approval_status not in (LeaveStatus.PENDING.value, LeaveStatus.APPROVED.value):
+                if leave.approval_status == LeaveStatus.APPROVED.value:
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": "Approved leaves must go through cancellation request flow"})
+                    continue
+                if leave.approval_status not in (LeaveStatus.PENDING.value,):
                     results.append({"leave_id": leave_id, "status": "failed", "reason": f"Already {leave.approval_status}"})
                     continue
                 if leave.start_date < today:
@@ -883,19 +902,37 @@ class LeaveBusinessService:
             self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) - requested_days, updated_at=now)
 
     async def get_pending_leaves(self, current_user: dict, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
-        """Fetch all pending leaves with balance info."""
+        """Fetch all pending leaves and cancellation requests with balance info."""
         roles = current_user.get("roles", [])
 
         if "Admin" in roles:
-            stmt = select(Leave).where(Leave.approval_status == LeaveStatus.PENDING.value)
+            stmt = select(Leave).where(
+                Leave.approval_status.in_([LeaveStatus.PENDING.value, LeaveStatus.CANCELLATION_REQUESTED.value])
+            )
         else:
             sql = RedmineSQLService(self.leave_db.db)
             pm_user = sql.get_user_by_email(current_user.get("email"))
             if not pm_user:
                 return []
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_user.get("email"))
+            ).scalars().first()
+            pm_redmine_id = pm_emp.redmine_user_id if pm_emp else None
+            if not pm_redmine_id:
+                return []
+            team_member_ids = sql.get_team_member_ids(int(pm_user["id"]))
+            team_member_ids.add(int(pm_user["id"]))
+            team_emps = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.redmine_user_id.in_(team_member_ids))
+            ).scalars().all()
+            team_keycloak_ids = [e.keycloak_user_id for e in team_emps]
+
             stmt = select(Leave).where(
-                Leave.approval_status == LeaveStatus.PENDING.value,
-                Leave.approver_id == int(pm_user["id"])
+                Leave.approval_status.in_([LeaveStatus.PENDING.value, LeaveStatus.CANCELLATION_REQUESTED.value]),
+                or_(
+                    Leave.approver_id == pm_redmine_id,
+                    Leave.keycloak_user_id.in_(team_keycloak_ids),
+                )
             )
         if from_date:
             stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
@@ -948,3 +985,208 @@ class LeaveBusinessService:
             pending.append(d)
 
         return pending
+
+    async def request_cancel_leave(self, leave_id: str, current_user: dict, remark: str) -> dict:
+        leave = self.leave_db.fetch_one(Leave, id=leave_id)
+        if not leave:
+            raise HTTPException(status_code=404, detail="Leave not found")
+
+        valid_statuses = (LeaveStatus.APPROVED.value, LeaveStatus.CANCELLATION_REJECTED.value)
+        if leave.approval_status not in valid_statuses:
+            raise HTTPException(status_code=400, detail="Only approved leaves can request cancellation")
+
+        roles = current_user.get("roles", [])
+        current_email = current_user.get("email")
+
+        is_self = current_email == leave.user_email
+        is_pm_pc = "Project Manager" in roles or "Project Coordinator" in roles
+
+        if not is_self and not is_pm_pc and "Admin" not in roles:
+            raise HTTPException(status_code=403, detail="Not authorized to request cancellation")
+
+        if is_pm_pc and not is_self:
+            sql = RedmineSQLService(self.leave_db.db)
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_email)
+            ).scalars().first()
+            tr_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == leave.keycloak_user_id)
+            ).scalars().first()
+            if not pm_emp or not tr_emp or not sql.check_project_access(pm_emp.redmine_user_id, tr_emp.redmine_user_id):
+                raise HTTPException(status_code=403, detail="Not authorized to request cancellation for this user")
+
+        current_attempts = leave.cancellation_attempts or 0
+        if current_attempts >= 5:
+            raise HTTPException(status_code=400, detail="Maximum cancellation attempts (5) reached. Contact admin.")
+
+        now = datetime.utcnow()
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.CANCELLATION_REQUESTED.value,
+            cancellation_remark=remark,
+            cancellation_requested_at=now,
+            cancellation_requested_by=current_email,
+            cancellation_attempts=current_attempts + 1,
+            cancellation_rejection_remark=None,
+            cancellation_rejected_at=None,
+            cancellation_rejected_by=None,
+            updated_at=now,
+        )
+
+        return {"message": "Cancellation request submitted", "attempt": current_attempts + 1, "limit": 5}
+
+    async def approve_cancel_leave(self, leave_id: str, current_user: dict) -> dict:
+        leave = self.leave_db.fetch_one(Leave, id=leave_id)
+        if not leave:
+            raise HTTPException(status_code=404, detail="Leave not found")
+
+        if leave.approval_status != LeaveStatus.CANCELLATION_REQUESTED.value:
+            raise HTTPException(status_code=400, detail="No cancellation request pending for this leave")
+
+        roles = current_user.get("roles", [])
+        is_admin = "Admin" in roles
+
+        if not is_admin:
+            sql = RedmineSQLService(self.leave_db.db)
+            current_email = current_user.get("email")
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_email)
+            ).scalars().first()
+            tr_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == leave.keycloak_user_id)
+            ).scalars().first()
+            if not pm_emp or not tr_emp or not sql.check_project_access(pm_emp.redmine_user_id, tr_emp.redmine_user_id):
+                raise HTTPException(status_code=403, detail="Not authorized to approve cancellation for this user")
+
+        now = datetime.utcnow()
+        self._reverse_balance(leave)
+
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.CANCELLED.value,
+            cancelled_at=now,
+            cancelled_by=current_user.get("email"),
+            updated_at=now,
+        )
+
+        return {"message": "Cancellation approved"}
+
+    async def reject_cancel_leave(self, leave_id: str, current_user: dict, remark: str) -> dict:
+        leave = self.leave_db.fetch_one(Leave, id=leave_id)
+        if not leave:
+            raise HTTPException(status_code=404, detail="Leave not found")
+
+        if leave.approval_status != LeaveStatus.CANCELLATION_REQUESTED.value:
+            raise HTTPException(status_code=400, detail="No cancellation request pending for this leave")
+
+        roles = current_user.get("roles", [])
+        is_admin = "Admin" in roles
+
+        if not is_admin:
+            sql = RedmineSQLService(self.leave_db.db)
+            current_email = current_user.get("email")
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_email)
+            ).scalars().first()
+            tr_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == leave.keycloak_user_id)
+            ).scalars().first()
+            if not pm_emp or not tr_emp or not sql.check_project_access(pm_emp.redmine_user_id, tr_emp.redmine_user_id):
+                raise HTTPException(status_code=403, detail="Not authorized to reject cancellation for this user")
+
+        now = datetime.utcnow()
+        self.leave_db.update(
+            Leave, leave_id,
+            approval_status=LeaveStatus.CANCELLATION_REJECTED.value,
+            cancellation_rejected_at=now,
+            cancellation_rejected_by=current_user.get("email"),
+            cancellation_rejection_remark=remark,
+            updated_at=now,
+        )
+
+        return {"message": "Cancellation request rejected"}
+
+    async def batch_approve_cancel_leaves(self, leave_ids: list, current_user: dict) -> dict:
+        return await self._batch_process_cancel(leave_ids, current_user, action="approve_cancel")
+
+    async def batch_reject_cancel_leaves(self, leave_ids: list, current_user: dict, remark: str) -> dict:
+        return await self._batch_process_cancel(leave_ids, current_user, action="reject_cancel", remark=remark)
+
+    async def _batch_process_cancel(self, leave_ids: list, current_user: dict, action: str, remark: str = None) -> dict:
+        if len(leave_ids) > 50:
+            raise HTTPException(status_code=400, detail="Maximum 50 leave IDs per batch request.")
+
+        import uuid as _uuid
+        for lid in leave_ids:
+            try:
+                _uuid.UUID(lid)
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=400, detail="Invalid leave ID(s). Must be valid UUID.")
+
+        roles = current_user.get("roles", [])
+        current_email = current_user.get("email")
+        is_admin = "Admin" in roles
+        sql = RedmineSQLService(self.leave_db.db)
+
+        pm_emp = None
+        pm_redmine_id = None
+        if not is_admin:
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_email)
+            ).scalars().first()
+            pm_redmine_id = pm_emp.redmine_user_id if pm_emp else None
+
+        processed = 0
+        success = 0
+        results = []
+        now = datetime.utcnow()
+
+        for leave_id in leave_ids:
+            processed += 1
+            leave = self.leave_db.fetch_one(Leave, id=leave_id)
+            if not leave:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": "Not found"})
+                continue
+
+            if leave.approval_status != LeaveStatus.CANCELLATION_REQUESTED.value:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": f"No cancellation request pending"})
+                continue
+
+            if not is_admin:
+                tr_emp = self.leave_db.db.execute(
+                    select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == leave.keycloak_user_id)
+                ).scalars().first()
+                if not pm_emp or not tr_emp or not sql.check_project_access(pm_emp.redmine_user_id, tr_emp.redmine_user_id):
+                    results.append({"leave_id": leave_id, "status": "failed", "reason": "Not authorized"})
+                    continue
+
+            if action == "approve_cancel":
+                self._reverse_balance(leave)
+                self.leave_db.update(
+                    Leave, leave_id,
+                    approval_status=LeaveStatus.CANCELLED.value,
+                    cancelled_at=now,
+                    cancelled_by=current_email,
+                    updated_at=now,
+                )
+                results.append({"leave_id": leave_id, "status": "cancelled"})
+            elif action == "reject_cancel":
+                self.leave_db.update(
+                    Leave, leave_id,
+                    approval_status=LeaveStatus.CANCELLATION_REJECTED.value,
+                    cancellation_rejected_at=now,
+                    cancellation_rejected_by=current_email,
+                    cancellation_rejection_remark=remark,
+                    updated_at=now,
+                )
+                results.append({"leave_id": leave_id, "status": "cancellation_rejected"})
+            success += 1
+
+        failed = processed - success
+        action_label = {"approve_cancel": "cancelled", "reject_cancel": "rejected"}[action]
+        return {
+            "processed": processed,
+            action_label: success,
+            "failed": failed,
+            "results": results,
+        }

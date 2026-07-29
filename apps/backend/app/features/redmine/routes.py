@@ -25,6 +25,8 @@ ALLOWED_EXTENSIONS = {
     ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".webm",
 }
 
+RECORDING_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".webm"}
+
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 MAX_FILE_COUNT = 2
 
@@ -699,19 +701,129 @@ async def download_attachment(
         )
 
 
-@router.get("/redmine/issues/{issue_id}")
-async def get_redmine_issue(
-    issue_id: int,
+@router.delete("/redmine/attachments/{attachment_id}")
+async def delete_attachment(
+    attachment_id: int,
     current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    deleted = await redmine_service.delete_attachment(attachment_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    return {"status": "success", "message": "Attachment deleted successfully", "id": attachment_id}
+
+
+@router.post("/redmine/issues/{issue_id}/attachments")
+async def upload_issue_attachment(
+    issue_id: int,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     roles = current_user.get("roles", [])
     if not roles:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    issue = await redmine_service.get_issue_by_id(issue_id)
+    sql = RedmineSQLService(db)
+    email = current_user.get("email")
+    user = sql.get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=400, detail="Redmine user not found")
+
+    redmine_user_id = user["id"]
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+    is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
+
+    issue_pid = sql.get_issue_project_id(issue_id)
+    if issue_pid is None:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    if is_admin:
+        pass
+    elif is_pm_or_pc:
+        if not sql.is_project_member(redmine_user_id, issue_pid):
+            raise HTTPException(status_code=403, detail="You are not a member of this issue's project")
+    elif is_tr:
+        assigned_to = sql.get_issue_assigned_to(issue_id)
+        if assigned_to != redmine_user_id:
+            raise HTTPException(status_code=403, detail="You can only add recordings to tickets assigned to you")
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Rate limit: max 20 uploads per user per day
+    daily = sql.count_daily_updates(redmine_user_id)
+    if daily >= 20:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="You can upload up to 20 recordings per day. Please try again tomorrow.",
+        )
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in RECORDING_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only audio recordings are allowed. Got '{ext}'",
+        )
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit")
+
+    existing = sql.count_issue_attachments(issue_id)
+    if existing + 1 > 10:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Attachment limit reached (10 per ticket). Create a new ticket and attach there.",
+        )
+
+    upload_result = await redmine_service.upload_file(file_bytes, file.filename, file.content_type)
+    uploads = [{
+        "token": upload_result["token"],
+        "filename": file.filename or "recording",
+        "content_type": file.content_type or "application/octet-stream",
+        "description": "",
+    }]
+
+    await redmine_service.update_issue(issue_id, {"uploads": uploads})
+    return {"status": "success", "message": "Recording uploaded", "id": issue_id}
+
+
+@router.get("/redmine/issues/{issue_id}")
+async def get_redmine_issue(
+    issue_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roles = current_user.get("roles", [])
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    sql = RedmineSQLService(db)
+    issue = sql.get_issue_by_id_enriched(issue_id)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
     return {"status": "success", "issue": issue}
+
+
+@router.delete("/redmine/issues/{issue_id}")
+async def delete_redmine_issue(
+    issue_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    deleted = await redmine_service.delete_issue(issue_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    return {"status": "success", "message": "Issue deleted successfully", "id": issue_id}
 
 
 @router.put("/redmine/issues/{issue_id}")
@@ -760,6 +872,29 @@ async def update_redmine_issue(
     is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
     is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
 
+    # Role-based access control
+    issue_pid = sql.get_issue_project_id(issue_id)
+    if issue_pid is None:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    if is_admin:
+        pass  # full access
+    elif is_pm_or_pc:
+        if not sql.is_project_member(redmine_user_id, issue_pid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this issue's project",
+            )
+    elif is_tr:
+        assigned_to = sql.get_issue_assigned_to(issue_id)
+        if assigned_to != redmine_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only edit tickets assigned to you",
+            )
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
     # Build issue payload
     issue_attrs = issue_data.model_dump(exclude_none=True)
     notes = issue_attrs.pop("notes", None)
@@ -770,21 +905,24 @@ async def update_redmine_issue(
     if private_notes is not None:
         issue_attrs["private_notes"] = private_notes
 
-    # TR: forced self-assign
+    # TR: forced self-assign (even on their own tickets)
     if is_tr:
         issue_attrs["assigned_to_id"] = redmine_user_id
 
-    # Validate assignee is a project member
+    # Validate assignee is a project member (skip for TR who self-assign)
     if "assigned_to_id" in issue_attrs and issue_attrs["assigned_to_id"] != redmine_user_id:
-        existing = await redmine_service.get_issue_by_id(issue_id)
-        if existing:
-            pid = existing["project"]["id"]
-            if not sql.is_project_member(issue_attrs["assigned_to_id"], pid):
-                del issue_attrs["assigned_to_id"]
+        if not sql.is_project_member(issue_attrs["assigned_to_id"], issue_pid):
+            del issue_attrs["assigned_to_id"]
 
     # Upload files to Redmine and get tokens
     uploads = []
     if files:
+        existing = sql.count_issue_attachments(issue_id)
+        if existing + len(files) > 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Attachment limit reached (10 per ticket). Create a new ticket and attach there.",
+            )
         for f in files:
             _validate_uploaded_file(f)
             file_bytes = await f.read()

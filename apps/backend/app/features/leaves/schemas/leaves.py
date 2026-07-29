@@ -14,6 +14,8 @@ class LeaveStatus(str, Enum):
     REJECTED = "rejected"
     EMERGENCY = "emergency"
     CANCELLED = "cancelled"
+    CANCELLATION_REQUESTED = "cancellation_requested"
+    CANCELLATION_REJECTED = "cancellation_rejected"
 
 class LeaveApplyRequest(BaseModel):
     start_date: datetime
@@ -52,6 +54,13 @@ class LeaveHistoryItem(BaseModel):
     rejected_by: Optional[str] = None
     approved_by_role: Optional[str] = None
     rejected_by_role: Optional[str] = None
+    cancellation_remark: Optional[str] = None
+    cancellation_requested_at: Optional[datetime] = None
+    cancellation_requested_by: Optional[str] = None
+    cancellation_rejected_at: Optional[datetime] = None
+    cancellation_rejected_by: Optional[str] = None
+    cancellation_rejection_remark: Optional[str] = None
+    cancellation_attempts: Optional[int] = None
 
 class LeaveStats(BaseModel):
     total_earned: float = 0.0
@@ -91,6 +100,19 @@ class BatchLeaveResponse(BaseModel):
     rejected: int = 0
     failed: int = 0
     results: List[BatchLeaveResult]
+
+
+class CancelLeaveRequest(BaseModel):
+    remark: str = Field(..., min_length=1, max_length=1000, description="Reason for requesting leave cancellation")
+
+
+class CancelLeaveRejectRequest(BaseModel):
+    remark: str = Field(..., min_length=1, max_length=1000, description="Reason for rejecting the cancellation request")
+
+
+class BatchCancelLeaveRejectRequest(BaseModel):
+    leave_ids: List[str]
+    remark: str = Field(..., min_length=1, max_length=1000, description="Reason for rejecting the cancellation requests")
 
 
 class LeaveBalanceCreate(BaseModel):

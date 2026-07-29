@@ -8,7 +8,10 @@ from app.features.leaves.schemas.leaves import (
     LeaveHistoryItem, 
     LeaveStats, 
     Holiday,
-    BatchLeaveRequest
+    BatchLeaveRequest,
+    CancelLeaveRequest,
+    CancelLeaveRejectRequest,
+    BatchCancelLeaveRejectRequest,
 )
 from app.features.leaves.services.leave_service import LeaveBusinessService
 from app.services.database.dependencies import get_leave_business_service
@@ -240,6 +243,30 @@ async def batch_cancel_leaves(
     return await leave_service.batch_cancel_leaves(payload.leave_ids, current_user)
 
 
+@router.post("/batch/approve-cancel")
+async def batch_approve_cancel_leaves(
+    payload: BatchLeaveRequest,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only Admin, PM, or PC can approve cancellation requests.")
+    return await leave_service.batch_approve_cancel_leaves(payload.leave_ids, current_user)
+
+
+@router.post("/batch/reject-cancel")
+async def batch_reject_cancel_leaves(
+    payload: BatchCancelLeaveRejectRequest,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only Admin, PM, or PC can reject cancellation requests.")
+    return await leave_service.batch_reject_cancel_leaves(payload.leave_ids, current_user, payload.remark)
+
+
 @router.post("/{leave_id}/approve")
 async def approve_leave(
     leave_id: str,
@@ -294,3 +321,44 @@ async def reject_leave(
         )
 
     return {"message": "Leave application rejected successfully"}
+
+
+@router.post("/{leave_id}/request-cancel")
+async def request_cancel_leave(
+    leave_id: str,
+    payload: CancelLeaveRequest,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    return await leave_service.request_cancel_leave(leave_id, current_user, payload.remark)
+
+
+@router.post("/{leave_id}/approve-cancel")
+async def approve_cancel_leave(
+    leave_id: str,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Admin, PM, or PC can approve cancellation requests."
+        )
+    return await leave_service.approve_cancel_leave(leave_id, current_user)
+
+
+@router.post("/{leave_id}/reject-cancel")
+async def reject_cancel_leave(
+    leave_id: str,
+    payload: CancelLeaveRejectRequest,
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Admin, PM, or PC can reject cancellation requests."
+        )
+    return await leave_service.reject_cancel_leave(leave_id, current_user, payload.remark)

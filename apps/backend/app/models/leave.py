@@ -18,6 +18,8 @@ class LeaveStatus(str, enum.Enum):
     REJECTED = "rejected"
     EMERGENCY = "emergency"
     CANCELLED = "cancelled"
+    CANCELLATION_REQUESTED = "cancellation_requested"
+    CANCELLATION_REJECTED = "cancellation_rejected"
 
 
 class Leave(Base):
@@ -36,13 +38,20 @@ class Leave(Base):
     resuming_date = Column(Date, nullable=True)
     leave_dates = Column(JSON, nullable=True)
     approver_id = Column(Integer, nullable=True)
-    approval_status = Column(String(8), nullable=False, server_default=text("'pending'"))
+    approval_status = Column(String(24), nullable=False, server_default=text("'pending'"))
     approved_at = Column(DateTime(timezone=True), nullable=True)
     approved_by = Column(String(255), nullable=True)
     rejected_at = Column(DateTime(timezone=True), nullable=True)
     rejected_by = Column(String(255), nullable=True)
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
     cancelled_by = Column(String(255), nullable=True)
+    cancellation_remark = Column(String(1000), nullable=True)
+    cancellation_requested_at = Column(DateTime(timezone=True), nullable=True)
+    cancellation_requested_by = Column(String(255), nullable=True)
+    cancellation_rejected_at = Column(DateTime(timezone=True), nullable=True)
+    cancellation_rejected_by = Column(String(255), nullable=True)
+    cancellation_rejection_remark = Column(String(1000), nullable=True)
+    cancellation_attempts = Column(Integer, nullable=False, server_default=text("0"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
@@ -68,6 +77,13 @@ class Leave(Base):
             "rejected_by": self.rejected_by,
             "cancelled_at": self.cancelled_at,
             "cancelled_by": self.cancelled_by,
+            "cancellation_remark": self.cancellation_remark,
+            "cancellation_requested_at": self.cancellation_requested_at,
+            "cancellation_requested_by": self.cancellation_requested_by,
+            "cancellation_rejected_at": self.cancellation_rejected_at,
+            "cancellation_rejected_by": self.cancellation_rejected_by,
+            "cancellation_rejection_remark": self.cancellation_rejection_remark,
+            "cancellation_attempts": self.cancellation_attempts,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

@@ -256,6 +256,51 @@ class RedmineSQLService:
         return [_issue_row_to_dict(r) for r in rows]
 
 
+    def get_issue_by_id_enriched(self, issue_id: int) -> dict | None:
+        row = self.db.execute(
+            text("""
+                SELECT i.id, i.subject, i.description, st.name as status,
+                       p.name as priority, t.name as tracker,
+                       i.project_id, pr.name as project_name,
+                       u.firstname || ' ' || u.lastname as assigned_to,
+                       i.created_on, i.updated_on,
+                       i.start_date, i.due_date, i.estimated_hours,
+                       i.done_ratio, i.is_private,
+                       st.id as status_id, p.id as priority_id, t.id as tracker_id,
+                       i.assigned_to_id,
+                       i.author_id, auth.firstname || ' ' || auth.lastname as author_name,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', a.id, 'filename', a.filename,
+                               'content_type', a.content_type, 'filesize', a.filesize
+                           )) FROM redmine.attachments a
+                           WHERE a.container_id = i.id AND a.container_type = 'Issue'),
+                           '[]'::json
+                       ) as attachments,
+                       COALESCE(
+                           (SELECT json_agg(json_build_object(
+                               'id', cf.id, 'name', cf.name, 'value', cv.value
+                           ) ORDER BY cf.id)
+                           FROM redmine.custom_values cv
+                           JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                           WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                           '[]'::json
+                       ) as custom_fields
+                FROM redmine.issues i
+                JOIN redmine.projects pr ON pr.id = i.project_id
+                LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+                LEFT JOIN redmine.users auth ON auth.id = i.author_id
+                JOIN redmine.issue_statuses st ON st.id = i.status_id
+                JOIN redmine.enumerations p ON p.id = i.priority_id
+                JOIN redmine.trackers t ON t.id = i.tracker_id
+                WHERE i.id = :issue_id
+            """),
+            {"issue_id": issue_id},
+        ).fetchone()
+        if not row:
+            return None
+        return _issue_row_to_dict(row)
+
     def get_duplicate_issue(self, subject: str, project_id: int) -> int | None:
         row = self.db.execute(
             text("""
@@ -360,6 +405,13 @@ class RedmineSQLService:
         ).fetchone()
         return row[0] if row else 0
 
+    def count_issue_attachments(self, issue_id: int) -> int:
+        row = self.db.execute(
+            text("SELECT count(*) FROM redmine.attachments WHERE container_id = :id AND container_type = 'Issue'"),
+            {"id": issue_id},
+        ).fetchone()
+        return row[0] if row else 0
+
     def is_project_member(self, user_id: int, project_id: int) -> bool:
         row = self.db.execute(
             text("""
@@ -423,6 +475,20 @@ class RedmineSQLService:
             }
             for r in rows
         ]
+
+    def get_issue_project_id(self, issue_id: int) -> int | None:
+        row = self.db.execute(
+            text("SELECT project_id FROM redmine.issues WHERE id = :id"),
+            {"id": issue_id},
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_issue_assigned_to(self, issue_id: int) -> int | None:
+        row = self.db.execute(
+            text("SELECT assigned_to_id FROM redmine.issues WHERE id = :id"),
+            {"id": issue_id},
+        ).fetchone()
+        return row[0] if row else None
 
     def get_categories(self, project_id: int) -> list[dict]:
         rows = self.db.execute(

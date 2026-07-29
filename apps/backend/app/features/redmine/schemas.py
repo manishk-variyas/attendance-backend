@@ -131,7 +131,7 @@ class SearchResponse(BaseModel):
 class IssueCreate(BaseModel):
     project_id: int
     subject: str = Field(..., min_length=1, max_length=255)
-    description: str | None = None
+    description: str | None = Field(None, max_length=65535)
     tracker_id: int | None = None
     status_id: int | None = None
     priority_id: int | None = None
@@ -172,7 +172,7 @@ class IssueCreate(BaseModel):
 
 class IssueUpdate(BaseModel):
     subject: str | None = Field(None, min_length=1, max_length=255)
-    description: str | None = None
+    description: str | None = Field(None, max_length=65535)
     tracker_id: int | None = None
     status_id: int | None = None
     priority_id: int | None = None
@@ -183,10 +183,11 @@ class IssueUpdate(BaseModel):
     start_date: str | None = None
     due_date: str | None = None
     estimated_hours: float | None = None
+    done_ratio: int | None = None
     is_private: bool | None = None
     watcher_user_ids: list[int] | None = None
     custom_fields: list[dict] | None = None
-    notes: str | None = None
+    notes: str | None = Field(None, max_length=10000)
     private_notes: bool | None = None
 
     @field_validator("start_date", "due_date")
@@ -204,6 +205,13 @@ class IssueUpdate(BaseModel):
     def check_estimated_hours(cls, v):
         if v is not None and v < 0:
             raise ValueError("Must be >= 0")
+        return v
+
+    @field_validator("done_ratio")
+    @classmethod
+    def check_done_ratio(cls, v):
+        if v is not None and (v < 0 or v > 100):
+            raise ValueError("Must be between 0 and 100")
         return v
 
     @model_validator(mode="after")

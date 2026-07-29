@@ -254,56 +254,52 @@ class RedmineService:
                 ))
             return result
 
+    def _build_issue_response(self, i: dict) -> IssueResponse:
+        assigned = i.get("assigned_to")
+        return IssueResponse(
+            id=i["id"],
+            subject=i["subject"],
+            description=i.get("description"),
+            status=i["status"]["name"],
+            priority=i["priority"]["name"],
+            tracker=i["tracker"]["name"],
+            project_id=i["project"]["id"],
+            project_name=i["project"]["name"],
+            assigned_to_name=assigned["name"] if assigned else None,
+            assigned_to_id=assigned["id"] if assigned else None,
+            created_on=i["created_on"],
+            updated_on=i["updated_on"],
+            start_date=i.get("start_date"),
+            due_date=i.get("due_date"),
+            estimated_hours=i.get("estimated_hours"),
+            done_ratio=i.get("done_ratio", 0),
+            is_private=i.get("is_private", False),
+            status_id=i["status"]["id"],
+            priority_id=i["priority"]["id"],
+            tracker_id=i["tracker"]["id"],
+            author_id=i["author"]["id"],
+            author_name=i["author"]["name"],
+        )
+
     async def get_issues_for_user(self, user_id: int) -> List[IssueResponse]:
         async with httpx.AsyncClient() as client:
-            # Fetch issues where user is assigned or author
-            # Redmine API: GET /issues.json?assigned_to_id=123 (or author_id)
-            response = await client.get(f"{self.url}/issues.json?assigned_to_id={user_id}", headers=self.headers)
+            response = await client.get(
+                f"{self.url}/issues.json?assigned_to_id={user_id}&include=attachments,custom_fields",
+                headers=self.headers,
+            )
             response.raise_for_status()
             issues_data = response.json().get("issues", [])
-            
-            issues = []
-            for i in issues_data:
-                issues.append(IssueResponse(
-                    id=i["id"],
-                    subject=i["subject"],
-                    description=i.get("description"),
-                    status=i["status"]["name"],
-                    priority=i["priority"]["name"],
-                    tracker=i["tracker"]["name"],
-                    project_id=i["project"]["id"],
-                    project_name=i["project"]["name"],
-                    assigned_to_name=i.get("assigned_to", {}).get("name") if i.get("assigned_to") else None,
-                    created_on=i["created_on"],
-                    updated_on=i["updated_on"]
-                ))
-            return issues
+            return [self._build_issue_response(i) for i in issues_data]
 
     async def get_issues_for_project(self, project_id: int, assigned_to_id: int = None) -> List[IssueResponse]:
         async with httpx.AsyncClient() as client:
-            url = f"{self.url}/issues.json?project_id={project_id}"
+            url = f"{self.url}/issues.json?project_id={project_id}&include=attachments,custom_fields"
             if assigned_to_id is not None:
                 url += f"&assigned_to_id={assigned_to_id}"
             response = await client.get(url, headers=self.headers)
             response.raise_for_status()
             issues_data = response.json().get("issues", [])
-
-            issues = []
-            for i in issues_data:
-                issues.append(IssueResponse(
-                    id=i["id"],
-                    subject=i["subject"],
-                    description=i.get("description"),
-                    status=i["status"]["name"],
-                    priority=i["priority"]["name"],
-                    tracker=i["tracker"]["name"],
-                    project_id=i["project"]["id"],
-                    project_name=i["project"]["name"],
-                    assigned_to_name=i.get("assigned_to", {}).get("name") if i.get("assigned_to") else None,
-                    created_on=i["created_on"],
-                    updated_on=i["updated_on"]
-                ))
-            return issues
+            return [self._build_issue_response(i) for i in issues_data]
 
     async def get_issue_by_id(self, issue_id: int) -> Optional[dict]:
         async with httpx.AsyncClient() as client:
@@ -473,6 +469,30 @@ class RedmineService:
             if not issue:
                 return {"id": issue_id}
             return issue
+
+
+    async def delete_issue(self, issue_id: int) -> bool:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{self.url}/issues/{issue_id}.json",
+                headers=self.headers,
+            )
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            return True
+
+
+    async def delete_attachment(self, attachment_id: int) -> bool:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{self.url}/attachments/{attachment_id}.json",
+                headers=self.headers,
+            )
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            return True
 
 
 redmine_service = RedmineService()

@@ -100,6 +100,37 @@ def _run_migrations():
         """))
         conn.commit()
 
+        conn.execute(text("ALTER TABLE leaves ALTER COLUMN approval_status TYPE VARCHAR(24)"))
+        conn.commit()
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_remark') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_remark VARCHAR(1000);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_requested_at') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_requested_at TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_requested_by') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_requested_by VARCHAR(255);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejected_at') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_rejected_at TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejected_by') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_rejected_by VARCHAR(255);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejection_remark') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_rejection_remark VARCHAR(1000);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_attempts') THEN
+                    ALTER TABLE leaves ADD COLUMN cancellation_attempts INTEGER NOT NULL DEFAULT 0;
+                END IF;
+            END $$;
+        """))
+        conn.commit()
+
 
 def get_db():
     """
