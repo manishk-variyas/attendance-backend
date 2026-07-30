@@ -901,6 +901,33 @@ class LeaveBusinessService:
         elif leave.leave_type == LeaveType.PL.value:
             self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) - requested_days, updated_at=now)
 
+    def _validate_cancel_date(self, leave) -> tuple[bool, str | None]:
+        today = date.today()
+        if leave.start_date < today:
+            return False, "Leave date has already passed"
+        if leave.start_date == today:
+            shift = self.leave_db.db.execute(
+                select(Shift).where(
+                    Shift.keycloak_user_id == leave.keycloak_user_id,
+                    Shift.date == today,
+                )
+            ).scalars().first()
+            if shift and shift.shift_code:
+                sd = self.leave_db.db.execute(
+                    select(ShiftDefinition).where(ShiftDefinition.shift_code == shift.shift_code)
+                ).scalars().first()
+                if sd and sd.start_time:
+                    start_time = sd.start_time
+                    tz_str = sd.timezone or "Asia/Kolkata"
+                    try:
+                        tz = ZoneInfo(tz_str)
+                    except Exception:
+                        tz = ZoneInfo("Asia/Kolkata")
+                    start_dt = datetime.combine(today, start_time, tzinfo=tz)
+                    if datetime.now(tz) >= start_dt:
+                        return False, "Shift has already started today"
+        return True, None
+
     async def get_pending_leaves(self, current_user: dict, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
         """Fetch all pending leaves and cancellation requests with balance info."""
         roles = current_user.get("roles", [])
@@ -995,6 +1022,10 @@ class LeaveBusinessService:
         if leave.approval_status not in valid_statuses:
             raise HTTPException(status_code=400, detail="Only approved leaves can request cancellation")
 
+        valid_date, date_error = self._validate_cancel_date(leave)
+        if not valid_date:
+            raise HTTPException(status_code=400, detail=date_error)
+
         roles = current_user.get("roles", [])
         current_email = current_user.get("email")
 
@@ -1042,6 +1073,10 @@ class LeaveBusinessService:
 
         if leave.approval_status != LeaveStatus.CANCELLATION_REQUESTED.value:
             raise HTTPException(status_code=400, detail="No cancellation request pending for this leave")
+
+        valid_date, date_error = self._validate_cancel_date(leave)
+        if not valid_date:
+            raise HTTPException(status_code=400, detail=date_error)
 
         roles = current_user.get("roles", [])
         is_admin = "Admin" in roles
@@ -1150,6 +1185,11 @@ class LeaveBusinessService:
 
             if leave.approval_status != LeaveStatus.CANCELLATION_REQUESTED.value:
                 results.append({"leave_id": leave_id, "status": "failed", "reason": f"No cancellation request pending"})
+                continue
+
+            valid_date, date_error = self._validate_cancel_date(leave)
+            if not valid_date:
+                results.append({"leave_id": leave_id, "status": "failed", "reason": date_error})
                 continue
 
             if not is_admin:

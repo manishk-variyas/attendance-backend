@@ -425,6 +425,114 @@ def status_distribution(tail=500):
     return [{"code": k, "count": v} for k, v in sorted(c.items())]
 
 
+# ─── database metrics ───────────────────────────────────────────
+
+DB_CONTAINER = "backend_postgres"
+DB_USER = "backend_user"
+DB_NAME = "attendance"
+
+def _psql(sql):
+    raw = run(["docker", "exec", DB_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-t", "-A", "-c", sql], timeout=8)
+    return raw.strip()
+
+def db_metrics():
+    try:
+        conn_data = _psql("""
+            SELECT json_build_object(
+                'active',  count(*) FILTER (WHERE state='active'),
+                'idle',    count(*) FILTER (WHERE state='idle'),
+                'idle_in_txn', count(*) FILTER (WHERE state='idle in transaction'),
+                'waiting_lock', count(*) FILTER (WHERE wait_event_type='Lock'),
+                'total',   count(*)
+            ) FROM pg_stat_activity WHERE datname='attendance'
+        """)
+        conns = json.loads(conn_data) if conn_data else {}
+
+        max_conn = _psql("SELECT setting::int FROM pg_settings WHERE name='max_connections'")
+        max_conn = int(max_conn) if max_conn.isdigit() else 100
+
+        db_size = _psql("SELECT pg_size_pretty(pg_database_size('attendance'))")
+        db_size_bytes = _psql("SELECT pg_database_size('attendance')")
+        db_size_bytes = int(db_size_bytes) if db_size_bytes.isdigit() else 0
+
+        cache_hit = _psql("""
+            SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit + blks_read), 0), 1)
+            FROM pg_stat_database WHERE datname='attendance'
+        """)
+        cache_hit = float(cache_hit) if cache_hit.replace('.','').isdigit() else 0.0
+
+        txn_count = _psql("""
+            SELECT xact_commit + xact_rollback
+            FROM pg_stat_database WHERE datname='attendance'
+        """)
+        txn_count = int(txn_count) if txn_count.isdigit() else 0
+
+        uptime_s = _psql("""
+            SELECT extract(epoch from now() - pg_postmaster_start_time())::bigint
+        """)
+        uptime_s = int(uptime_s) if uptime_s.isdigit() else 0
+
+        dead_raw = _psql("""
+            SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (
+                SELECT relname as table_name, n_dead_tup, n_live_tup,
+                    round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) as dead_pct
+                FROM pg_stat_user_tables
+                WHERE n_dead_tup > 0
+                ORDER BY n_dead_tup DESC LIMIT 10
+            ) t
+        """)
+        dead_tuples = json.loads(dead_raw) if dead_raw else []
+
+        return {
+            "connections": conns,
+            "max_connections": max_conn,
+            "connection_pct": round(conns.get("total", 0) / max_conn * 100, 1) if max_conn else 0,
+            "db_size": db_size,
+            "db_size_bytes": db_size_bytes,
+            "cache_hit_ratio": cache_hit,
+            "txn_count": txn_count,
+            "uptime_seconds": uptime_s,
+            "dead_tuples": dead_tuples,
+        }
+    except Exception as e:
+        return {"error": str(e), "connections": {}, "max_connections": 0, "connection_pct": 0}
+
+
+# ─── docker health ──────────────────────────────────────────────
+
+def docker_health():
+    try:
+        out = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Image}}\t{{.RunningFor}}"])
+        containers = []
+        state_counts = Counter()
+        for line in out.strip().split("\n"):
+            if not line: continue
+            parts = line.split("\t")
+            if len(parts) < 5: continue
+            name, state, status, image, running_for = parts[0], parts[1], parts[2], parts[3], parts[4]
+            containers.append({
+                "name": name,
+                "state": state,
+                "status": status,
+                "image": image.split(":")[0] if ":" in image else image,
+                "running_for": running_for,
+            })
+            state_counts[state] += 1
+
+        return {
+            "containers": containers,
+            "total": len(containers),
+            "running": state_counts.get("running", 0),
+            "exited": state_counts.get("exited", 0),
+            "paused": state_counts.get("paused", 0),
+            "restarting": state_counts.get("restarting", 0),
+            "dead": state_counts.get("dead", 0),
+            "state_distribution": dict(state_counts),
+        }
+    except Exception as e:
+        return {"error": str(e), "containers": [], "total": 0, "running": 0}
+
+
 # ─── helpers ─────────────────────────────────────────────────────
 
 def _format_ist_time(iso_str):
@@ -494,6 +602,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/top-ips": self._json(top_ips(tail))
             elif path == "/api/latency-hist": self._json(latency_histogram(tail))
             elif path == "/api/status-dist": self._json(status_distribution(tail))
+            elif path == "/api/db-metrics": self._json(db_metrics())
+            elif path == "/api/docker-health": self._json(docker_health())
             else: self.send_error(404)
         except Exception as e:
             self._json({"error": str(e)}, 500)
@@ -758,6 +868,7 @@ body{background:radial-gradient(ellipse at top,#0d1117 0%,#0a0d12 60%);color:var
   <button data-tab="audit">Audit</button>
   <button data-tab="docker">Docker</button>
   <button data-tab="stats">Stats</button>
+  <button data-tab="infra">Infra</button>
   <button data-tab="all">All</button>
 </div>
 <div class="ctrl">
@@ -1235,6 +1346,7 @@ function onSearch() {
     case 'audit': renderAudit(p); break;
     case 'stats': renderStats(); break;
     case 'docker': renderDocker(p); break;
+    case 'infra': renderInfra(p); break;
     case 'all': renderAll(p); break;
   }
 }
@@ -1646,6 +1758,142 @@ document.getElementById('windowSel').addEventListener('click', function(e) {
   btn.classList.add('active');
   onSearch();
 });
+
+// ── Infra Tab ─────────────────────────────────────────────────
+async function renderInfra(p) {
+  const main = document.getElementById('main');
+  main.innerHTML = '<div class="loading">Loading infra metrics...</div>';
+
+  try {
+    const [dbRes, hRes, statsRes] = await Promise.all([
+      fetch('/api/db-metrics').then(r => r.json()),
+      fetch('/api/docker-health').then(r => r.json()),
+      fetch('/api/stats').then(r => r.json()),
+    ]);
+    const db = dbRes.error ? null : dbRes;
+    const h = hRes.error ? null : hRes;
+    const stats = statsRes;
+
+    let html = '<div class="dash">';
+
+    // ── DB Panel ──
+    html += '<div class="panel col-6"><div class="panel-head"><span class="title">PostgreSQL — attendance</span><span class="sub">' + esc(db?.db_size || '?') + '</span></div><div class="panel-body">';
+    if (!db || db.error) {
+      html += '<div class="empty"><div class="big">DB Error</div><div class="hint">' + esc(db?.error || 'no data') + '</div></div>';
+    } else {
+      html += '<div class="stat-cont">';
+      // Connections
+      const conns = db.connections || {};
+      const active = conns.active || 0;
+      const total = conns.total || 0;
+      const maxConn = db.max_connections || 100;
+      const connPct = db.connection_pct || 0;
+      const connColor = connPct > 80 ? 'r' : connPct > 50 ? 'y' : 'g';
+      html += '<div class="stat-row"><div class="sn">Connections</div><div class="sg">';
+      html += '<div class="stat-bar-wrap"><div class="stat-bar ' + connColor + '" style="width:' + connPct + '%"></div></div>';
+      html += '<div class="stat-val">' + total + ' / ' + maxConn + '</div></div>';
+      html += '<div class="sx">active:' + active + ' idle:' + (conns.idle||0) + ' lock:' + (conns.waiting_lock||0) + '</div></div>';
+      // Cache hit
+      const ch = db.cache_hit_ratio || 0;
+      const chColor = ch > 98 ? 'g' : ch > 90 ? 'y' : 'r';
+      html += '<div class="stat-row"><div class="sn">Cache Hit Ratio</div><div class="sg">';
+      html += '<div class="stat-bar-wrap"><div class="stat-bar ' + chColor + '" style="width:' + Math.min(ch, 100) + '%"></div></div>';
+      html += '<div class="stat-val ' + chColor + '">' + ch + '%</div></div></div>';
+      // DB size
+      html += '<div class="stat-row"><div class="sn">Database Size</div><div class="sg">';
+      html += '<div class="stat-bar-wrap"><div class="stat-bar" style="width:' + Math.min((db.db_size_bytes||0) / 1073741824 * 100, 100) + '%;background:linear-gradient(90deg,#bc8cff,#58a6ff)"></div></div>';
+      html += '<div class="stat-val">' + esc(db.db_size || '?') + '</div></div></div>';
+      // TXN count
+      html += '<div class="stat-row"><div class="sn">Transactions</div>';
+      html += '<div class="stat-val" style="color:var(--text);font-weight:700">' + (db.txn_count || 0).toLocaleString() + '</div>';
+      html += '<div class="sx">uptime ' + formatDuration(db.uptime_seconds || 0) + '</div></div>';
+      html += '</div>';
+
+      // Dead tuples table
+      if (db.dead_tuples && db.dead_tuples.length) {
+        html += '<div style="margin-top:10px;font-size:10px;color:var(--muted);padding:0 14px">Dead Tuples (top ' + db.dead_tuples.length + ')</div>';
+        html += '<table class="tbl"><tr><th>Table</th><th>Dead</th><th>Live</th><th>Dead %</th></tr>';
+        db.dead_tuples.forEach(d => {
+          const dp = d.dead_pct || 0;
+          const dc = dp > 20 ? 'r' : dp > 5 ? 'y' : '';
+          html += '<tr><td>' + esc(d.table_name) + '</td><td>' + d.n_dead_tup + '</td><td>' + d.n_live_tup + '</td><td class="' + dc + '">' + dp + '%</td></tr>';
+        });
+        html += '</table>';
+      }
+    }
+    html += '</div></div>';
+
+    // ── Docker Health Donut ──
+    html += '<div class="panel col-3 h-220"><div class="panel-head"><span class="title">Container States</span><span class="sub">' + (h?.total || 0) + ' total</span></div>';
+    html += '<div class="panel-body" id="donutState"></div></div>';
+
+    // ── Per-container CPU/Mem ──
+    html += '<div class="panel col-3 h-220"><div class="panel-head"><span class="title">CPU / Memory</span></div>';
+    html += '<div class="panel-body" style="overflow:auto">';
+    if (stats.containers && stats.containers.length) {
+      html += '<div class="stat-cont">';
+      const maxCpu = Math.max(...stats.containers.map(c => c.cpu || 0), 1);
+      const maxMem = Math.max(...stats.containers.map(c => c.mem_bytes || 0), 1);
+      stats.containers.slice(0, 12).forEach(c => {
+        const cpuPct = Math.min((c.cpu || 0) / maxCpu * 100, 100);
+        const memPct = Math.min((c.mem_bytes || 0) / maxMem * 100, 100);
+        const cpuCol = (c.cpu || 0) > 80 ? 'r' : (c.cpu || 0) > 50 ? 'y' : 'g';
+        html += '<div style="padding:5px 0"><div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">' + esc(c.name) + '</span><span style="color:var(--green);margin-left:6px">' + (c.cpu_str||'?') + '</span><span style="color:var(--blue);margin-left:4px">' + (c.mem_str||'?') + '</span></div>';
+        html += '<div style="display:flex;gap:2px"><div class="stat-bar-wrap"><div class="stat-bar ' + cpuCol + '" style="width:' + cpuPct + '%"></div></div>';
+        html += '<div class="stat-bar-wrap"><div class="stat-bar" style="width:' + memPct + '%;background:linear-gradient(90deg,#58a6ff,#bc8cff)"></div></div></div></div>';
+      });
+      html += '</div>';
+    } else {
+      html += emptyState('No container data', '');
+    }
+    html += '</div></div>';
+
+    // ── Container List ──
+    html += '<div class="panel col-6"><div class="panel-head"><span class="title">Containers</span></div><div class="panel-body">';
+    if (h && h.containers && h.containers.length) {
+      html += '<table class="tbl"><tr><th>Container</th><th>State</th><th>Status</th><th>Uptime</th></tr>';
+      h.containers.forEach(c => {
+        const sc = c.state === 'running' ? 'st2' : c.state === 'exited' ? 'st4' : '';
+        html += '<tr><td><span style="color:var(--purple);font-weight:700">' + esc(c.name) + '</span></td><td class="' + sc + '">' + c.state + '</td><td style="font-size:11px;color:var(--muted)">' + esc(c.status) + '</td><td>' + esc(c.running_for) + '</td></tr>';
+      });
+      html += '</table>';
+    } else {
+      html += emptyState('No container data', '');
+    }
+    html += '</div></div>';
+
+    html += '</div>'; // close dash
+    main.innerHTML = html;
+
+    // Render donut
+    if (h && !h.error) {
+      const donutData = [
+        { label: 'Running', value: h.running || 0, color: COL.green },
+        { label: 'Exited', value: h.exited || 0, color: COL.red },
+        { label: 'Restarting', value: h.restarting || 0, color: COL.yellow },
+        { label: 'Paused', value: h.paused || 0, color: COL.orange },
+        { label: 'Dead', value: h.dead || 0, color: COL.muted },
+      ].filter(d => d.value > 0);
+      const dc = document.getElementById('donutState');
+      if (dc && donutData.length) donutChart(dc, donutData, { centerLabel: 'containers' });
+    }
+
+  } catch (e) {
+    main.innerHTML = '<div class="empty"><div class="big">Error</div><div class="hint">' + esc(e.message) + '</div></div>';
+  }
+}
+
+function formatDuration(sec) {
+  if (!sec || sec < 0) return '0s';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const parts = [];
+  if (d) parts.push(d + 'd');
+  if (h) parts.push(h + 'h');
+  if (m) parts.push(m + 'm');
+  return parts.join(' ') || '<1m';
+}
 
 document.addEventListener('keydown', function(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
