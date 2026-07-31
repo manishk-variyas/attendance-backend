@@ -12,12 +12,16 @@ ExecStart=/usr/bin/python3 /home/app-backend/backend-monorepo/scripts/logdash.py
 Restart=always
 RestartSec=5
 
-# Security hardening (free, safe)
+Environment="LOG_ALERT_HOST=smtp.gmail.com"
+Environment="LOG_ALERT_PORT=587"
+Environment="LOG_ALERT_USER=manishk@variyaslabs.com"
+Environment="LOG_ALERT_PASS=dywz pvob mouz zazf"
+Environment="LOG_ALERT_TO=manishk@variyaslabs.com"
+
 ProtectSystem=strict
 PrivateTmp=true
 NoNewPrivileges=true
 
-# Log to journald
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=logdash

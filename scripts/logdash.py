@@ -15,8 +15,12 @@ import time
 import os
 import signal
 import sys
+import smtplib
+import ssl
 from datetime import datetime, timedelta
 from collections import defaultdict, deque, Counter
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 IST = timedelta(hours=5, minutes=30)
 
@@ -30,6 +34,27 @@ HOST = "127.0.0.1"
 SAMPLE_INTERVAL = 10         # seconds between background samples (was 3)
 HISTORY_MAX = 360            # ~1 hour at 10s sampling (was 600)
 MAX_TAIL_CACHE = 1000        # max log lines to cache in memory (was 5000)
+
+# ─── alerting ────────────────────────────────────────────────────
+
+SMTP_HOST = os.environ.get("LOG_ALERT_HOST", "")
+SMTP_PORT = int(os.environ.get("LOG_ALERT_PORT", "587"))
+SMTP_USER = os.environ.get("LOG_ALERT_USER", "")
+SMTP_PASS = os.environ.get("LOG_ALERT_PASS", "")
+SMTP_FROM = SMTP_USER
+ALERT_TO = [e.strip() for e in os.environ.get("LOG_ALERT_TO", "").split(",") if e.strip()]
+ALERTS_ENABLED = bool(SMTP_HOST and SMTP_USER and SMTP_PASS and ALERT_TO)
+
+_last_alert_time = {}        # {"alert_key": timestamp}
+_high_latency_streak = 0     # consecutive samples with p95 > threshold
+_prev_container_states = {}  # {container_name: "running"|"exited"|...}
+ALERT_COOLDOWNS = {
+    "container_down":  900,   # 15 min
+    "error_spike":      600,   # 10 min
+    "db_conn_high":    1200,   # 20 min
+    "db_cache_low":    1800,   # 30 min
+    "latency_high":     900,   # 15 min
+}
 
 _lock = threading.Lock()
 METRICS_HISTORY = deque(maxlen=HISTORY_MAX)
@@ -62,6 +87,7 @@ def _sampler_loop():
                 LAST_AUDIT_LOGS = list(parse_json_log_lines(audit_lines))
                 
             _sample_metrics()
+            _check_alerts()
         except Exception as e:
             _log(f"sampler error: {e}")
             time.sleep(5)
@@ -124,7 +150,121 @@ def _sample_metrics():
         return {"ts": _now(), "error": str(e)}
 
 
+# ─── alerting ───────────────────────────────────────────────────
 
+def _send_alert_email(subject, html_body):
+    if not ALERTS_ENABLED:
+        _log(f"alert skipped (disabled): {subject}")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_FROM
+        msg["To"] = ", ".join(ALERT_TO)
+        msg["Subject"] = f"[logdash] {subject}"
+        msg.attach(MIMEText(html_body, "html"))
+
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.ehlo()
+            server.starttls(context=ctx)
+            server.ehlo()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        _log(f"alert sent: {subject}")
+        return True
+    except Exception as e:
+        _log(f"alert failed: {subject} — {e}")
+        return False
+
+
+def _can_alert(key, cooldown=None):
+    if cooldown is None:
+        cooldown = ALERT_COOLDOWNS.get(key, 600)
+    now = _now()
+    last = _last_alert_time.get(key, 0)
+    if now - last < cooldown:
+        return False
+    _last_alert_time[key] = now
+    return True
+
+
+def _check_alerts():
+    global _high_latency_streak
+    sample = LAST_SAMPLE
+    if not sample or sample.get("error"):
+        return
+
+    now = datetime.utcnow() + IST
+    ts = now.strftime("%Y-%m-%d %H:%M:%S IST")
+    alerts = []
+
+    # ── Container state changes ──
+    try:
+        h = docker_health()
+        current_states = {c["name"]: c["state"] for c in h.get("containers", [])}
+        global _prev_container_states
+
+        newly_down = []
+        newly_recovered = []
+        for name, state in current_states.items():
+            prev = _prev_container_states.get(name)
+            if prev == "running" and state != "running":
+                newly_down.append(name)
+            elif prev and prev != "running" and state == "running":
+                newly_recovered.append(name)
+
+        _prev_container_states = current_states
+
+        if newly_down:
+            rows = "".join(f"<tr><td style='color:#bf2600;font-weight:700'>{n}</td></tr>" for n in newly_down)
+            alerts.append(("⚠ Container(s) Went DOWN", f"<h2>Container Crash Detected</h2><table>{rows}</table><p>{ts}</p>"))
+        if newly_recovered:
+            rows = "".join(f"<tr><td style='color:#006644;font-weight:700'>{n}</td></tr>" for n in newly_recovered)
+            alerts.append(("✅ Container(s) Recovered", f"<h2>Container Restarted</h2><table>{rows}</table><p>{ts}</p>"))
+    except Exception:
+        pass
+
+    # ── 5xx spike ──
+    s5xx = sample.get("status_5xx", 0)
+    req = sample.get("req_count", 0)
+    if s5xx > 3 and req > 0 and (s5xx / req) > 0.05:
+        if _can_alert("error_spike"):
+            alerts.append(("⚠ 5xx Spike", f"<h2>{s5xx} server errors</h2><p>{s5xx}/{req} = {round(s5xx/req*100,1)}% error rate</p><p>{ts}</p>"))
+
+    # ── DB checks ──
+    try:
+        db = db_metrics()
+        conn_pct = db.get("connection_pct", 0)
+        if conn_pct > 80 and _can_alert("db_conn_high"):
+            alerts.append(("⚠ DB Connections High", f"<h2>{conn_pct}% connection pool used</h2><p>{db.get('connections',{}).get('total',0)}/{db.get('max_connections',0)}</p><p>{ts}</p>"))
+
+        cache = db.get("cache_hit_ratio", 100)
+        if cache < 90 and _can_alert("db_cache_low"):
+            alerts.append(("⚠ DB Cache Hit Low", f"<h2>Cache hit ratio: {cache}%</h2><p>Disk reads increasing — may need investigation.</p><p>{ts}</p>"))
+    except Exception:
+        pass
+
+    # ── High latency ──
+    p95 = sample.get("p95", 0)
+    if p95 > 5000:
+        _high_latency_streak += 1
+        if _high_latency_streak >= 3 and _can_alert("latency_high"):
+            alerts.append(("⚠ High Latency", f"<h2>P95 latency: {p95}ms</h2><p>Sustained for {_high_latency_streak} samples ({_high_latency_streak * SAMPLE_INTERVAL}s)</p><p>{ts}</p>"))
+    else:
+        _high_latency_streak = 0
+
+    for subject, body in alerts:
+        _send_alert_email(subject, _alert_wrapper(body))
+
+
+def _alert_wrapper(body):
+    return f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f5f7;padding:32px">
+<table width="100%"><tr><td align="center">
+<table width="560" style="background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);overflow:hidden">
+<tr><td style="background:linear-gradient(135deg,#1a2332,#2d3f54);padding:24px 32px;color:#fff;font-size:18px;font-weight:700">logdash Alert</td></tr>
+<tr><td style="padding:28px 32px;font-size:14px;color:#172b4d;line-height:1.6">{body}</td></tr>
+<tr><td style="background:#f4f5f7;padding:16px 32px;font-size:11px;color:#8993a4;text-align:center">Automated alert from logdash monitoring. Do not reply.</td></tr>
+</table></td></tr></table></body></html>"""
 
 
 # ─── docker helpers ──────────────────────────────────────────────

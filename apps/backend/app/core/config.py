@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     MINIO_ASSETS_BUCKET: str = "company-assets"
     MINIO_REGION: str = "us-east-1"
 
+    # SMTP Email settings
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""          # Set via .env
+    SMTP_PASS: str = ""          # Set via .env — use Gmail App Password
+    SMTP_FROM: str = ""          # Set via .env — sender email address
+    SMTP_ENABLED: bool = False   # Set to True in .env to enable email notifications
+
 
 
 

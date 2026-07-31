@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, date, timedelta
+import asyncio
 import io
 from typing import List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, L
 from app.features.redmine.sql_service import RedmineSQLService
 from app.services.database.leave_service import LeaveService as LeaveDBService, LeaveBalanceService
 from app.services.database.holiday_service import HolidayService as HolidayDBService
+from app.services.email_service import email_service
 from app.models.leave import Leave
 from app.models.leave_balance import LeaveBalance
 from app.models.holiday import Holiday
@@ -25,6 +27,31 @@ class LeaveBusinessService:
         self.leave_db = leave_db
         self.holiday_db = holiday_db
         self.balance_db = balance_db
+
+    def _get_employee_name(self, email: str) -> str:
+        if not email:
+            return "Unknown"
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.user_email == email)
+        ).scalars().first()
+        if emp:
+            return f"{emp.first_name or ''} {emp.last_name or ''}".strip()
+        return email
+
+    def _get_approver_email(self, leave) -> str | None:
+        if not leave.approver_id:
+            return None
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == leave.approver_id)
+        ).scalars().first()
+        return emp.user_email if emp else None
+
+    def _send_email_bg(self, method, *args):
+        try:
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, method, *args)
+        except RuntimeError:
+            pass
 
     async def validate_leave_dates(self, start_date: datetime, end_date: datetime, user_id: str = None, leave_dates: list = None) -> dict:
         IST = ZoneInfo("Asia/Kolkata")
@@ -228,6 +255,34 @@ class LeaveBusinessService:
                 remaining = (balance.accrued_compoff or 0.0) - (balance.consumed_compoff or 0.0)
             balance_info["remaining"] = remaining
             balance_info["will_be_negative"] = remaining < requested_days if remaining is not None else None
+
+        applicant_name = self._get_employee_name(email)
+        start_str = str(dates[0])
+        end_str = str(dates[-1])
+        reason_str = leave_data.reason or leave_data.comment or ""
+
+        self._send_email_bg(
+            email_service.send_leave_applied_confirmation,
+            email,
+            applicant_name,
+            start_str,
+            end_str,
+            reason_str,
+        )
+
+        if leave_data.approver_id:
+            emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == leave_data.approver_id)
+            ).scalars().first()
+            if emp and emp.user_email:
+                self._send_email_bg(
+                    email_service.send_leave_applied,
+                    emp.user_email,
+                    applicant_name,
+                    start_str,
+                    end_str,
+                    reason_str,
+                )
 
         return {"leave_id": leave_ids[0], "leave_ids": leave_ids, "created": len(leave_ids), "balance": balance_info}
 
@@ -679,6 +734,14 @@ class LeaveBusinessService:
             elif leave_type == LeaveType.PL.value:
                 self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
 
+        self._send_email_bg(
+            email_service.send_leave_approved,
+            leave.user_email,
+            self._get_employee_name(leave.user_email),
+            str(leave.start_date),
+            str(leave.end_date),
+        )
+
         return True
 
     async def reject_leave(self, leave_id: str, current_user: dict) -> bool:
@@ -716,6 +779,15 @@ class LeaveBusinessService:
             rejected_at=now, 
             rejected_by=actor_email,
         )
+
+        self._send_email_bg(
+            email_service.send_leave_rejected,
+            leave.user_email,
+            self._get_employee_name(leave.user_email),
+            str(leave.start_date),
+            str(leave.end_date),
+        )
+
         return True
 
     async def batch_approve_leaves(self, leave_ids: list, current_user: dict) -> dict:
@@ -1064,6 +1136,17 @@ class LeaveBusinessService:
             updated_at=now,
         )
 
+        approver_email = self._get_approver_email(leave)
+        if approver_email:
+            self._send_email_bg(
+                email_service.send_cancel_requested,
+                approver_email,
+                self._get_employee_name(leave.user_email),
+                str(leave.start_date),
+                str(leave.end_date),
+                remark,
+            )
+
         return {"message": "Cancellation request submitted", "attempt": current_attempts + 1, "limit": 5}
 
     async def approve_cancel_leave(self, leave_id: str, current_user: dict) -> dict:
@@ -1104,6 +1187,14 @@ class LeaveBusinessService:
             updated_at=now,
         )
 
+        self._send_email_bg(
+            email_service.send_cancel_approved,
+            leave.user_email,
+            self._get_employee_name(leave.user_email),
+            str(leave.start_date),
+            str(leave.end_date),
+        )
+
         return {"message": "Cancellation approved"}
 
     async def reject_cancel_leave(self, leave_id: str, current_user: dict, remark: str) -> dict:
@@ -1137,6 +1228,15 @@ class LeaveBusinessService:
             cancellation_rejected_by=current_user.get("email"),
             cancellation_rejection_remark=remark,
             updated_at=now,
+        )
+
+        self._send_email_bg(
+            email_service.send_cancel_rejected,
+            leave.user_email,
+            self._get_employee_name(leave.user_email),
+            str(leave.start_date),
+            str(leave.end_date),
+            remark,
         )
 
         return {"message": "Cancellation request rejected"}

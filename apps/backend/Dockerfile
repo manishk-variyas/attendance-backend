@@ -50,4 +50,4 @@ RUN crontab ./scripts/log-cleanup.cron
 EXPOSE 8000
 
 # Start cron daemon in background, then run the FastAPI server
-CMD ["sh", "-c", "cron && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "cron && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
