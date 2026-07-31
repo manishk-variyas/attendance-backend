@@ -1,17 +1,3 @@
-# Dependencies
-node_modules/
-.pnpm-store/
-
-# Build outputs
-dist/
-build/
-.next/
-.nuxt/
-out/
-
-# Turbo
-.turbo/
-
 # Environment
 .env
 .env.*
@@ -19,8 +5,6 @@ out/
 
 # Logs
 *.log
-npm-debug.log*
-pnpm-debug.log*
 
 # IDE
 .vscode/

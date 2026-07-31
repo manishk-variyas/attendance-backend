@@ -4,8 +4,7 @@ Backend monorepo for attendance system with Keycloak authentication.
 
 ## Tech Stack
 
-- **Package Manager**: pnpm
-- **Orchestration**: Turbo
+- **Package Manager**: uv
 - **Backend**: FastAPI (Python 3.14+)
 - **Database**: PostgreSQL
 - **Cache**: Redis
@@ -13,8 +12,7 @@ Backend monorepo for attendance system with Keycloak authentication.
 
 ## Prerequisites
 
-- Node.js + pnpm
-- Python 3.14+
+- Python 3.14+ (uv)
 - Docker & Docker Compose
 
 ## Setup
@@ -22,7 +20,8 @@ Backend monorepo for attendance system with Keycloak authentication.
 ### 1. Install dependencies
 
 ```bash
-pnpm install
+cd apps/backend
+uv sync
 ```
 
 ### 2. Set up environment variables
@@ -40,21 +39,13 @@ Edit `.env` with your configuration (database URL, Keycloak settings, etc.).
 ```bash
 # Start PostgreSQL, Redis, Keycloak, Nginx
 docker-compose -f infra/docker-compose.yml up -d
-
-# Or start only Keycloak
-pnpm run infra:up
 ```
 
 ### 4. Start the backend
 
 ```bash
-# Development mode with hot reload
-pnpm run dev
-
-# Or in backend directory
-cd apps/backend
-uv sync
-pnpm run dev
+# Development mode with hot reload (from apps/backend)
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 The API runs at `http://localhost:8000`. API docs at `http://localhost:8000/docs`.
@@ -63,14 +54,8 @@ The API runs at `http://localhost:8000`. API docs at `http://localhost:8000/docs
 
 | Command | Description |
 |---------|-------------|
-| `pnpm install` | Install all dependencies |
-| `pnpm dev` | Run all apps in dev mode |
-| `pnpm build` | Build all apps |
-| `pnpm test` | Run tests |
-| `pnpm lint` | Lint all apps |
-| `pnpm format` | Format code with Prettier |
-| `pnpm infra:up` | Start Keycloak |
-| `pnpm infra:down` | Stop Keycloak |
+| `uv sync` | Install Python dependencies |
+| `uv run uvicorn app.main:app --reload` | Run backend in dev mode |
 
 ## Project Structure
 
@@ -80,7 +65,7 @@ backend-monorepo/
 │   └── backend/          # FastAPI application
 ├── docs/                 # Documentation
 ├── infra/                # Docker configs (Keycloak, Redis, Nginx)
-└── packages/             # Shared packages
+└── scripts/              # Internal scripts (logdash, etc.)
 ```
 
 ## Documentation

@@ -14,8 +14,8 @@
 - When proposing changes, always mention the specific files and line numbers affected.
 
 ### Package Management
-- Never run `pnpm install`, `uv add`, `uv sync`, `uv pip install`, `npm install`, or similar without asking.
-- Never modify `pyproject.toml` dependencies or `package.json` without asking.
+- Never run `uv add`, `uv sync`, `uv pip install`, or similar without asking.
+- Never modify `pyproject.toml` dependencies without asking.
 
 ### Infrastructure
 - Never start, stop, or restart Docker containers (`docker-compose up/down`, `docker run`, etc.) without asking.
@@ -35,7 +35,6 @@
 
 ### Project Architecture
 This is an **attendance system backend monorepo** using:
-- **pnpm** workspace manager + **Turbo** for orchestration
 - **Python 3.14+** with **FastAPI** as the web framework
 - **PostgreSQL** (via SQLAlchemy 2.0 ORM) + **Redis** (sessions/cache)
 - **Keycloak** for authentication (OIDC)
@@ -117,11 +116,8 @@ logger.info("message", extra={"extra_data": {...}})
 
 | Command | Purpose |
 |---------|---------|
-| `pnpm dev` | Run backend in dev mode (hot reload) |
-| `pnpm build` | Build all apps |
-| `pnpm lint` | Lint all apps |
-| `pnpm test` | Run tests |
-| `pnpm format` | Format code (Prettier) |
+| `uv sync` | Install Python dependencies (in `apps/backend/`) |
+| `uv run uvicorn app.main:app --reload` | Run backend in dev mode (hot reload) |
 
 ## Best Practices
 
@@ -131,8 +127,7 @@ logger.info("message", extra={"extra_data": {...}})
 - Check if a reusable service/utility already exists before creating one.
 
 ### After Writing Code
-- Always run `pnpm lint` and fix any issues.
-- Run `pnpm test` if tests exist for the modified feature.
+- Verify the code runs (backend tests via `uv run pytest` if available).
 - Never leave commented-out code without explaining why.
 
 ### Code Quality
