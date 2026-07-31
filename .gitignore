@@ -47,3 +47,6 @@ venv/
 # Temporary
 *.tmp
 *.temp
+
+# Logdash / internal scripts (keep off github)
+scripts/

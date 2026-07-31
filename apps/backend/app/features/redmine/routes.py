@@ -705,10 +705,44 @@ async def download_attachment(
 async def delete_attachment(
     attachment_id: int,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     roles = current_user.get("roles", [])
-    if "Admin" not in roles:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    email = current_user.get("email")
+
+    if not roles:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+    is_tr = "Technical Resource" in roles and not is_admin and not is_pm_or_pc
+
+    sql = RedmineSQLService(db)
+    info = sql.get_attachment_issue_info(attachment_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    user = sql.get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Redmine user not found")
+    redmine_user_id = user["id"]
+
+    if is_admin:
+        pass
+    elif is_pm_or_pc:
+        if not sql.is_project_member(redmine_user_id, info["project_id"]):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not a member of this issue's project",
+            )
+    elif is_tr:
+        if info["assigned_to_id"] != redmine_user_id and info["author_id"] != redmine_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only delete attachments from tickets assigned to you",
+            )
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     deleted = await redmine_service.delete_attachment(attachment_id)
     if not deleted:

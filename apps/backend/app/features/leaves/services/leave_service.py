@@ -728,11 +728,13 @@ class LeaveBusinessService:
         )
 
         # ── Update leave balance (consume credit) ──────────────────────────
-        if balance:
-            if leave_type == LeaveType.EL.value:
-                self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
-            elif leave_type == LeaveType.PL.value:
-                self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
+        # NOTE: Auto-deduction disabled — balance managed manually via admin panel.
+        # Uncomment below to re-enable automatic balance deduction on approval.
+        # if balance:
+        #     if leave_type == LeaveType.EL.value:
+        #         self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
+        #     elif leave_type == LeaveType.PL.value:
+        #         self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
 
         self._send_email_bg(
             email_service.send_leave_approved,
@@ -925,11 +927,13 @@ class LeaveBusinessService:
                 LeaveBalance.month.is_(None),
             )
         ).scalars().first()
-        if balance:
-            if leave.leave_type == LeaveType.EL.value:
-                self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
-            elif leave.leave_type == LeaveType.PL.value:
-                self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
+        # NOTE: Auto-deduction disabled — balance managed manually via admin panel.
+        # Uncomment below to re-enable automatic balance deduction on batch approval.
+        # if balance:
+        #     if leave.leave_type == LeaveType.EL.value:
+        #         self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
+        #     elif leave.leave_type == LeaveType.PL.value:
+        #         self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
 
     async def _do_reject(self, leave_id: str, leave, current_user: dict) -> None:
         now = datetime.utcnow()
@@ -947,8 +951,10 @@ class LeaveBusinessService:
         now = datetime.utcnow()
         actor_email = current_user.get("email")
 
-        if leave.approval_status == LeaveStatus.APPROVED.value:
-            self._reverse_balance(leave)
+        # NOTE: Auto-restore disabled — balance managed manually via admin panel.
+        # Uncomment below to re-enable automatic balance reversal on cancellation.
+        # if leave.approval_status == LeaveStatus.APPROVED.value:
+        #     self._reverse_balance(leave)
 
         self.leave_db.update(
             Leave, leave_id,
@@ -1177,7 +1183,10 @@ class LeaveBusinessService:
                 raise HTTPException(status_code=403, detail="Not authorized to approve cancellation for this user")
 
         now = datetime.utcnow()
-        self._reverse_balance(leave)
+
+        # NOTE: Auto-restore disabled — balance managed manually via admin panel.
+        # Uncomment below to re-enable automatic balance reversal on cancellation approval.
+        # self._reverse_balance(leave)
 
         self.leave_db.update(
             Leave, leave_id,
@@ -1301,7 +1310,8 @@ class LeaveBusinessService:
                     continue
 
             if action == "approve_cancel":
-                self._reverse_balance(leave)
+                # NOTE: Auto-restore disabled — balance managed manually via admin panel.
+                # self._reverse_balance(leave)
                 self.leave_db.update(
                     Leave, leave_id,
                     approval_status=LeaveStatus.CANCELLED.value,

@@ -501,3 +501,22 @@ class RedmineSQLService:
             {"project_id": project_id},
         ).fetchall()
         return [{"id": r[0], "name": r[1]} for r in rows]
+
+    def get_attachment_issue_info(self, attachment_id: int) -> dict | None:
+        row = self.db.execute(
+            text("""
+                SELECT a.container_id, i.project_id, i.author_id, i.assigned_to_id
+                FROM redmine.attachments a
+                JOIN redmine.issues i ON i.id = a.container_id
+                WHERE a.id = :id AND a.container_type = 'Issue'
+            """),
+            {"id": attachment_id},
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "issue_id": row[0],
+            "project_id": row[1],
+            "author_id": row[2],
+            "assigned_to_id": row[3],
+        }
