@@ -49,5 +49,5 @@ RUN crontab ./scripts/log-cleanup.cron
 # Expose the API port
 EXPOSE 8000
 
-# Start cron daemon in background, then run the FastAPI server
-CMD ["sh", "-c", "cron && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
+# Start cron daemon in background, then run Gunicorn with Uvicorn workers
+CMD ["sh", "-c", "cron && uv run gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000 app.main:app"]

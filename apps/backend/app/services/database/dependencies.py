@@ -5,7 +5,6 @@ from app.core.database import get_db
 from app.services.database.shift_service import ShiftService, ShiftDefinitionService
 from app.services.database.leave_service import LeaveService, LeaveBalanceService
 from app.services.database.holiday_service import HolidayService
-from app.services.database.notification_service import NotificationService
 from app.services.database.recording_service import RecordingService
 from app.services.database.location_service import LocationService
 from app.services.database.office_location_service import OfficeLocationService
@@ -27,9 +26,6 @@ def get_leave_balance_service(db: Session = Depends(get_db)) -> LeaveBalanceServ
 
 def get_holiday_service(db: Session = Depends(get_db)) -> HolidayService:
     return HolidayService(db)
-
-def get_notification_service(db: Session = Depends(get_db)) -> NotificationService:
-    return NotificationService(db)
 
 def get_recording_service(db: Session = Depends(get_db)) -> RecordingService:
     return RecordingService(db)

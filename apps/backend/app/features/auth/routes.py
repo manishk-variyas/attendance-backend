@@ -121,6 +121,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
 
 
 @router.post("/refresh")
+@limiter.limit("20/minute")
 async def refresh_session_endpoint(
     request: Request,
     current_user: dict = Depends(get_current_user),
@@ -197,6 +198,7 @@ async def refresh_session_endpoint(
 
 
 @router.post("/logout")
+@limiter.limit("10/minute")
 async def logout(request: Request):
     """
     Logout endpoint - ends the user's session.
@@ -236,6 +238,7 @@ async def logout(request: Request):
 
 
 @router.post("/backchannel-logout")
+@limiter.limit("30/minute")
 async def backchannel_logout(request: Request, logout_token: str = Form(...)):
     """
     Backchannel logout endpoint for Keycloak SSO logout.

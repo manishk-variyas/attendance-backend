@@ -9,7 +9,7 @@ This module:
 - Sets up exception handlers for rate limiting
 
 The app acts as a Backend-for-Frontend (BFF) that sits between
-the frontend and Keycloak, using server-side sessions stored in Redis.
+the frontend and Keycloak.
 """
 import logging
 from datetime import datetime, timezone
@@ -54,6 +54,24 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={"detail": "Too many requests. Please try again later."},
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    from fastapi.responses import JSONResponse
+    correlation_id = getattr(request.state, "correlation_id", "-")
+    logging.getLogger("app.error").error(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}",
+        extra={
+            "correlation_id": correlation_id,
+            "extra_data": {"method": request.method, "path": request.url.path},
+        },
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "correlation_id": correlation_id},
     )
 
 

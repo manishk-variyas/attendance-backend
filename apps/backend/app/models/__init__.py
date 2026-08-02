@@ -5,7 +5,6 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.leave import Leave
 from app.models.holiday import Holiday
 from app.models.leave_balance import LeaveBalance
-from app.models.notification import Notification
 from app.models.recording import Recording
 from app.models.location import UserLocation
 from app.models.system_setting import SystemSetting
@@ -20,7 +19,6 @@ __all__ = [
     "Leave",
     "Holiday",
     "LeaveBalance",
-    "Notification",
     "Recording",
     "UserLocation",
     "SystemSetting",
