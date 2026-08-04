@@ -19,7 +19,7 @@ from slowapi.util import get_remote_address
 from app.core.config import settings
 
 # Default rate limit for all un-decorated endpoints
-DEFAULT_RATE_LIMIT = "100/minute"
+DEFAULT_RATE_LIMIT = f"{settings.RATE_LIMIT_PER_SECOND}/second"
 
 # Create a limiter with a global default limit
 limiter = Limiter(key_func=get_remote_address, default_limits=[DEFAULT_RATE_LIMIT])

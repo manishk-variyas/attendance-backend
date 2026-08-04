@@ -28,7 +28,7 @@ from app.middleware.logging import log_requests
 from app.middleware.active_employee import active_employee_middleware
 from app.middleware.csrf import origin_validation_middleware
 from app.features.auth.routes import router as auth_router
-from app.features.auth.dependencies import get_current_user, require_active
+from app.features.auth.dependencies import get_current_user
 from app.features.redmine.routes import router as redmine_router
 
 
@@ -108,9 +108,7 @@ def health_check():
 
 
 @app.get("/server-time")
-def get_server_time(
-    _: None = Depends(require_active),
-):
+def get_server_time():
     """Returns the current server time in UTC."""
     now = datetime.now(timezone.utc)
     return {
@@ -175,4 +173,8 @@ app.include_router(attendance_router, prefix="/api", tags=["attendance"])
 # Register Admin Attendance routes
 from app.features.attendance.admin_routes import router as admin_attendance_router
 app.include_router(admin_attendance_router, prefix="/api", tags=["admin-attendance"])
+
+# Register Admin Audit Log routes
+from app.features.audit.admin_routes import router as audit_router
+app.include_router(audit_router, prefix="/api", tags=["admin-audit"])
 

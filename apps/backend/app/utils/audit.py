@@ -63,6 +63,7 @@ def log_login(
 def log_logout(
     correlation_id: str,
     username: str = "-",
+    success: bool = True,
     client_ip: str = "-",
     extra: Optional[dict] = None,
 ) -> None:
@@ -72,16 +73,19 @@ def log_logout(
     Args:
         correlation_id: Request correlation ID for tracing
         username: The user that logged out
+        success: True if logout succeeded, False if it failed
         client_ip: IP address of the client
         extra: Additional data to include in the log
     """
+    status = "success" if success else "failed"
     audit_logger.info(
-        f"User logout: {username}",
+        f"User logout: {username} ({status})",
         extra={
             "correlation_id": correlation_id,
             "extra_data": {
                 "action": "logout",
                 "username": username,
+                "status": status,
                 "client_ip": client_ip,
                 **(extra or {}),
             },

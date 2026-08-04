@@ -11,7 +11,7 @@ How it works:
 1. User sends credentials to /auth/login
 2. Backend forwards to Keycloak to verify credentials
 3. On success, Keycloak returns JWT tokens
-4. Backend stores tokens in Redis with a session ID
+4. Backend creates a session in the database with a session ID
 5. Backend sets an HTTP-only cookie with the session ID
 6. Browser only gets the session cookie, not the actual JWTs
 """
@@ -50,7 +50,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     2. Sends these to Keycloak's token endpoint (with client credentials)
     3. If valid, Keycloak returns access_token, refresh_token, etc.
     4. Extracts user info from the access token
-    5. Stores the refresh token in Redis under a new session ID
+    5. Stores the refresh token in a new session ID
     6. Sets an HTTP-only cookie with the session ID (browser never sees the JWTs)
     """
     import httpx
@@ -92,15 +92,17 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     # Block deactivated employees (admins bypass)
     email = user_data.get("email")
     roles = user_data.get("roles", [])
+    is_active = True
     if email and "Admin" not in roles:
         svc = BaseService[EmployeeMaster](db)
         emp = svc.fetch_one(EmployeeMaster, user_email=email)
         if emp and not emp.is_active:
             log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "account_deactivated"})
             raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")
+        is_active = emp.is_active if emp else True
 
     # Enforce single session per user
-    session_id = await create_session(user_data, tokens.get("refresh_token"))
+    session_id = await create_session(user_data, tokens.get("refresh_token"), is_active=is_active)
     await enforce_session_limit(user_data.get("sub"), max_sessions=1)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
@@ -131,7 +133,7 @@ async def refresh_session_endpoint(
     
     How it works:
     1. Gets the session ID from the cookie
-    2. Looks up the session in Redis to get the Keycloak refresh token
+    2. Looks up the session to get the Keycloak refresh token
     3. Sends the refresh token to Keycloak to get new tokens
     4. Creates a new session with the new refresh token
     5. Deletes the old session
@@ -146,7 +148,7 @@ async def refresh_session_endpoint(
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="No session")
 
-    # Look up the session in Redis/Backend session storage
+    # Look up the session in the database
     session_data = await get_session(old_session_id)
     if not session_data:
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
@@ -175,10 +177,11 @@ async def refresh_session_endpoint(
         "username": session_data.get("username"),
         "email": session_data.get("email"),
         "roles": session_data.get("roles", []),
+        "is_active": session_data.get("is_active", True),
     }
 
     # Create new session with new refresh token, delete old session
-    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"))
+    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True))
     await delete_session(old_session_id)
 
     log_session_refresh(correlation_id, username=user_data.get("username"), success=True, client_ip=client_ip)
@@ -207,7 +210,7 @@ async def logout(request: Request):
     1. Gets the session ID from the cookie
     2. Looks up the session to get the Keycloak refresh token
     3. Tells Keycloak to revoke the refresh token
-    4. Deletes the session from Redis
+    4. Deletes the session from the database
     5. Clears the session cookie
     """
     correlation_id = request.state.correlation_id
@@ -226,10 +229,10 @@ async def logout(request: Request):
             if refresh_token:
                 await revoke_keycloak_token(refresh_token)
 
-        # Remove the session from Redis
+        # Remove the session from the database
         await delete_session(session_id)
 
-    log_logout(correlation_id, username=username, client_ip=client_ip)
+    log_logout(correlation_id, username=username, success=True, client_ip=client_ip)
 
     # Clear the session cookie in the browser
     response = JSONResponse({"message": "Logout successful"})

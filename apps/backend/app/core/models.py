@@ -14,8 +14,7 @@ To create a new model:
         id = Column(Integer, primary_key=True)
         ...
 
-Note: This backend currently uses Redis for sessions, not PostgreSQL.
-This base is here for future database models.
+All database models inherit from this Base class.
 """
 from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base

@@ -29,7 +29,6 @@ class Settings(BaseSettings):
     KEYCLOAK_CLIENT_SECRET: str = ""  # Set via .env — no hardcoded default
 
     # Session settings
-    # Sessions are stored in Redis with these settings
     SECRET_KEY: str = ""  # Set via .env — no hardcoded default
     ALGORITHM: str = "HS256"  # JWT signing algorithm
     SESSION_EXPIRE_HOURS: int = 24  # How long sessions last in hours

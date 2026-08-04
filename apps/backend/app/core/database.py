@@ -9,7 +9,7 @@ It provides:
 - get_db(): FastAPI dependency that provides a database session
 
 Note: Currently the database is mainly used by Keycloak (user data).
-This backend stores sessions in Redis, not PostgreSQL.
+This backend stores sessions in PostgreSQL.
 """
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session

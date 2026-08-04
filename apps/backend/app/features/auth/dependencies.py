@@ -22,22 +22,13 @@ from app.core.database import get_db
 
 
 async def get_current_user(request: Request) -> dict:
-    """
-    FastAPI dependency that validates the user's session and returns user info.
-    
-    How it works:
-    1. Get the session_id from the HTTP cookie
-    2. Look up that session in the session store
-    3. If found, return the user data (sub, username, email, roles)
-    4. If not found or missing, raise 401 Unauthorized
-    
-    This is used with FastAPI's Depends() to protect routes.
-    """
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    session_data = await get_session(session_id)
+    session_data = getattr(request.state, "session_data", None)
+    if not session_data:
+        session_data = await get_session(session_id)
     if not session_data:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
