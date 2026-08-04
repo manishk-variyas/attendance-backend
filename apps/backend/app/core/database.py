@@ -106,26 +106,18 @@ def _run_migrations():
         conn.execute(text("""
             DO $$
             BEGIN
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_remark') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_remark VARCHAR(1000);
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_requested_at') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_requested_at TIMESTAMPTZ;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_requested_by') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_requested_by VARCHAR(255);
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejected_at') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_rejected_at TIMESTAMPTZ;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejected_by') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_rejected_by VARCHAR(255);
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_rejection_remark') THEN
-                    ALTER TABLE leaves ADD COLUMN cancellation_rejection_remark VARCHAR(1000);
-                END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='leaves' AND column_name='cancellation_attempts') THEN
                     ALTER TABLE leaves ADD COLUMN cancellation_attempts INTEGER NOT NULL DEFAULT 0;
+                END IF;
+            END $$;
+        """))
+        conn.commit()
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='password_reset_tokens' AND column_name='reset_attempts') THEN
+                    ALTER TABLE password_reset_tokens ADD COLUMN reset_attempts INTEGER NOT NULL DEFAULT 0;
                 END IF;
             END $$;
         """))

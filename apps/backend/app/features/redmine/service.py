@@ -389,6 +389,8 @@ class RedmineService:
             payload["user"]["lastname"] = data["lastname"]
         if "mail" in data:
             payload["user"]["mail"] = data["mail"]
+        if "password" in data:
+            payload["user"]["password"] = data["password"]
 
         if not payload["user"]:
             return True

@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""          # Set via .env — sender email address
     SMTP_ENABLED: bool = False   # Set to True in .env to enable email notifications
 
+    # Password reset token expiry in minutes
+    RESET_TOKEN_EXPIRE_MINUTES: int = 15
+
 
 
 

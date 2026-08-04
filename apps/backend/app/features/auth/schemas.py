@@ -94,3 +94,28 @@ class SignupRequest(BaseModel):
 class SignupResponse(BaseModel):
     message: str
     user_id: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=2000)
+    password: str = Field(..., min_length=8, max_length=20)
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Token must not be empty")
+        return v.strip()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if len(v) > 20:
+            raise ValueError("Password must be at most 20 characters")
+        return v

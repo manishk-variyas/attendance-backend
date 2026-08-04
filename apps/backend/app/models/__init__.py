@@ -11,6 +11,7 @@ from app.models.system_setting import SystemSetting
 from app.models.employee_master import EmployeeMaster
 from app.models.attendance import Attendance
 from app.models.session import Session
+from app.models.password_reset import PasswordResetToken
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "SystemSetting",
     "EmployeeMaster",
     "Attendance",
+    "PasswordResetToken",
 ]

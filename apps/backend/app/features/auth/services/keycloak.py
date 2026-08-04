@@ -227,6 +227,29 @@ async def remove_realm_role_from_user(user_id: str, role_name: str) -> bool:
     return resp.status_code == 204
 
 
+async def get_keycloak_user_by_email(email: str) -> dict:
+    """
+    Look up a Keycloak user by email address via Admin API.
+    
+    Returns the first matching user dict with keys: id, username, email.
+    Returns empty dict if no user found.
+    """
+    admin_token = await get_admin_token()
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users",
+            params={"email": email, "max": 1},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    if resp.status_code != 200:
+        return {}
+    users = resp.json()
+    if not users:
+        return {}
+    u = users[0]
+    return {"id": u["id"], "username": u.get("username", ""), "email": u.get("email", "")}
+
+
 async def update_keycloak_user(user_id: str, data: dict) -> bool:
     """Update a Keycloak user's profile."""
     admin_token = await get_admin_token()

@@ -16,23 +16,34 @@ How it works:
 6. Browser only gets the session cookie, not the actual JWTs
 """
 import logging
+import secrets
+import asyncio
+import hashlib
+import logging
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
+from jose import jwt
+from jose.exceptions import JWTError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
 from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub
-from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user
+from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user, get_keycloak_user_by_email
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.models.employee_master import EmployeeMaster
+from app.models.password_reset import PasswordResetToken
 from app.services.database.base_service import BaseService
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
+from app.utils.email import send_password_reset_email
 from app.middleware.logging import _get_client_ip
-from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse
+from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse, ForgotPasswordRequest, ResetPasswordRequest
 from app.features.redmine.service import redmine_service
 
 logger = logging.getLogger(__name__)
@@ -285,6 +296,187 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
 
     # Return 204 No Content as per spec
     return JSONResponse(status_code=204, content=None)
+
+
+@router.post("/forgot-password")
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, payload: ForgotPasswordRequest):
+    """
+    Forgot Password — sends a password reset link to the user's email.
+    Always returns success to prevent email enumeration.
+    """
+    correlation_id = request.state.correlation_id
+    client_ip = _get_client_ip(request)
+
+    try:
+        kc_user = await get_keycloak_user_by_email(payload.email)
+        if not kc_user:
+            log_security_event(
+                correlation_id, "forgot_password",
+                f"Email not found: {payload.email}",
+                severity="info",
+                extra={"email": payload.email, "client_ip": client_ip},
+            )
+            return {"message": "If the email is registered, a reset link has been sent."}
+
+        db = SessionLocal()
+        try:
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            daily_count = db.query(PasswordResetToken).filter(
+                PasswordResetToken.user_sub == kc_user["id"],
+                PasswordResetToken.created_at >= today,
+            ).count()
+
+            if daily_count >= 5:
+                log_security_event(
+                    correlation_id, "forgot_password",
+                    f"Daily limit reached for {payload.email}",
+                    severity="warning",
+                    extra={"email": payload.email, "client_ip": client_ip},
+                )
+                return {"message": "You've reached the maximum password reset requests for today. Please try again tomorrow."}
+        finally:
+            db.close()
+
+        token_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        expire_minutes = settings.RESET_TOKEN_EXPIRE_MINUTES
+        claims = {
+            "sub": kc_user["id"],
+            "email": kc_user["email"],
+            "jti": token_id,
+            "purpose": "password_reset",
+            "iat": now,
+            "exp": now + timedelta(minutes=expire_minutes),
+        }
+        reset_token = jwt.encode(claims, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+        token_hash = hashlib.sha256(reset_token.encode()).hexdigest()
+
+        db = SessionLocal()
+        try:
+            rt = PasswordResetToken(
+                id=token_id,
+                user_sub=kc_user["id"],
+                token_hash=token_hash,
+                expires_at=now + timedelta(minutes=expire_minutes),
+            )
+            db.add(rt)
+            db.commit()
+        finally:
+            db.close()
+
+        reset_link = f"{settings.FRONTEND_URL}/reset-password?token={reset_token}"
+        await send_password_reset_email(kc_user["email"], reset_link)
+
+        log_security_event(
+            correlation_id, "forgot_password",
+            f"Reset email sent to {kc_user['email']}",
+            severity="info",
+            extra={"email": kc_user["email"], "client_ip": client_ip},
+        )
+
+    except Exception as e:
+        logger.error(f"Forgot password error: {e}")
+
+    return {"message": "If the email is registered, a reset link has been sent."}
+
+
+@router.post("/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(request: Request, payload: ResetPasswordRequest):
+    """
+    Reset Password — validates the reset token from email and sets a new password
+    in both Keycloak and Redmine. Invalidates all existing sessions.
+    """
+    correlation_id = request.state.correlation_id
+    client_ip = _get_client_ip(request)
+
+    try:
+        claims = jwt.decode(
+            payload.token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            options={"require": ["sub", "email", "jti", "exp", "purpose"]},
+        )
+    except JWTError:
+        log_security_event(
+            correlation_id, "password_reset",
+            "Invalid or expired reset token",
+            severity="warning", extra={"client_ip": client_ip},
+        )
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
+
+    if claims.get("purpose") != "password_reset":
+        raise HTTPException(status_code=400, detail="Invalid reset link.")
+
+    token_id = claims["jti"]
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    user_sub = claims["sub"]
+    user_email = claims.get("email", "")
+
+    db = SessionLocal()
+    try:
+        stored = db.query(PasswordResetToken).filter(
+            PasswordResetToken.id == token_id,
+            PasswordResetToken.token_hash == token_hash,
+        ).first()
+
+        if not stored or stored.used:
+            raise HTTPException(status_code=400, detail="This reset link has already been used or is invalid.")
+
+        if stored.expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
+
+        if stored.reset_attempts >= 5:
+            await asyncio.sleep(5)
+            raise HTTPException(status_code=400, detail="Too many failed attempts. Please request a new reset link.")
+
+        success = await set_keycloak_password(user_sub, payload.password)
+        if not success:
+            stored.reset_attempts += 1
+            db.commit()
+            delay = min(2 ** stored.reset_attempts, 30)
+            await asyncio.sleep(delay)
+            log_security_event(
+                correlation_id, "password_reset",
+                f"Keycloak password update failed for {user_sub} (attempt {stored.reset_attempts})",
+                severity="error", extra={"client_ip": client_ip},
+            )
+            raise HTTPException(status_code=500, detail="Failed to reset password. Please try again.")
+
+        if user_email:
+            try:
+                rm_user = await redmine_service.get_user_by_email(user_email)
+                if rm_user and rm_user.get("id"):
+                    await redmine_service.update_user(rm_user["id"], {"password": payload.password})
+                    logger.info(f"Redmine password synced for {user_email}")
+                else:
+                    logger.warning(f"Redmine user not found for {user_email} — creating sync user")
+                    await redmine_service.create_user(
+                        user_email.split("@")[0],
+                        user_email,
+                        password=payload.password,
+                    )
+            except Exception as e:
+                logger.error(f"Redmine password sync failed for {user_email}: {e}")
+
+        deleted = await delete_sessions_by_sub(user_sub)
+        logger.info(f"Invalidated {deleted} sessions for user {user_sub} after password reset")
+
+        stored.used = True
+        db.commit()
+
+        log_security_event(
+            correlation_id, "password_reset",
+            f"Password reset successful for {user_email}",
+            severity="info",
+            extra={"user_sub": user_sub, "email": user_email, "sessions_deleted": deleted, "client_ip": client_ip},
+        )
+
+    finally:
+        db.close()
+
+    return {"message": "Password reset successful. You can now login with your new password."}
 
 
 @router.post("/signup")
