@@ -52,3 +52,21 @@ async def send_password_reset_email(to_email: str, reset_link: str):
 </body>
 </html>"""
     return await loop.run_in_executor(None, _send_email, to_email, subject, html)
+
+
+async def send_password_changed_email(to_email: str):
+    loop = __import__("asyncio").get_running_loop()
+    subject = "Your Password Was Changed — Attendance App"
+    html = """\
+<html>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+  <h2>Password Changed</h2>
+  <p>Your password has been successfully changed.</p>
+  <p style="color: #16a34a; font-weight: bold;">If you made this change, no further action is needed.</p>
+  <p style="color: #dc2626; font-weight: bold;">If you DID NOT make this change, please contact your administrator
+     immediately — your account may be compromised.</p>
+  <hr>
+  <p style="color:#888;font-size:12px;">Attendance App</p>
+</body>
+</html>"""
+    return await loop.run_in_executor(None, _send_email, to_email, subject, html)

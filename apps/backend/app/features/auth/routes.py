@@ -41,7 +41,7 @@ from app.models.password_reset import PasswordResetToken
 from app.services.database.base_service import BaseService
 from app.utils.jwt import get_user_info_from_token
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
-from app.utils.email import send_password_reset_email
+from app.utils.email import send_password_reset_email, send_password_changed_email
 from app.middleware.logging import _get_client_ip
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse, ForgotPasswordRequest, ResetPasswordRequest
 from app.features.redmine.service import redmine_service
@@ -472,6 +472,9 @@ async def reset_password(request: Request, payload: ResetPasswordRequest):
             severity="info",
             extra={"user_sub": user_sub, "email": user_email, "sessions_deleted": deleted, "client_ip": client_ip},
         )
+
+        if user_email:
+            await send_password_changed_email(user_email)
 
     finally:
         db.close()
