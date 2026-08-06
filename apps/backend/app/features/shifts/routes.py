@@ -13,6 +13,7 @@ from app.features.redmine.service import redmine_service
 from app.models.leave import Leave
 from app.models.shift import Shift
 from app.models.employee_master import EmployeeMaster
+from app.models.holiday import Holiday
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,21 @@ async def create_shift(
     from app.services.database.shift_service import ShiftService as PGShiftService
     svc = PGShiftService(db)
     current_date = start
+    skipped_weekends = 0
+    skipped_holidays = 0
     while current_date <= end:
+        if payload.skipWeekends and current_date.weekday() >= 5:
+            skipped_weekends += 1
+            current_date += timedelta(days=1)
+            continue
+        if payload.skipHolidays:
+            holiday_query = db.query(Holiday).filter(Holiday.holiday_date == current_date)
+            if payload.country:
+                holiday_query = holiday_query.filter(Holiday.country_code == payload.country)
+            if holiday_query.first():
+                skipped_holidays += 1
+                current_date += timedelta(days=1)
+                continue
         date_str = current_date.isoformat()
         await check_and_resolve_tr_availability(db, payload.userId, payload.userEmail, date_str, date_str)
         shift_data = {**base, "date": date_str, "endDate": date_str}
@@ -158,7 +173,15 @@ async def create_shift(
 
     if len(created) == 1:
         return created[0]
-    return {"created": len(created), "shifts": created}
+    response = {"created": len(created), "shifts": created}
+    skipped = {}
+    if payload.skipWeekends:
+        skipped["weekends"] = skipped_weekends
+    if payload.skipHolidays:
+        skipped["holidays"] = skipped_holidays
+    if skipped:
+        response["skipped"] = skipped
+    return response
 
 
 @router.post("/validate")

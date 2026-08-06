@@ -3,12 +3,16 @@ import json
 import os
 import time
 from datetime import datetime
+from io import BytesIO
 from typing import Optional
 
+import openpyxl
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.limiter import limiter
+from app.middleware.logging import _get_client_ip
+from app.utils.audit import audit_logger
 from app.features.auth.dependencies import get_current_user, require_admin
 
 router = APIRouter(prefix="/admin/audit-logs", tags=["admin-audit"])
@@ -16,7 +20,6 @@ router = APIRouter(prefix="/admin/audit-logs", tags=["admin-audit"])
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 AUDIT_LOG_PATH = os.path.join(LOG_DIR, "audit.log")
 
-MAX_ENTRIES = 500
 STREAM_TIMEOUT = 900
 
 
@@ -40,41 +43,116 @@ async def get_audit_logs(
     since: Optional[str] = Query(None),
     until: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Search by username"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(50, description="Results per page"),
 ):
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    search_term = (search or "").strip().lower()[:100]
+
     entries = []
     since_dt = datetime.fromisoformat(since) if since else None
     until_dt = datetime.fromisoformat(until) if until else None
 
-    if not os.path.exists(AUDIT_LOG_PATH):
-        return {"entries": []}
-
-    with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            entry = _parse_log_line(line)
-            if not entry:
-                continue
-            metadata = entry.get("metadata") or {}
-            if metadata.get("action") == "backchannel_logout":
-                continue
-            if action and metadata.get("action", "").lower() != action.lower():
-                continue
-            if since_dt or until_dt:
-                try:
-                    ts = entry.get("time", "")
-                    if not ts:
-                        continue
-                    entry_time = datetime.fromisoformat(ts)
-                    if since_dt and entry_time < since_dt:
-                        continue
-                    if until_dt and entry_time > until_dt:
-                        continue
-                except (ValueError, TypeError):
+    if os.path.exists(AUDIT_LOG_PATH):
+        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                entry = _parse_log_line(line)
+                if not entry:
                     continue
-            entries.append(entry)
+                metadata = entry.get("metadata") or {}
+                if metadata.get("action") == "backchannel_logout":
+                    continue
+                if action and metadata.get("action", "").lower() != action.lower():
+                    continue
+                if search_term:
+                    username = (metadata.get("username") or "").lower()
+                    if search_term not in username:
+                        continue
+                if since_dt or until_dt:
+                    try:
+                        ts = entry.get("time", "")
+                        if not ts:
+                            continue
+                        entry_time = datetime.fromisoformat(ts)
+                        if since_dt and entry_time < since_dt:
+                            continue
+                        if until_dt and entry_time > until_dt:
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                entries.append(entry)
 
     entries.reverse()
 
-    return {"entries": entries[:MAX_ENTRIES]}
+    if export:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Audit Logs"
+        ws.append(["Time", "Level", "Action", "User", "Status", "Message", "IP", "Correlation ID"])
+
+        for entry in entries:
+            metadata = entry.get("metadata", {})
+            ws.append([
+                entry.get("time", ""),
+                entry.get("level", ""),
+                metadata.get("action", ""),
+                metadata.get("username", ""),
+                entry.get("status", ""),
+                entry.get("message", ""),
+                metadata.get("client_ip", ""),
+                entry.get("correlation_id", ""),
+            ])
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filters = []
+        if search_term:
+            filters.append(f"search={search_term}")
+        if action:
+            filters.append(f"action={action}")
+        if since:
+            filters.append(f"since={since}")
+        if until:
+            filters.append(f"until={until}")
+        filter_str = f" ({', '.join(filters)})" if filters else ""
+
+        audit_logger.info(
+            f"Audit logs exported by {current_user.get('username')}{filter_str}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_audit",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(entries),
+                },
+            },
+        )
+
+        filename = f"audit_logs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    total = len(entries)
+    offset = (page - 1) * page_size
+    paged = entries[offset:offset + page_size]
+
+    return {
+        "entries": paged,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
 
 
 @router.get("/stream")

@@ -27,6 +27,8 @@ class ShiftCreate(BaseModel):
     pincode: Optional[str] = Field(None, max_length=10)
     perDiemEligible: bool = False
     conveyanceEligible: bool = False
+    skipWeekends: bool = False
+    skipHolidays: bool = False
 
     @field_validator("timezone")
     @classmethod

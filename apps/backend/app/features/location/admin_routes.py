@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
+from io import BytesIO
 from typing import List
+
+import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from app.core.database import get_db
 from app.features.location.schemas.office_location import (
     OfficeLocationCreate,
@@ -13,6 +16,8 @@ from app.features.location.schemas.office_location import (
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.services.database.office_location_service import OfficeLocationService
 from app.models.office_location import OfficeLocation
+from app.models.employee_master import EmployeeMaster
+from app.models.shift import Shift
 
 router = APIRouter(prefix="/admin/office-locations", tags=["admin-office-locations"])
 
@@ -70,18 +75,67 @@ async def create_office_location(
 @router.get("")
 async def list_office_locations(
     category: str = None,
+    search: str = Query(None, description="Search by location name"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(50, description="Results per page"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     if category and len(category) > 50:
         raise HTTPException(status_code=400, detail="Category must be 50 characters or less.")
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    search_term = (search or "").strip()[:100]
 
-    svc = OfficeLocationService(db)
+    query = db.query(OfficeLocation)
     if category:
-        locations = db.query(OfficeLocation).filter(OfficeLocation.category == category).order_by(OfficeLocation.updated_at.desc()).all()
-    else:
-        locations = svc.fetch_all(OfficeLocation, order_by=OfficeLocation.updated_at.desc())
-    return [_to_response(l) for l in locations]
+        query = query.filter(OfficeLocation.category == category)
+    if search_term:
+        query = query.filter(OfficeLocation.name.ilike(f"%{search_term}%"))
+
+    query = query.order_by(OfficeLocation.updated_at.desc())
+    total = query.count()
+
+    if export:
+        locations = query.all()
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Work Locations"
+        ws.append(["Name", "Category", "City", "Country", "Address", "Radius (m)", "Created At"])
+
+        for loc in locations:
+            ws.append([
+                loc.name,
+                loc.category,
+                loc.city or "",
+                loc.country or "",
+                loc.address or "",
+                loc.radius_meters,
+                loc.created_at.isoformat() if loc.created_at else "",
+            ])
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"work_locations_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    offset = (page - 1) * page_size
+    locations = query.offset(offset).limit(page_size).all()
+
+    return {
+        "entries": [_to_response(l) for l in locations],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
 
 
 @router.get("/{location_id}", response_model=OfficeLocationResponse)
@@ -153,9 +207,28 @@ async def delete_office_location(
     _: None = Depends(require_admin),
 ):
     svc = OfficeLocationService(db)
+    loc = svc.fetch_one(OfficeLocation, id=location_id)
+    if not loc:
+        raise HTTPException(status_code=404, detail="Office location not found")
+
     child = db.query(OfficeLocation).filter(OfficeLocation.parent_location_id == location_id).first()
     if child:
         raise HTTPException(status_code=400, detail="Cannot delete — this location has sub-locations. Remove them first.")
+
+    emp_count = db.query(EmployeeMaster).filter(EmployeeMaster.location_id == location_id).count()
+    shift_count = db.query(Shift).filter(Shift.location_id == location_id).count()
+
+    if emp_count or shift_count:
+        parts = []
+        if emp_count:
+            parts.append(f"{emp_count} employee{'s' if emp_count > 1 else ''}")
+        if shift_count:
+            parts.append(f"{shift_count} shift{'s' if shift_count > 1 else ''}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete '{loc.name}'. Still in use by {', '.join(parts)}. Reassign or remove all references before deleting.",
+        )
+
     deleted = svc.delete(OfficeLocation, location_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Office location not found")
