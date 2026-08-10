@@ -182,6 +182,37 @@ class WfhService:
         db.refresh(wfh)
         return wfh
 
+    def delete(self, db: Session, request_id: str) -> bool:
+        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+        if not wfh or wfh.status != "pending":
+            return False
+        db.delete(wfh)
+        db.commit()
+        return True
+
+    def update(self, db: Session, request_id: str, data: dict) -> Optional[WfhRequest]:
+        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+        if not wfh or wfh.status != "pending":
+            return None
+
+        updatable = {"reason", "comment", "contact_number", "project_id", "project_name"}
+        for key in updatable:
+            if key in data:
+                setattr(wfh, key, data[key])
+
+        if "start_date" in data:
+            wfh.start_date = data["start_date"]
+            wfh.end_date = data["start_date"]
+        if "end_date" in data:
+            wfh.end_date = data["end_date"]
+        if "resuming_date" in data:
+            wfh.resuming_date = data["resuming_date"]
+
+        wfh.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(wfh)
+        return wfh
+
     def _ensure_wfh_shift(self, db: Session, wfh: WfhRequest):
         existing = db.query(Shift).filter(
             Shift.keycloak_user_id == wfh.keycloak_user_id,

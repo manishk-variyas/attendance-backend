@@ -54,6 +54,16 @@ class EmailService:
         body = _template("wfh_requested", applicant_name=applicant_name, start=start, end=end, reason=reason)
         return self.send([to], subject, body)
 
+    def send_wfh_approved(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+        subject = f"WFH Approved — {start} → {end}"
+        body = _template("wfh_approved", applicant_name=applicant_name, start=start, end=end)
+        return self.send([to], subject, body)
+
+    def send_wfh_rejected(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+        subject = f"WFH Rejected — {start} → {end}"
+        body = _template("wfh_rejected", applicant_name=applicant_name, start=start, end=end)
+        return self.send([to], subject, body)
+
     def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
         subject = f"Leave Applied — {applicant_name} ({start} → {end})"
         body = _template("leave_applied", applicant_name=applicant_name, start=start, end=end, reason=reason)
@@ -173,6 +183,19 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
         </table>
         <p>Please review and approve or reject this request.</p>
+    """,
+    "wfh_approved": """
+        <h2 style="color:#16a34a;margin:0 0 8px">WFH Approved</h2>
+        <p>{applicant_name}, your Work From Home request has been approved.</p>
+        <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
+        </table>
+    """,
+    "wfh_rejected": """
+        <h2 style="color:#dc2626;margin:0 0 8px">WFH Rejected</h2>
+        <p>{applicant_name}, your Work From Home request ({start} → {end}) has been rejected.</p>
+        <p>Please contact your manager if you have any questions.</p>
     """,
 }
 

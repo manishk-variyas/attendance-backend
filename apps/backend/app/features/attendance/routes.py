@@ -694,7 +694,23 @@ async def get_today_attendance(
         s = "overnight" if open_att.attendance_date < today else "in_progress"
         srec = _find_matching_shift(db, open_att.keycloak_user_id, open_att.shift_code, open_att.check_in_time)
         if _shift_has_ended(db, open_att, shift_date=srec.date if srec else None):
-            s = "shift_ended"
+            effective_date = srec.date if srec else open_att.attendance_date
+            sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == open_att.shift_code).first()
+            if sd and sd.end_time:
+                tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+                shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
+                if datetime.now(timezone.utc) > shift_end + timedelta(hours=2):
+                    open_att.check_out_time = shift_end
+                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, "Auto-checkout: shift ended"]))
+                    shift_rec = db.query(Shift).filter(
+                        Shift.keycloak_user_id == open_att.keycloak_user_id,
+                        Shift.date <= effective_date,
+                        Shift.end_date >= effective_date,
+                    ).first()
+                    if shift_rec:
+                        shift_rec.status = "Ended"
+                    db.commit()
+                    s = "completed"
         return _build_status_response(db, open_att, today, s)
 
     # 1b. Check if user is on leave today (approved or emergency)

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import date, timedelta, datetime, timezone
 from io import BytesIO
 from typing import Optional
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.wfh.schemas import WfhRequestCreate, WfhRequestReject
+from app.features.wfh.schemas import WfhRequestCreate, WfhRequestUpdate, WfhRequestReject
 from app.features.wfh.service import wfh_service
 from app.models.wfh_request import WfhRequest
 from app.models.employee_master import EmployeeMaster
@@ -22,6 +23,8 @@ from app.models.leave import Leave
 from app.models.attendance import Attendance
 from app.middleware.logging import _get_client_ip
 from app.utils.audit import audit_logger
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/wfh", tags=["wfh"])
 
@@ -494,6 +497,13 @@ async def approve_wfh_request(
         },
     )
 
+    applicant_name = _batch_user_names(db, [result.user_email]).get(result.user_email, result.user_email)
+    logger.info(f"Dispatching WFH approval email to {result.user_email}")
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, email_service.send_wfh_approved,
+        result.user_email, applicant_name,
+        result.start_date.isoformat(), result.end_date.isoformat())
+
     return result.to_dict()
 
 
@@ -534,4 +544,128 @@ async def reject_wfh_request(
         },
     )
 
+    applicant_name = _batch_user_names(db, [result.user_email]).get(result.user_email, result.user_email)
+    logger.info(f"Dispatching WFH rejection email to {result.user_email}")
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, email_service.send_wfh_rejected,
+        result.user_email, applicant_name,
+        result.start_date.isoformat(), result.end_date.isoformat())
+
     return result.to_dict()
+
+
+@router.delete("/{request_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
+async def delete_wfh_request(
+    request: Request,
+    request_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    if not wfh:
+        raise HTTPException(status_code=404, detail="WFH request not found.")
+    if wfh.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be deleted.")
+
+    user_email = current_user.get("email")
+    is_own = wfh.user_email == user_email
+    if not is_own and not _can_approve(db, current_user, wfh.user_email):
+        raise HTTPException(status_code=403, detail="You are not authorized to delete this request.")
+
+    deleted = wfh_service.delete(db, request_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="WFH request not found.")
+
+    audit_logger.info(
+        f"WFH request deleted for {wfh.user_email} on {wfh.start_date} by {user_email}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "wfh_deleted",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "requester": wfh.user_email,
+                "request_date": wfh.start_date.isoformat(),
+            },
+        },
+    )
+
+
+@router.get("/{request_id}")
+async def get_wfh_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    if not wfh:
+        raise HTTPException(status_code=404, detail="WFH request not found.")
+    if wfh.user_email != current_user.get("email") and not _can_approve(db, current_user, wfh.user_email):
+        raise HTTPException(status_code=403, detail="You are not authorized to view this request.")
+    return wfh.to_dict()
+
+
+@router.put("/{request_id}")
+@limiter.limit("5/minute")
+async def update_wfh_request(
+    request: Request,
+    request_id: str,
+    payload: WfhRequestUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    if not wfh:
+        raise HTTPException(status_code=404, detail="WFH request not found.")
+    if wfh.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be edited.")
+    user_email = current_user.get("email")
+    is_own = wfh.user_email == user_email
+    if not is_own and not _can_approve(db, current_user, wfh.user_email):
+        raise HTTPException(status_code=403, detail="You are not authorized to edit this request.")
+
+    update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided for update.")
+
+    if "start_date" in update_data:
+        try:
+            new_start = date.fromisoformat(update_data["start_date"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD.")
+        if new_start < date.today():
+            raise HTTPException(status_code=400, detail="Cannot set start_date to a past date.")
+
+    if "end_date" in update_data:
+        try:
+            new_end = date.fromisoformat(update_data["end_date"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD.")
+        start = date.fromisoformat(update_data.get("start_date", wfh.start_date.isoformat()))
+        if start > new_end:
+            raise HTTPException(status_code=400, detail="end_date must be on or after start_date.")
+        if new_end < date.today():
+            raise HTTPException(status_code=400, detail="Cannot set end_date to a past date.")
+
+    updated = wfh_service.update(db, request_id, update_data)
+    if not updated:
+        raise HTTPException(status_code=404, detail="WFH request not found.")
+
+    audit_logger.info(
+        f"WFH request updated for {updated.user_email} by {current_user.get('email')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "wfh_updated",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "requester": updated.user_email,
+                "request_date": updated.start_date.isoformat(),
+            },
+        },
+    )
+
+    return updated.to_dict()

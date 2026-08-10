@@ -114,6 +114,7 @@ class TodayAttendance(BaseModel):
     officeName: Optional[str] = None
     shiftCode: Optional[str] = None
     status: Optional[str] = None
+    remarks: Optional[str] = None
     updatedAt: Optional[str] = None
 
 
