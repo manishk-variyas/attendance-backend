@@ -1,5 +1,5 @@
 from datetime import datetime, time
-from sqlalchemy import Column, String, Time, Integer, DateTime, text
+from sqlalchemy import Column, String, Time, Integer, Boolean, DateTime, text
 from app.core.models import Base
 
 
@@ -15,6 +15,8 @@ class SystemSetting(Base):
     default_shift_end_time = Column(Time, nullable=True)
     default_timezone = Column(String(50), nullable=True, server_default=text("'Asia/Kolkata'"))
     grace_minutes = Column(Integer, nullable=True, server_default=text("15"))
+    checkout_reminder_grace_hours = Column(Integer, nullable=True, server_default=text("2"))
+    auto_checkout_enabled = Column(Boolean, nullable=False, server_default=text("true"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     def to_dict(self) -> dict:
@@ -26,5 +28,7 @@ class SystemSetting(Base):
             "default_shift_end_time": self.default_shift_end_time.isoformat() if self.default_shift_end_time else None,
             "default_timezone": self.default_timezone,
             "grace_minutes": self.grace_minutes,
+            "checkout_reminder_grace_hours": self.checkout_reminder_grace_hours,
+            "auto_checkout_enabled": self.auto_checkout_enabled,
             "updated_at": self.updated_at,
         }

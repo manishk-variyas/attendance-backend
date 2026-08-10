@@ -1,8 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from datetime import datetime
+from io import BytesIO
 from typing import List, Optional
-from app.features.auth.dependencies import get_current_user, require_admin
+
+import openpyxl
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
 from app.core.limiter import limiter
+from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
     LeaveHistoryItem, 
@@ -14,9 +21,12 @@ from app.features.leaves.schemas.leaves import (
     BatchCancelLeaveRejectRequest,
 )
 from app.features.leaves.services.leave_service import LeaveBusinessService
+from app.middleware.logging import _get_client_ip
+from app.models.employee_master import EmployeeMaster
+from app.models.holiday import Holiday as HolidayModel
 from app.services.database.dependencies import get_leave_business_service
 from app.features.redmine.service import redmine_service
-from app.models.employee_master import EmployeeMaster
+from app.utils.audit import audit_logger
 import logging
 
 logger = logging.getLogger(__name__)
@@ -101,14 +111,107 @@ async def get_history(
     records = await leave_service.get_leave_history(user_id, from_date, to_date)
     return {"total": len(records), "records": records}
 
-@router.get("/holidays", response_model=List[Holiday])
+@router.get("/holidays")
 async def get_holidays(
-    limit: int = Query(10, ge=1, le=100),
-    skip: int = Query(0, ge=0),
+    request: Request,
+    search: str = Query(None, description="Search by holiday name"),
+    holiday_type: str = Query(None, description="Filter: GAZETTED, RESTRICTED"),
+    is_national: bool = Query(None, description="Filter by national flag"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    page: int = Query(1, description="Page number"),
+    page_size: int = Query(50, description="Results per page"),
+    sort_by: str = Query("holiday_date", description="Sort column: holiday_date, holiday_name, holiday_type, country_code"),
+    sort_dir: str = Query("asc", description="Sort direction: asc, desc"),
+    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
-    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    return await leave_service.get_holidays(limit, skip)
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    search_term = (search or "").strip()[:100]
+
+    query = db.query(HolidayModel)
+    if holiday_type:
+        query = query.filter(HolidayModel.holiday_type == holiday_type.upper())
+    if is_national is not None:
+        query = query.filter(HolidayModel.is_national == is_national)
+    if search_term:
+        query = query.filter(HolidayModel.holiday_name.ilike(f"%{search_term}%"))
+
+    SORT_COLUMNS = {"holiday_date", "holiday_name", "holiday_type", "country_code"}
+    sort_by = sort_by if sort_by in SORT_COLUMNS else "holiday_date"
+    sort_dir = sort_dir if sort_dir in ("asc", "desc") else "asc"
+
+    query = query.order_by(
+        getattr(HolidayModel, sort_by).desc() if sort_dir == "desc"
+        else getattr(HolidayModel, sort_by).asc()
+    )
+    total = query.count()
+
+    if export:
+        holidays = query.all()
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Holidays"
+        ws.append(["Country Code", "Region", "Date", "Holiday Name", "Type", "National"])
+
+        for h in holidays:
+            ws.append([
+                h.country_code,
+                h.region or "",
+                h.holiday_date.isoformat() if h.holiday_date else "",
+                h.holiday_name,
+                h.holiday_type,
+                "Yes" if h.is_national else "No",
+            ])
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        audit_logger.info(
+            f"Holidays exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_excel",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(holidays),
+                },
+            },
+        )
+
+        filename = f"holidays_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    offset = (page - 1) * page_size
+    holidays = query.offset(offset).limit(page_size).all()
+
+    return {
+        "holidays": [h.to_dict() for h in holidays],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
+
+@router.delete("/holidays/{holiday_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_holiday(
+    holiday_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    holiday = db.query(HolidayModel).filter(HolidayModel.id == holiday_id).first()
+    if not holiday:
+        raise HTTPException(status_code=404, detail="Holiday not found.")
+    db.delete(holiday)
+    db.commit()
 
 from fastapi import UploadFile, File
 

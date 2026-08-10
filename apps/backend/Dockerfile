@@ -41,7 +41,7 @@ COPY pyproject.toml ./
 
 # Copy only the application source
 COPY app/ ./app/
-COPY scripts/log-cleanup.cron ./scripts/log-cleanup.cron
+COPY scripts/ ./scripts/
 
 # Install the cron job for log rotation
 RUN crontab ./scripts/log-cleanup.cron

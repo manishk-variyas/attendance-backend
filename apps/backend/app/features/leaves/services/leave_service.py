@@ -313,7 +313,7 @@ class LeaveBusinessService:
             if existing_attendance.check_out_time:
                 raise HTTPException(status_code=400, detail="Already completed work for today.")
             existing_attendance.check_out_time = datetime.now(timezone.utc)
-            existing_attendance.remarks = (existing_attendance.remarks or "") + " | Emergency leave"
+            existing_attendance.remarks = ", ".join(filter(None, [existing_attendance.remarks, "Emergency leave"]))
             self.leave_db.db.commit()
 
         if not existing_attendance:
@@ -523,11 +523,6 @@ class LeaveBusinessService:
 
         visible_ids = sql.get_team_member_ids(pm_user["id"])
         return [u for u in all_users if u["id"] in visible_ids]
-
-    async def get_holidays(self, limit: int = 10, skip: int = 0) -> List[Dict[str, Any]]:
-        stmt = select(Holiday).order_by(Holiday.holiday_date.asc()).offset(skip).limit(limit)
-        results = self.holiday_db.db.execute(stmt).scalars().all()
-        return [r.to_dict() for r in results]
 
     async def upload_holidays_from_excel(self, file_content: bytes) -> dict:
         """Parse Excel file and bulk upsert holidays."""

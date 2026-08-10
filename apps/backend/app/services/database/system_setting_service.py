@@ -16,7 +16,8 @@ class SystemSettingService(BaseService[SystemSetting]):
 
     def upsert(self, company_name: str = "", logo_content_type: str = None, created_by: str = None, updated_by: str = None,
                default_shift_start_time: str = None, default_shift_end_time: str = None,
-               default_timezone: str = None, grace_minutes: int = None) -> SystemSetting:
+               default_timezone: str = None, grace_minutes: int = None,
+               checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None) -> SystemSetting:
         existing = self.fetch()
         now = datetime.utcnow()
         data = {"company_name": company_name, "updated_at": now}
@@ -34,6 +35,10 @@ class SystemSettingService(BaseService[SystemSetting]):
             data["default_timezone"] = default_timezone
         if grace_minutes is not None:
             data["grace_minutes"] = grace_minutes
+        if checkout_reminder_grace_hours is not None:
+            data["checkout_reminder_grace_hours"] = checkout_reminder_grace_hours
+        if auto_checkout_enabled is not None:
+            data["auto_checkout_enabled"] = auto_checkout_enabled
         if existing:
             for k, v in data.items():
                 setattr(existing, k, v)

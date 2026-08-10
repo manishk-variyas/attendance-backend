@@ -26,13 +26,10 @@ def _shift_end_datetime(shift_date, start_time, end_time, tz):
     return datetime.combine(shift_date, end_time, tzinfo=tz)
 
 
-def _lookup_attendance(att_map: dict, keycloak_user_id: str, shift_date: date):
-    """Look up attendance with ±1 day tolerance to handle night shifts
-    whose check-in UTC date differs from the shift's calendar date."""
-    for delta in (0, 1, -1):
-        a = att_map.get((keycloak_user_id, shift_date + timedelta(days=delta)))
-        if a:
-            return a
+def _lookup_attendance(att_map: dict, keycloak_user_id: str, shift_date: date, shift_code: str = None):
+    a = att_map.get((keycloak_user_id, shift_date))
+    if a and (shift_code is None or a.shift_code == shift_code):
+        return a
     return None
 
 
@@ -246,6 +243,7 @@ class ShiftService:
         emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
         company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
         grace_min = company.grace_minutes if company and company.grace_minutes else 2
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
         shift_codes = list({s.shift_code for s in shifts if s.shift_code})
@@ -277,12 +275,12 @@ class ShiftService:
         for s in shifts:
             sd = sd_map.get(s.shift_code)
             leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
-            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date)
+            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date, s.shift_code)
 
             derived_status = s.status
             if att and att.check_out_time:
                 derived_status = "Ended"
-            elif att and not att.check_out_time:
+            elif att and not att.check_out_time and s.date <= today:
                 derived_status = "In Progress"
             elif leave:
                 derived_status = "on_leave"
@@ -382,7 +380,7 @@ class ShiftService:
                     })
                 current += timedelta(days=1)
 
-        result.sort(key=lambda x: x["date"], reverse=True)
+        result.sort(key=lambda x: x["date"], reverse=False)
         return result
 
     async def get_team_shifts(self, db: Session, emails: list, from_date: str = None, to_date: str = None) -> List[dict]:
@@ -397,6 +395,7 @@ class ShiftService:
 
         company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
         grace_min = company.grace_minutes if company and company.grace_minutes else 2
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
         shift_user_emails = list({s.user_email for s in shifts if s.user_email})
@@ -432,12 +431,12 @@ class ShiftService:
             emp = emp_map.get(s.user_email)
             sd = sd_map.get(s.shift_code)
             leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
-            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date)
+            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date, s.shift_code)
 
             derived_status = s.status
             if att and att.check_out_time:
                 derived_status = "Ended"
-            elif att and not att.check_out_time:
+            elif att and not att.check_out_time and s.date <= today:
                 derived_status = "In Progress"
             elif leave:
                 derived_status = "on_leave"
@@ -539,7 +538,7 @@ class ShiftService:
                         })
                     current += timedelta(days=1)
 
-        result.sort(key=lambda x: x["date"], reverse=True)
+        result.sort(key=lambda x: x["date"], reverse=False)
         return result
 
     async def update_shift(self, db: Session, shift_id: str, data: dict) -> Optional[dict]:
@@ -694,11 +693,6 @@ class ShiftService:
             country=data.get("country", ""),
         )
         return self._serialize_def(sd)
-
-    async def get_all_shift_definitions(self, db: Session) -> List[dict]:
-        svc = self._def_svc(db)
-        defs = svc.fetch_all()
-        return [self._serialize_def(d) for d in defs]
 
     async def get_shift_definition_by_code(self, db: Session, shift_code: str) -> Optional[dict]:
         svc = self._def_svc(db)

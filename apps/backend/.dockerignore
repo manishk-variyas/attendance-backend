@@ -26,6 +26,8 @@ test_*.py
 # Scripts (only keep cron-related and bootstrap)
 scripts/*.py
 !scripts/log-cleanup.cron
+!scripts/send_checkout_reminders.py
+!scripts/auto_close_attendance.py
 !scripts/bootstrap_admin_employee.py
 
 # Env files

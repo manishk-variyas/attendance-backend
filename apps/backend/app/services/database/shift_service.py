@@ -77,10 +77,16 @@ class ShiftService(BaseService[Shift]):
         return list(self.db.execute(stmt).scalars().all())
 
     def delete_by_user_and_date(self, redmine_user_id: int, date_str: str):
+        from app.models.attendance import Attendance
         d = date.fromisoformat(date_str)
         stmt = select(Shift).where(Shift.redmine_user_id == redmine_user_id, Shift.date == d)
         shifts = list(self.db.execute(stmt).scalars().all())
         for s in shifts:
+            self.db.query(Attendance).filter(
+                Attendance.keycloak_user_id == s.keycloak_user_id,
+                Attendance.attendance_date == d,
+                Attendance.shift_code == s.shift_code,
+            ).update({Attendance.shift_code: None}, synchronize_session=False)
             self.db.delete(s)
         self.db.commit()
 

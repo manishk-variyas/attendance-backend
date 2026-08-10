@@ -46,6 +46,7 @@ class Attendance(Base):
     modified_by = Column(String(255), nullable=True)
     remarks = Column(String(500), nullable=True)
     comp_off_credited = Column(Boolean, nullable=False, server_default=text("false"))
+    checkout_reminder_sent = Column(Boolean, nullable=False, server_default=text("false"))
     is_deleted = Column(Boolean, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))

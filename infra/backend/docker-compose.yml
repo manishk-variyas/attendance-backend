@@ -27,8 +27,13 @@ services:
         condition: service_started
     networks:
       - infra-network
+    volumes:
+      - backend_logs:/app/logs
 
 # Reference the shared network from main docker-compose.yml
 networks:
   infra-network:
     driver: bridge
+
+volumes:
+  backend_logs:

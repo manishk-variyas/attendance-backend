@@ -7,3 +7,9 @@
 
 # Daily housekeeping: remove rotated backups older than 14 days
 0 0 * * * find /app/logs -name "*.log.*" -mtime +14 -delete 2>/dev/null
+
+# Checkout reminder: notify employees who forgot to check out
+0 * * * * cd /app && uv run python scripts/send_checkout_reminders.py 2>&1 | tee -a /app/logs/checkout_reminders.log
+
+# Auto-close overdue attendance daily at 1 AM
+0 1 * * * cd /app && uv run python scripts/auto_close_attendance.py 2>&1 | tee -a /app/logs/auto_close_attendance.log

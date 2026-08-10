@@ -1,19 +1,28 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from io import BytesIO
+
+import openpyxl
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone, date, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import List, Optional
+from typing import Annotated, List, Optional
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_active
 from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftResponse, ShiftStats, ShiftHistoryItem, ShiftDefinitionCreate, ShiftDefinitionResponse
 from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
+from app.middleware.logging import _get_client_ip
 from app.models.leave import Leave
 from app.models.shift import Shift
 from app.models.employee_master import EmployeeMaster
 from app.models.holiday import Holiday
+from app.models.shift_definition import ShiftDefinition
+from app.models.attendance import Attendance
+from app.utils.audit import audit_logger
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
@@ -112,7 +121,7 @@ async def create_shift(
     if start > end:
         raise HTTPException(status_code=400, detail="endDate must be on or after date.")
 
-    today = date.today()
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     if end < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
@@ -130,12 +139,10 @@ async def create_shift(
         except ValueError:
             pass
 
-    from app.models.shift_definition import ShiftDefinition
     shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
     if not shift_def:
         raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
 
-    from app.models.attendance import Attendance
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == payload.userEmail).first()
     if emp and emp.keycloak_user_id:
         existing_att = db.query(Attendance).filter(
@@ -224,7 +231,7 @@ async def create_bulk_shifts(
     if start > end:
         raise HTTPException(status_code=400, detail="startDate must be on or before endDate.")
 
-    today = date.today()
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     if start < today:
         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
@@ -236,7 +243,6 @@ async def create_bulk_shifts(
     if st == et:
         raise HTTPException(status_code=400, detail="Shift start and end time cannot be the same.")
 
-    from app.models.shift_definition import ShiftDefinition
     shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
     if not shift_def:
         raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
@@ -573,20 +579,53 @@ async def get_shift_history(
     return {"total": len(records), "records": records}
 
 
+
+
 @router.put("/{shift_id}")
+@limiter.limit("10/minute")
 async def update_shift(
-    shift_id: str,
+    request: Request,
+    shift_id: Annotated[str, Path(max_length=36)],
     payload: ShiftUpdate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    existing_shift = db.query(Shift).filter(Shift.id == shift_id).first()
+    if not existing_shift:
+        raise HTTPException(status_code=404, detail="Shift not found.")
+
     await authorize_shift_access(
         current_user=current_user,
-        target_email=current_user.get("email"),
-        target_project_id=payload.projectId,
-        is_write=True
+        target_email=existing_shift.user_email,
+        target_project_id=payload.projectId or existing_shift.project_id,
+        is_write=True,
     )
-    
+
+    existing_att = db.query(Attendance).filter(
+        Attendance.keycloak_user_id == existing_shift.keycloak_user_id,
+        Attendance.attendance_date >= existing_shift.date,
+        Attendance.attendance_date <= (existing_shift.end_date or existing_shift.date),
+        Attendance.check_in_time.isnot(None),
+    ).first()
+    if existing_att:
+        raise HTTPException(status_code=400, detail="Cannot update shift. User has already checked in for this date range.")
+
+    if payload.shift:
+        shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
+        if not shift_def:
+            raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
+
+    if payload.shiftStartTime:
+        try:
+            time.fromisoformat(payload.shiftStartTime[:5])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid shiftStartTime format. Use HH:MM.")
+    if payload.shiftEndTime:
+        try:
+            time.fromisoformat(payload.shiftEndTime[:5])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid shiftEndTime format. Use HH:MM.")
+
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields provided for update.")
@@ -596,35 +635,49 @@ async def update_shift(
             end = date.fromisoformat(update_data["endDate"])
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid endDate format. Use YYYY-MM-DD.")
-        
-        existing_shift = await shift_service.get_shift_by_id(db, shift_id)
-        if not existing_shift:
-            raise HTTPException(status_code=404, detail="Shift not found.")
-        
-        start = date.fromisoformat(existing_shift["date"])
+
+        start = existing_shift.date
         if start > end:
             raise HTTPException(status_code=400, detail="endDate must be on or after date.")
-            
-        today = date.today()
+
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         if end < today:
             raise HTTPException(status_code=400, detail="Cannot update endDate to a past date.")
 
     updated = await shift_service.update_shift(db, shift_id, update_data)
     if not updated:
         raise HTTPException(status_code=404, detail="Shift not found.")
+
+    changed = ", ".join(update_data.keys())
+    audit_logger.info(
+        f"Shift updated for {existing_shift.user_email} ({existing_shift.date} to {existing_shift.end_date or existing_shift.date}) by {current_user.get('username')} — changed: {changed}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "shift_update",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "updated_user": existing_shift.user_email,
+                "updated_date": existing_shift.date.isoformat(),
+                "changed_fields": changed,
+            },
+        },
+    )
+
     return updated
 
 
 @router.delete("/by-date", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
 async def delete_shift_by_date(
+    request: Request,
     user_id: int = Query(..., description="Redmine user ID"),
     target_date: str = Query(..., description="YYYY-MM-DD"),
     reason: Optional[str] = Query(None, max_length=200, description="Reason for deletion"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    if "Admin" not in current_user.get("roles", []):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
     try:
         td = date.fromisoformat(target_date)
     except ValueError:
@@ -634,31 +687,97 @@ async def delete_shift_by_date(
     if not emp or not emp.keycloak_user_id:
         raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
 
+    shift = db.query(Shift).filter(
+        Shift.keycloak_user_id == emp.keycloak_user_id,
+        Shift.date <= td,
+        Shift.end_date >= td,
+    ).first()
+
+    await authorize_shift_access(
+        current_user=current_user,
+        target_email=emp.user_email,
+        target_project_id=shift.project_id if shift else None,
+        is_write=True,
+    )
+
+    existing_att = db.query(Attendance).filter(
+        Attendance.keycloak_user_id == emp.keycloak_user_id,
+        Attendance.attendance_date == td,
+        Attendance.check_in_time.isnot(None),
+    ).first()
+    if existing_att:
+        raise HTTPException(status_code=400, detail="Cannot delete shift. User has already checked in for this date. Clear the attendance record first.")
+
     deleted = await shift_service.delete_shift_by_date(db, emp.keycloak_user_id, td)
     if not deleted:
         raise HTTPException(status_code=404, detail="No shift found for this date")
 
-    if reason:
-        logger.info(f"Admin {current_user.get('email')} deleted shift for user {user_id} on {target_date}: {reason}")
+    audit_logger.info(
+        f"Shift deleted for {emp.user_email} on {target_date} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "shift_delete",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "deleted_user": emp.user_email,
+                "deleted_date": target_date,
+                "reason": reason or "",
+            },
+        },
+    )
 
 
 @router.delete("/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("5/minute")
 async def delete_shift(
-    shift_id: str,
+    request: Request,
+    shift_id: Annotated[str, Path(max_length=36)],
     reason: Optional[str] = Query(None, max_length=200, description="Reason for deletion"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    if "Admin" not in current_user.get("roles", []):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required.",
-        )
+    shift = db.query(Shift).filter(Shift.id == shift_id).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found.")
+
+    await authorize_shift_access(
+        current_user=current_user,
+        target_email=shift.user_email,
+        target_project_id=shift.project_id,
+        is_write=True,
+    )
+
+    existing_att = db.query(Attendance).filter(
+        Attendance.keycloak_user_id == shift.keycloak_user_id,
+        Attendance.attendance_date >= shift.date,
+        Attendance.attendance_date <= (shift.end_date or shift.date),
+        Attendance.check_in_time.isnot(None),
+    ).first()
+    if existing_att:
+        raise HTTPException(status_code=400, detail="Cannot delete shift. User has already checked in for this date range. Clear the attendance record first.")
+
     deleted = await shift_service.delete_shift(db, shift_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Shift not found.")
-    if reason:
-        logger.info(f"Admin {current_user.get('email')} deleted shift {shift_id}: {reason}")
+
+    audit_logger.info(
+        f"Shift deleted for {shift.user_email} ({shift.date} to {shift.end_date or shift.date}) by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "shift_delete",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "deleted_user": shift.user_email,
+                "deleted_date": shift.date.isoformat(),
+                "deleted_end_date": shift.end_date.isoformat() if shift.end_date else None,
+                "reason": reason or "",
+            },
+        },
+    )
 
 
 @router.post("/definitions", status_code=status.HTTP_201_CREATED)
@@ -672,12 +791,104 @@ async def create_shift_definition(
     return await shift_service.create_shift_definition(db, payload.model_dump())
 
 
-@router.get("/definitions", response_model=List[ShiftDefinitionResponse])
+@router.get("/definitions")
 async def get_all_shift_definitions(
+    request: Request,
+    search: str = Query(None, description="Search by shift name"),
+    country: str = Query(None, description="Filter by country"),
+    sort_by: str = Query("shift_code", description="shift_code, shift_name, country"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    export: bool = Query(False, description="Export as Excel"),
+    page: int = Query(1),
+    page_size: int = Query(50, description="Max 100"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    return await shift_service.get_all_shift_definitions(db)
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    search_term = (search or "").strip()[:100]
+
+    query = db.query(ShiftDefinition)
+    if search_term:
+        query = query.filter(ShiftDefinition.shift_name.ilike(f"%{search_term}%"))
+    if country:
+        query = query.filter(ShiftDefinition.country == country)
+
+    SORT_COLUMNS = {"shift_code", "shift_name", "country"}
+    sort_by = sort_by if sort_by in SORT_COLUMNS else "shift_code"
+    sort_dir = sort_dir if sort_dir in ("asc", "desc") else "asc"
+    query = query.order_by(
+        getattr(ShiftDefinition, sort_by).desc() if sort_dir == "desc"
+        else getattr(ShiftDefinition, sort_by).asc()
+    )
+
+    total = query.count()
+
+    if export:
+        definitions = query.all()
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Shift Definitions"
+        ws.append(["Shift Code", "Shift Name", "Start Time", "End Time", "Timezone", "Country"])
+
+        for d in definitions:
+            ws.append([
+                d.shift_code,
+                d.shift_name,
+                d.start_time.isoformat() if d.start_time else "",
+                d.end_time.isoformat() if d.end_time else "",
+                d.timezone,
+                d.country or "",
+            ])
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        audit_logger.info(
+            f"Shift definitions exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_excel",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(definitions),
+                },
+            },
+        )
+
+        filename = f"shift_definitions_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    offset = (page - 1) * page_size
+    definitions = query.offset(offset).limit(page_size).all()
+
+    return {
+        "definitions": [
+            {
+                "_id": str(d.shift_id),
+                "shiftCode": d.shift_code,
+                "shiftName": d.shift_name,
+                "startTime": d.start_time.isoformat() if d.start_time else None,
+                "endTime": d.end_time.isoformat() if d.end_time else None,
+                "timezone": d.timezone,
+                "country": d.country,
+                "createdAt": d.created_at,
+                "updatedAt": d.updated_at,
+            }
+            for d in definitions
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
 
 
 @router.get("/definitions/by-code/{shift_code}", response_model=ShiftDefinitionResponse)
@@ -727,6 +938,41 @@ async def delete_shift_definition(
 ):
     if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+
+    definition = db.query(ShiftDefinition).filter(ShiftDefinition.shift_id == shift_id).first()
+    if not definition:
+        raise HTTPException(status_code=404, detail="Shift definition not found.")
+
+    shift_count = db.query(Shift).filter(Shift.shift_code == definition.shift_code).count()
+
+    if shift_count:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete '{definition.shift_name}'. Still in use by {shift_count} shift{'s' if shift_count > 1 else ''}. Reassign or remove all shifts using this definition before deleting.",
+        )
+
     deleted = await shift_service.delete_shift_definition(db, shift_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Shift definition not found.")
+
+
+@router.get("/{shift_id}")
+@limiter.limit("20/minute")
+async def get_shift_by_id(
+    request: Request,
+    shift_id: Annotated[str, Path(max_length=36)],
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    shift = db.query(Shift).filter(Shift.id == shift_id).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found.")
+
+    await authorize_shift_access(
+        current_user=current_user,
+        target_email=shift.user_email,
+        target_project_id=shift.project_id,
+        is_write=False,
+    )
+
+    return await shift_service.get_shift_by_id(db, shift_id)

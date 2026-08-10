@@ -158,6 +158,10 @@ app.include_router(office_location_router, prefix="/api", tags=["admin-office-lo
 from app.features.shifts.routes import router as shifts_router
 app.include_router(shifts_router, prefix="/api", tags=["shifts"])
 
+# Register WFH Request routes
+from app.features.wfh.routes import router as wfh_router
+app.include_router(wfh_router, prefix="/api", tags=["wfh"])
+
 # Register Company Settings routes
 from app.features.settings.routes import router as settings_router
 app.include_router(settings_router, prefix="/api", tags=["settings"])

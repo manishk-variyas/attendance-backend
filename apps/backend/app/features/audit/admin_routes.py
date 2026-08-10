@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Optional
 
@@ -53,8 +53,24 @@ async def get_audit_logs(
     search_term = (search or "").strip().lower()[:100]
 
     entries = []
-    since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
+    since_dt = None
+    if since:
+        try:
+            clean = since.replace("Z", "+00:00")
+            since_dt = datetime.fromisoformat(clean)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+    until_dt = None
+    if until:
+        try:
+            clean = until.replace("Z", "+00:00")
+            until_dt = datetime.fromisoformat(clean)
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
 
     if os.path.exists(AUDIT_LOG_PATH):
         with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
@@ -82,7 +98,7 @@ async def get_audit_logs(
                         if until_dt and entry_time > until_dt:
                             continue
                     except (ValueError, TypeError):
-                        continue
+                        pass
                 entries.append(entry)
 
     entries.reverse()
@@ -126,7 +142,7 @@ async def get_audit_logs(
             extra={
                 "correlation_id": request.state.correlation_id,
                 "extra_data": {
-                    "action": "export_audit",
+                    "action": "export_excel",
                     "username": current_user.get("username"),
                     "status": "success",
                     "client_ip": _get_client_ip(request),
@@ -209,3 +225,22 @@ async def audit_logs_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/actions")
+async def get_audit_actions(
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    actions = set()
+    if os.path.exists(AUDIT_LOG_PATH):
+        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                entry = _parse_log_line(line)
+                if not entry:
+                    continue
+                metadata = entry.get("metadata") or {}
+                action = metadata.get("action")
+                if action:
+                    actions.add(action)
+    return {"actions": sorted(actions)}

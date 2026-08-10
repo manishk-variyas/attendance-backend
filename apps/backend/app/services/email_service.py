@@ -49,6 +49,11 @@ class EmailService:
             logger.error(f"Failed to send email '{subject}': {e}")
             return False
 
+    def send_wfh_requested(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
+        subject = f"WFH Request — {applicant_name} ({start} → {end})"
+        body = _template("wfh_requested", applicant_name=applicant_name, start=start, end=end, reason=reason)
+        return self.send([to], subject, body)
+
     def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
         subject = f"Leave Applied — {applicant_name} ({start} → {end})"
         body = _template("leave_applied", applicant_name=applicant_name, start=start, end=end, reason=reason)
@@ -158,6 +163,16 @@ _EMAIL_TEMPLATES = {
             <tr><td>Manager's Remark</td><td>{remark}</td></tr>
         </table>
         <p>You may submit a new cancellation request with an updated reason (maximum 5 attempts).</p>
+    """,
+    "wfh_requested": """
+        <h2 style="color:#2563eb;margin:0 0 8px">WFH Request</h2>
+        <p>{applicant_name} has requested Work From Home.</p>
+        <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
+        </table>
+        <p>Please review and approve or reject this request.</p>
     """,
 }
 

@@ -3,7 +3,7 @@ from io import BytesIO
 from typing import List
 
 import openpyxl
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -14,7 +14,9 @@ from app.features.location.schemas.office_location import (
     OfficeLocationResponse,
 )
 from app.features.auth.dependencies import get_current_user, require_admin
+from app.middleware.logging import _get_client_ip
 from app.services.database.office_location_service import OfficeLocationService
+from app.utils.audit import audit_logger
 from app.models.office_location import OfficeLocation
 from app.models.employee_master import EmployeeMaster
 from app.models.shift import Shift
@@ -74,6 +76,7 @@ async def create_office_location(
 
 @router.get("")
 async def list_office_locations(
+    request: Request,
     category: str = None,
     search: str = Query(None, description="Search by location name"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
@@ -119,6 +122,20 @@ async def list_office_locations(
         wb.save(output)
         output.seek(0)
 
+        audit_logger.info(
+            f"Work locations exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_excel",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(locations),
+                },
+            },
+        )
+
         filename = f"work_locations_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
         return StreamingResponse(
             output,
@@ -130,7 +147,7 @@ async def list_office_locations(
     locations = query.offset(offset).limit(page_size).all()
 
     return {
-        "entries": [_to_response(l) for l in locations],
+        "locations": [_to_response(l) for l in locations],
         "total": total,
         "page": page,
         "page_size": page_size,
