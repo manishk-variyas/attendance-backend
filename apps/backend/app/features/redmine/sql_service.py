@@ -165,11 +165,14 @@ class RedmineSQLService:
         ).fetchone()
         return row is not None
 
-    def get_all_issues_for_user(self, user_id: int, assigned_only: bool = False) -> list:
+    def get_all_issues_for_user(self, user_id: int, assigned_only: bool = False, include_authored: bool = False) -> list:
         clauses = "AND m.user_id = :user_id"
         params = {"user_id": user_id}
         if assigned_only:
-            clauses += " AND i.assigned_to_id = :user_id"
+            if include_authored:
+                clauses += " AND (i.assigned_to_id = :user_id OR i.author_id = :user_id)"
+            else:
+                clauses += " AND i.assigned_to_id = :user_id"
         rows = self.db.execute(
             text(f"""
                 SELECT i.id, i.subject, i.description, st.name as status,
@@ -486,6 +489,13 @@ class RedmineSQLService:
     def get_issue_assigned_to(self, issue_id: int) -> int | None:
         row = self.db.execute(
             text("SELECT assigned_to_id FROM redmine.issues WHERE id = :id"),
+            {"id": issue_id},
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_issue_author_id(self, issue_id: int) -> int | None:
+        row = self.db.execute(
+            text("SELECT author_id FROM redmine.issues WHERE id = :id"),
             {"id": issue_id},
         ).fetchone()
         return row[0] if row else None

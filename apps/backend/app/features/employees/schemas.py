@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
 from datetime import datetime
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
@@ -95,6 +95,18 @@ class AssignProjectRequest(BaseModel):
     project_id: int
     reports_to: int
     redmine_role_name: Optional[str] = "Developer"
+
+
+class MyProfileUpdate(BaseModel):
+    first_name: Optional[str] = Field(None, max_length=255)
+    middle_name: Optional[str] = Field(None, max_length=255)
+    last_name: Optional[str] = Field(None, max_length=255)
+    user_email: Optional[EmailStr] = None
+    contact_number: Optional[str] = Field(None, max_length=50, pattern=r'^\+[0-9\s\-]+$')
+    alt_contact_number: Optional[str] = Field(None, max_length=50, pattern=r'^\+[0-9\s\-]+$')
+    work_address: Optional[str] = Field(None, max_length=500)
+    current_address: Optional[str] = Field(None, max_length=150)
+    permanent_address: Optional[str] = Field(None, max_length=150)
 
 
 class EmployeeUpdate(BaseModel):

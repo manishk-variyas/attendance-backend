@@ -246,6 +246,8 @@ async def get_all_project_issues(
 
     # Own issues (default) — all roles see only assigned issues
     if not team:
+        if is_tr:
+            return sql.get_all_issues_for_user(current_rm_user["id"], assigned_only=True, include_authored=True)
         return sql.get_all_issues_for_user(current_rm_user["id"], assigned_only=True)
 
     # Team issues
@@ -622,11 +624,7 @@ async def create_redmine_issue(
     issue_attrs = issue_data.model_dump(exclude_none=True)
     issue_attrs["author_id"] = redmine_user_id
 
-    # TR: forced self-assign (frontend handles hiding the assignee field)
-    if is_tr:
-        issue_attrs["assigned_to_id"] = redmine_user_id
-
-    # Validate assignee is a project member (TR already self-assigned above)
+    # Validate assignee is a project member
     if "assigned_to_id" in issue_attrs and issue_attrs["assigned_to_id"] != redmine_user_id:
         if not sql.is_project_member(issue_attrs["assigned_to_id"], issue_data.project_id):
             del issue_attrs["assigned_to_id"]
@@ -656,7 +654,7 @@ async def create_redmine_issue(
         issue_attrs["uploads"] = uploads
 
     try:
-        issue = await redmine_service.create_issue(issue_attrs)
+        issue = await redmine_service.create_issue(issue_attrs, switch_user=user["login"])
         return {"status": "success", "message": "Issue created successfully", "id": issue["id"]}
     except httpx.HTTPStatusError as e:
         logger.error("Redmine error (create issue): status=%s body=%s", e.response.status_code, e.response.text)
@@ -739,7 +737,7 @@ async def delete_attachment(
         if info["assigned_to_id"] != redmine_user_id and info["author_id"] != redmine_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="You can only delete attachments from tickets assigned to you",
+                detail="You can only delete attachments from tickets you created or are assigned to",
             )
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -784,8 +782,9 @@ async def upload_issue_attachment(
             raise HTTPException(status_code=403, detail="You are not a member of this issue's project")
     elif is_tr:
         assigned_to = sql.get_issue_assigned_to(issue_id)
-        if assigned_to != redmine_user_id:
-            raise HTTPException(status_code=403, detail="You can only add recordings to tickets assigned to you")
+        author_id = sql.get_issue_author_id(issue_id)
+        if assigned_to != redmine_user_id and author_id != redmine_user_id:
+            raise HTTPException(status_code=403, detail="You can only add recordings to tickets you created or are assigned to")
     else:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -823,7 +822,7 @@ async def upload_issue_attachment(
         "description": "",
     }]
 
-    await redmine_service.update_issue(issue_id, {"uploads": uploads})
+    await redmine_service.update_issue(issue_id, {"uploads": uploads}, switch_user=user["login"])
     return {"status": "success", "message": "Recording uploaded", "id": issue_id}
 
 
@@ -921,10 +920,11 @@ async def update_redmine_issue(
             )
     elif is_tr:
         assigned_to = sql.get_issue_assigned_to(issue_id)
-        if assigned_to != redmine_user_id:
+        author_id = sql.get_issue_author_id(issue_id)
+        if assigned_to != redmine_user_id and author_id != redmine_user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="You can only edit tickets assigned to you",
+                detail="You can only edit tickets you created or are assigned to",
             )
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
@@ -939,11 +939,7 @@ async def update_redmine_issue(
     if private_notes is not None:
         issue_attrs["private_notes"] = private_notes
 
-    # TR: forced self-assign (even on their own tickets)
-    if is_tr:
-        issue_attrs["assigned_to_id"] = redmine_user_id
-
-    # Validate assignee is a project member (skip for TR who self-assign)
+    # Validate assignee is a project member
     if "assigned_to_id" in issue_attrs and issue_attrs["assigned_to_id"] != redmine_user_id:
         if not sql.is_project_member(issue_attrs["assigned_to_id"], issue_pid):
             del issue_attrs["assigned_to_id"]
@@ -974,7 +970,7 @@ async def update_redmine_issue(
         issue_attrs["uploads"] = uploads
 
     try:
-        issue = await redmine_service.update_issue(issue_id, issue_attrs)
+        issue = await redmine_service.update_issue(issue_id, issue_attrs, switch_user=user["login"])
         return {"status": "success", "message": "Issue updated successfully", "id": issue_id}
     except httpx.HTTPStatusError as e:
         logger.error("Redmine error (update issue): status=%s body=%s", e.response.status_code, e.response.text)

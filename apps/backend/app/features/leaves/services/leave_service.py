@@ -1,10 +1,12 @@
 from datetime import datetime, timezone, date, timedelta
 import asyncio
 import io
+from io import BytesIO
 from typing import List, Dict, Any
 from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 import openpyxl
+import httpx
 from pydantic import ValidationError
 
 from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest
@@ -562,7 +564,7 @@ class LeaveBusinessService:
                 country_code = str(row[header_map["country_code"]]).strip()
                 holiday_name = str(row[header_map["holiday_name"]]).strip()
 
-                key = (country_code, str(holiday_date_str))
+                key = (country_code, str(holiday_date_str), holiday_name)
                 if key in seen_holidays:
                     raise HTTPException(
                         status_code=400,
@@ -594,7 +596,7 @@ class LeaveBusinessService:
         inserted = 0
         modified = 0
         for h in parsed_holidays:
-            existing = self.holiday_db.fetch_one(Holiday, country_code=h["country_code"], holiday_date=h["holiday_date"])
+            existing = self.holiday_db.fetch_one(Holiday, country_code=h["country_code"], holiday_date=h["holiday_date"], holiday_name=h["holiday_name"])
             if existing:
                 self.holiday_db.update(Holiday, existing.id, **h)
                 modified += 1
@@ -606,8 +608,76 @@ class LeaveBusinessService:
             "message": "Holidays uploaded successfully",
             "inserted": inserted,
             "modified": modified,
-            "total_processed": len(parsed_holidays)
+"total_processed": len(parsed_holidays)
         }
+
+    async def _fetch_holidays_from_google_ics(self, year: int, country: str) -> list[dict]:
+        url = "https://calendar.google.com/calendar/ical/en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        holidays = []
+        for event in resp.text.split("BEGIN:VEVENT")[1:]:
+            dt = self._ics_field(event, "DTSTART")[:8]
+            name = self._ics_field(event, "SUMMARY")
+            if dt and name and dt.startswith(str(year)):
+                holidays.append({
+                    "country_code": country,
+                    "region": None,
+                    "holiday_date": date(int(dt[:4]), int(dt[4:6]), int(dt[6:8])),
+                    "holiday_name": name.strip(),
+                    "holiday_type": "GAZETTED",
+                    "is_national": True,
+                })
+        holidays.sort(key=lambda h: h["holiday_date"])
+        return holidays
+
+    @staticmethod
+    def _ics_field(event: str, key: str) -> str:
+        for line in event.strip().split("\n"):
+            if line.startswith(key):
+                return line.split(":")[1] if ":" in line else ""
+        return ""
+
+    def _get_default_holidays(self, year: int) -> list[dict]:
+        return [
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 1, 1),  "holiday_name": "New Year", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 1, 26), "holiday_name": "Republic Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 5, 1),  "holiday_name": "May Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 8, 15), "holiday_name": "Independence Day", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 10, 2), "holiday_name": "Gandhi Jayanti", "holiday_type": "GAZETTED", "is_national": True},
+            {"country_code": "IN", "region": None, "holiday_date": date(year, 12, 25), "holiday_name": "Christmas Day", "holiday_type": "GAZETTED", "is_national": True},
+        ]
+
+    def _create_holiday_template_excel(self, holidays: list[dict]) -> BytesIO:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Holidays"
+        ws.append(["country_code", "region", "holiday_date", "holiday_name", "holiday_type", "is_national"])
+        for h in holidays:
+            ws.append([
+                h["country_code"],
+                h.get("region") or "",
+                h["holiday_date"].isoformat() if hasattr(h["holiday_date"], "isoformat") else str(h["holiday_date"]),
+                h["holiday_name"],
+                h["holiday_type"],
+                "TRUE" if h["is_national"] else "FALSE",
+            ])
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return output
+
+    async def generate_holiday_template(self, year: int, country: str) -> dict:
+        source = "defaults"
+        holidays = self._get_default_holidays(year)
+        try:
+            holidays = await self._fetch_holidays_from_google_ics(year, country)
+            source = "google"
+        except Exception:
+            pass
+        excel_bytes = self._create_holiday_template_excel(holidays)
+        return {"source": source, "total": len(holidays), "excel": excel_bytes, "holidays": holidays}
 
     async def get_leave_stats(self, user_id: str, year: int = None, month: int = None) -> Dict[str, Any]:
         yr = year or date.today().year

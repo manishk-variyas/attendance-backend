@@ -23,6 +23,7 @@ from app.features.leaves.schemas.leaves import (
 from app.features.leaves.services.leave_service import LeaveBusinessService
 from app.middleware.logging import _get_client_ip
 from app.models.employee_master import EmployeeMaster
+from app.models.leave import Leave
 from app.models.holiday import Holiday as HolidayModel
 from app.services.database.dependencies import get_leave_business_service
 from app.features.redmine.service import redmine_service
@@ -249,6 +250,26 @@ async def upload_holidays(
     finally:
         await file.close()
 
+
+@router.get("/holidays/template")
+@limiter.limit("5/minute")
+async def download_holiday_template(
+    request: Request,
+    year: int = Query(..., ge=2024, le=2030, description="Year (2024-2030)"),
+    country: str = Query("IN", min_length=2, max_length=2, pattern=r"^[A-Z]{2}$", description="Country code, e.g. IN"),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+):
+    result = await leave_service.generate_holiday_template(year, country.upper())
+    filename = f"holidays_{year}_{country.upper()}_{datetime.utcnow().strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(
+        result["excel"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/validate")
 async def validate_leave_dates(
     payload: dict,
@@ -277,6 +298,7 @@ async def apply_leave(
     bal = result["balance"]
 
     return {"message": "Leave application submitted successfully", "leave_id": leave_id, "leave_ids": result["leave_ids"], "created": result["created"], "balance": bal}
+
 
 @router.post("/emergency")
 @limiter.limit("3/minute")
@@ -465,3 +487,104 @@ async def reject_cancel_leave(
             detail="Only Admin, PM, or PC can reject cancellation requests."
         )
     return await leave_service.reject_cancel_leave(leave_id, current_user, payload.remark)
+
+
+@router.get("/{leave_id}", response_model=LeaveHistoryItem)
+async def get_leave_by_id(
+    leave_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+
+    email = current_user.get("email")
+    roles = current_user.get("roles", [])
+
+    if "Admin" in roles:
+        pass
+    elif leave.user_email == email:
+        pass
+    elif "Project Manager" in roles or "Project Coordinator" in roles:
+        from app.features.redmine.sql_service import RedmineSQLService
+        sql = RedmineSQLService(db)
+        current_rm = sql.get_user_by_email(email)
+        target_rm = sql.get_user_by_email(leave.user_email)
+        if not current_rm or not target_rm:
+            raise HTTPException(status_code=404, detail="Redmine user not found")
+        current_projects = sql.get_projects_for_user(current_rm["id"])
+        target_projects = sql.get_projects_for_user(target_rm["id"])
+        current_pids = {p.id for p in current_projects}
+        target_pids = {p.id for p in target_projects}
+        if not current_pids.intersection(target_pids):
+            raise HTTPException(status_code=403, detail="Not authorized to view this leave")
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized to view this leave")
+
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
+    data = leave.to_dict()
+    if emp:
+        data["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
+        data["userDesignation"] = emp.designation
+    else:
+        data["userName"] = leave.user_email
+        data["userDesignation"] = None
+    return data
+
+
+@router.delete("/{leave_id}")
+@limiter.limit("5/minute")
+async def delete_leave(
+    request: Request,
+    leave_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+
+    email = current_user.get("email")
+    roles = current_user.get("roles", [])
+
+    if "Admin" in roles:
+        pass
+    elif leave.user_email == email:
+        pass
+    elif "Project Manager" in roles or "Project Coordinator" in roles:
+        from app.features.redmine.sql_service import RedmineSQLService
+        sql = RedmineSQLService(db)
+        current_rm = sql.get_user_by_email(email)
+        target_rm = sql.get_user_by_email(leave.user_email)
+        if not current_rm or not target_rm:
+            raise HTTPException(status_code=404, detail="Redmine user not found")
+        current_projects = sql.get_projects_for_user(current_rm["id"])
+        target_projects = sql.get_projects_for_user(target_rm["id"])
+        current_pids = {p.id for p in current_projects}
+        target_pids = {p.id for p in target_projects}
+        if not current_pids.intersection(target_pids):
+            raise HTTPException(status_code=403, detail="Not authorized to delete this leave")
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this leave")
+
+    db.delete(leave)
+    db.commit()
+
+    audit_logger.info(
+        f"Leave {leave_id} deleted by {current_user.get('username')} (user: {leave.user_email}, type: {leave.leave_type}, status: {leave.approval_status})",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "delete_leave",
+                "username": current_user.get("username"),
+                "leave_id": leave_id,
+                "leave_user_email": leave.user_email,
+                "leave_type": leave.leave_type,
+                "leave_status": leave.approval_status,
+                "client_ip": _get_client_ip(request),
+            },
+        },
+    )
+
+    return {"message": "Leave deleted", "leave_id": leave_id}

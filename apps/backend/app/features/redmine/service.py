@@ -448,22 +448,28 @@ class RedmineService:
             resp.raise_for_status()
             return resp.json().get("upload")
 
-    async def create_issue(self, issue_attrs: dict) -> dict:
+    async def create_issue(self, issue_attrs: dict, switch_user: str = None) -> dict:
+        headers = {**self.headers}
+        if switch_user:
+            headers["X-Redmine-Switch-User"] = switch_user
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{self.url}/issues.json",
                 json={"issue": issue_attrs},
-                headers=self.headers,
+                headers=headers,
             )
             resp.raise_for_status()
             return resp.json().get("issue")
 
-    async def update_issue(self, issue_id: int, issue_attrs: dict) -> dict:
+    async def update_issue(self, issue_id: int, issue_attrs: dict, switch_user: str = None) -> dict:
+        headers = {**self.headers}
+        if switch_user:
+            headers["X-Redmine-Switch-User"] = switch_user
         async with httpx.AsyncClient() as client:
             resp = await client.put(
                 f"{self.url}/issues/{issue_id}.json",
                 json={"issue": issue_attrs},
-                headers=self.headers,
+                headers=headers,
             )
             resp.raise_for_status()
             # Redmine returns 204 No Content on success, re-fetch the issue

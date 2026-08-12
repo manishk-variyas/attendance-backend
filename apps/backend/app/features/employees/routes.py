@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from app.core.database import get_db
 from app.core.config import settings
 from app.features.auth.dependencies import get_current_user, require_admin, require_active
-from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, DisonboardRequest, UserProfileResponse
+from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, MyProfileUpdate, DisonboardRequest, UserProfileResponse
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
 from app.models.office_location import OfficeLocation
 from app.features.redmine.service import redmine_service
@@ -18,8 +18,24 @@ from app.features.auth.services.keycloak import update_keycloak_user, remove_rea
 from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
 from app.utils.storage import storage_service
+from app.models.system_setting import SystemSetting
+from datetime import date
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_joining_date(joining_date_str: Optional[str], db: Session) -> Optional[date]:
+    if not joining_date_str:
+        return None
+    try:
+        d = date.fromisoformat(joining_date_str)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid joining_date format. Use YYYY-MM-DD.")
+    company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+    incorporation = company.incorporation_date if company and company.incorporation_date else date(2016, 6, 9)
+    if d < incorporation:
+        raise HTTPException(status_code=400, detail=f"Joining date cannot be before company incorporation date ({incorporation.isoformat()}).")
+    return d
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -57,6 +73,90 @@ async def get_my_profile(
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_PROFILE_PIC_SIZE = 5 * 1024 * 1024  # 5MB
 ASSETS_BUCKET = "company-assets"
+
+
+@router.patch("/me", response_model=UserProfileResponse)
+async def update_my_profile(
+    payload: MyProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    email = current_user.get("email")
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee record not found")
+
+    data = payload.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    old_email = emp.user_email
+
+    if "user_email" in data and data["user_email"] != old_email:
+        exists = db.query(EmployeeMaster).filter(
+            EmployeeMaster.user_email == data["user_email"]
+        ).first()
+        if exists:
+            raise HTTPException(status_code=400, detail="This email is already in use by another employee")
+
+    for key, val in data.items():
+        if hasattr(emp, key):
+            setattr(emp, key, val)
+    emp.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(emp)
+
+    if "user_email" in data and data["user_email"] != old_email:
+        if emp.redmine_user_id:
+            try:
+                await redmine_service.update_user(emp.redmine_user_id, {"mail": emp.user_email})
+            except Exception:
+                pass
+        if emp.keycloak_user_id:
+            try:
+                await update_keycloak_user(emp.keycloak_user_id, {"email": emp.user_email})
+            except Exception:
+                pass
+
+    name_fields = {"first_name", "middle_name", "last_name"}
+    if name_fields & set(data.keys()):
+        if emp.redmine_user_id:
+            try:
+                await redmine_service.update_user(emp.redmine_user_id, {
+                    "firstname": emp.first_name,
+                    "lastname": emp.last_name,
+                })
+            except Exception:
+                pass
+        if emp.keycloak_user_id:
+            try:
+                await update_keycloak_user(emp.keycloak_user_id, {
+                    "firstName": emp.first_name,
+                    "lastName": emp.last_name,
+                })
+            except Exception:
+                pass
+
+    return {
+        "first_name": emp.first_name,
+        "middle_name": emp.middle_name,
+        "last_name": emp.last_name,
+        "user_email": emp.user_email,
+        "designation": emp.designation,
+        "employee_id": emp.employee_id,
+        "work_location_status": emp.work_location_status,
+        "contact_number": emp.contact_number,
+        "alt_contact_number": emp.alt_contact_number,
+        "work_address": emp.work_address,
+        "current_address": emp.current_address,
+        "permanent_address": emp.permanent_address,
+        "reports_to_name": emp.reports_to_name,
+        "is_active": emp.is_active,
+        "title": emp.title,
+        "profilePictureUrl": f"/api/employees/me/profile-picture" if emp.profile_picture_url else None,
+        "joined_at": emp.joining_date.isoformat() if emp.joining_date else emp.created_at.date().isoformat() if emp.created_at else None,
+    }
 
 
 @router.get("/me/profile-picture")
@@ -419,6 +519,8 @@ async def create_employee(
             kc_roles = await get_user_realm_roles(mgr.keycloak_user_id)
             if "Admin" not in kc_roles and not any(r in kc_roles for r in ["Project Manager", "Project Coordinator"]):
                 raise HTTPException(status_code=400, detail="Reporting manager must be Admin, Project Manager, or Project Coordinator")
+    if payload.joining_date:
+        _validate_joining_date(payload.joining_date, db)
     emp = svc.create(EmployeeMaster, **payload.model_dump())
     return _employee_to_dict(emp)
 
@@ -571,6 +673,9 @@ async def update_employee(
         new_alt = changes.get("alt_contact_number", emp.alt_contact_number)
         if new_primary and new_alt and new_primary == new_alt:
             raise HTTPException(status_code=400, detail="Alternative contact number cannot be same as primary")
+
+    if changes.get("joining_date"):
+        _validate_joining_date(changes["joining_date"], db)
 
     # Validate reports_to is a valid manager in the target project
     if changes.get("reports_to"):
