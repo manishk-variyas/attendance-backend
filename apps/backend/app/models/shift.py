@@ -29,6 +29,7 @@ class Shift(Base):
     status = Column(String(20), nullable=False, server_default=text("'Yet to start'"))
     per_diem_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     conveyance_eligible = Column(Boolean, nullable=False, server_default=text("false"))
+    checkin_reminder_sent = Column(Boolean, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 

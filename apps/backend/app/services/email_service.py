@@ -99,8 +99,23 @@ class EmailService:
         body = _template("cancel_rejected", applicant_name=applicant_name, start=start, end=end, remark=remark)
         return self.send([to], subject, body)
 
+    def send_missed_checkin_reminder(self, to: str, employee_name: str, shift_date: str, shift_start_time: str) -> bool:
+        subject = f"Reminder: Missed Check-In for Today's Shift ({shift_date})"
+        body = _template("missed_checkin_reminder", employee_name=employee_name, shift_date=shift_date, shift_start_time=shift_start_time)
+        return self.send([to], subject, body)
+
 
 _EMAIL_TEMPLATES = {
+    "missed_checkin_reminder": """
+        <div class="badge badge-warning">Missed Check-In Reminder</div>
+        <p>Hello {employee_name},</p>
+        <p>Our records show that you have not checked in for your scheduled shift today.</p>
+        <table class="details">
+            <tr><td>Shift Date</td><td>{shift_date}</td></tr>
+            <tr><td>Shift Start Time</td><td>{shift_start_time}</td></tr>
+        </table>
+        <p>If you are working today, please log into the Attendance Portal and check in as soon as possible. If you are on leave, please submit a leave request in the portal.</p>
+    """,
     "leave_applied": """
         <div class="badge badge-info">New Leave Request</div>
         <p>Hello,</p>

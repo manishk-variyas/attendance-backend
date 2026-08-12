@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, time, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -22,6 +22,7 @@ from app.models.leave import Leave
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
+from app.services.email_service import email_service
 
 logger = logging.getLogger(__name__)
 
@@ -699,9 +700,13 @@ async def get_today_attendance(
             if sd and sd.end_time:
                 tz = _safe_zone(sd.timezone or "Asia/Kolkata")
                 shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
-                if datetime.now(timezone.utc) > shift_end + timedelta(hours=2):
+                # 10:00 PM (22:00) Night Cutoff: allow working late into evening up to 10 PM.
+                # If shift_end is past 10 PM (e.g. night shift ending next morning), cutoff is shift_end.
+                cutoff_time = datetime.combine(effective_date, time(22, 0), tzinfo=tz)
+                cutoff_dt = max(cutoff_time, shift_end)
+                if datetime.now(timezone.utc) > cutoff_dt:
                     open_att.check_out_time = shift_end
-                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, "Auto-checkout: shift ended"]))
+                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, "Auto-checkout: shift ended (10 PM cutoff)"]))
                     shift_rec = db.query(Shift).filter(
                         Shift.keycloak_user_id == open_att.keycloak_user_id,
                         Shift.date <= effective_date,
@@ -767,6 +772,31 @@ async def get_today_attendance(
                 if s == "in_progress" and end_dt and now > end_dt:
                     s = "shift_ended"
                 return _build_status_response(db, shift_att, today, s)
+
+        # Check for missed check-in email reminder (2 hours after shift start)
+        if not shift_att and not on_leave_today and not getattr(shift, "checkin_reminder_sent", False):
+            if now > start_dt + timedelta(hours=2):
+                user_email = current_user.get("email")
+                if not user_email:
+                    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
+                    if emp:
+                        user_email = emp.user_email
+                if user_email:
+                    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
+                    emp_name = f"{emp.first_name} {emp.last_name}".strip() if (emp and emp.first_name) else current_user.get("preferred_username", user_email)
+                    start_str = sd.start_time.strftime("%H:%M") if (sd and sd.start_time) else "Scheduled Time"
+                    try:
+                        email_service.send_missed_checkin_reminder(
+                            to=user_email,
+                            employee_name=emp_name,
+                            shift_date=shift.date.isoformat(),
+                            shift_start_time=start_str,
+                        )
+                        shift.checkin_reminder_sent = True
+                        db.commit()
+                        logger.info(f"Sent missed check-in email reminder to {user_email} for shift {shift.date}")
+                    except Exception as e:
+                        logger.error(f"Failed to send missed check-in email reminder: {e}")
 
         if on_leave_today or shift.work_location_status == "LEAVE":
             return _no_attendance_response("on_leave", shift, sd, tz, today)

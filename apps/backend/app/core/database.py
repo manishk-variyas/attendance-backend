@@ -49,6 +49,12 @@ def _run_migrations():
                 ) THEN
                     ALTER TABLE shifts ADD COLUMN project_name VARCHAR(255);
                 END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='shifts' AND column_name='checkin_reminder_sent'
+                ) THEN
+                    ALTER TABLE shifts ADD COLUMN checkin_reminder_sent BOOLEAN DEFAULT FALSE;
+                END IF;
             END $$;
         """))
         conn.commit()
