@@ -14,6 +14,7 @@ from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
     LeaveHistoryItem, 
     LeaveStats, 
+    LeaveBalanceSummary,
     Holiday,
     BatchLeaveRequest,
     CancelLeaveRequest,
@@ -44,6 +45,13 @@ async def get_stats(
     user_id = current_user.get("sub")
     stats = await leave_service.get_leave_stats(user_id, year, month)
     return stats
+
+@router.get("/balance", response_model=LeaveBalanceSummary)
+async def get_balance(
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    return await leave_service.get_leave_balance(current_user.get("sub"))
 
 @router.get("/admin/{email}", response_model=List[LeaveHistoryItem])
 async def get_user_leave_history(

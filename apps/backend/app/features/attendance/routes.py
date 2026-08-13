@@ -1,15 +1,19 @@
 import logging
+from io import BytesIO
 from datetime import date, datetime, time, timezone, timedelta
-from typing import Optional
+from typing import Optional, List
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse
+
+import openpyxl
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, text
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_active
 from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse
+from app.features.attendance.admin_routes import _to_response_with_email_batched, _build_virtual_record
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
@@ -23,6 +27,8 @@ from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
 from app.services.email_service import email_service
+from app.utils.audit import audit_logger
+from app.middleware.logging import _get_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -698,15 +704,20 @@ async def get_today_attendance(
             effective_date = srec.date if srec else open_att.attendance_date
             sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == open_att.shift_code).first()
             if sd and sd.end_time:
+                company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+                auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
+                cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
+
                 tz = _safe_zone(sd.timezone or "Asia/Kolkata")
                 shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
-                # 10:00 PM (22:00) Night Cutoff: allow working late into evening up to 10 PM.
-                # If shift_end is past 10 PM (e.g. night shift ending next morning), cutoff is shift_end.
-                cutoff_time = datetime.combine(effective_date, time(22, 0), tzinfo=tz)
+                # Configurable night cutoff: allow working late into evening.
+                # If shift_end is past cutoff (e.g. night shift ending next morning), cutoff is shift_end.
+                cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
                 cutoff_dt = max(cutoff_time, shift_end)
-                if datetime.now(timezone.utc) > cutoff_dt:
-                    open_att.check_out_time = shift_end
-                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, "Auto-checkout: shift ended (10 PM cutoff)"]))
+                if auto_checkout_enabled and datetime.now(timezone.utc) > cutoff_dt:
+                    open_att.check_out_time = cutoff_dt
+                    cutoff_str = cutoff_time_setting.strftime("%I:%M %p")
+                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, f"Auto-checkout: shift ended ({cutoff_str} cutoff)"]))
                     shift_rec = db.query(Shift).filter(
                         Shift.keycloak_user_id == open_att.keycloak_user_id,
                         Shift.date <= effective_date,
@@ -1206,3 +1217,357 @@ async def get_my_projects_attendance(
         "total": len(result),
         "records": result,
     }
+
+
+def _build_attendance_excel(records: list) -> BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+    ws.append(["Date", "Day", "Employee", "Designation", "Project", "Shift Code", "Shift Name",
+               "Work Status", "Status", "Check In", "Check Out", "Total Hours", "Late",
+               "Office", "Manual Entry", "Remarks"])
+    for r in records:
+        ws.append([
+            r.get("attendanceDate") or "",
+            r.get("dayName") or "",
+            r.get("userName") or "",
+            r.get("userDesignation") or "",
+            r.get("shiftProject") or "",
+            r.get("shiftCode") or "",
+            r.get("shiftName") or "",
+            r.get("workLocationStatus") or "",
+            r.get("derivedStatus") or r.get("status") or "",
+            r.get("checkInTime") or "",
+            r.get("checkOutTime") or "",
+            r.get("totalHours") if r.get("totalHours") is not None else "",
+            "Yes" if r.get("isLate") else "No",
+            r.get("officeName") or "",
+            "Yes" if r.get("isManualEntry") else "No",
+            r.get("remarks") or "",
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+def _get_attendance_paginated(
+    db: Session, keycloak_user_ids: List[str],
+    from_date: Optional[str] = None, to_date: Optional[str] = None,
+    work_status: Optional[str] = None, project_id: Optional[int] = None,
+    per_diem: Optional[bool] = None, conveyance: Optional[bool] = None,
+    entry_type: Optional[str] = None, status_filter: Optional[str] = None,
+    is_late: Optional[bool] = None,
+    search: Optional[str] = None, include_name_search: bool = False,
+    sort_by: str = "attendanceDate", sort_dir: str = "asc",
+    page: int = 1, page_size: int = 50, export: bool = False,
+) -> dict:
+    query = db.query(Attendance).filter(Attendance.keycloak_user_id.in_(keycloak_user_ids))
+    if from_date:
+        query = query.filter(Attendance.attendance_date >= date.fromisoformat(from_date))
+    if to_date:
+        query = query.filter(Attendance.attendance_date <= date.fromisoformat(to_date))
+    if work_status:
+        query = query.filter(Attendance.work_location_status == work_status)
+    if per_diem is not None:
+        query = query.filter(Attendance.per_diem_eligible == per_diem)
+    if conveyance is not None:
+        query = query.filter(Attendance.conveyance_eligible == conveyance)
+    if entry_type:
+        query = query.filter(Attendance.is_manual_entry == (entry_type == "manual"))
+    if status_filter:
+        query = query.filter(Attendance.status == status_filter)
+    if is_late is not None:
+        query = query.filter(Attendance.is_late == is_late)
+    if project_id:
+        query = query.join(Shift, and_(
+            Shift.keycloak_user_id == Attendance.keycloak_user_id,
+            Shift.date == Attendance.attendance_date,
+        )).filter(Shift.project_id == project_id)
+
+    records = query.all()
+
+    user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id})
+    loc_ids = list({str(r.location_id) for r in records if r.location_id})
+    shift_codes = list({r.shift_code for r in records if r.shift_code})
+    modified_by_ids = list({r.modified_by for r in records if r.modified_by})
+    dates_set = list({r.attendance_date for r in records})
+
+    emp_map = {}
+    if user_ids:
+        emps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(user_ids)).all()
+        emp_map = {e.keycloak_user_id: e for e in emps}
+
+    loc_map = {}
+    if loc_ids:
+        from uuid import UUID
+        locs = db.query(OfficeLocation).filter(OfficeLocation.id.in_([UUID(x) for x in loc_ids])).all()
+        loc_map = {str(l.id): l for l in locs}
+
+    sd_map = {}
+    if shift_codes:
+        sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+        sd_map = {s.shift_code: s for s in sds}
+
+    shift_map = {}
+    if user_ids and dates_set:
+        shifts = db.query(Shift).filter(
+            Shift.keycloak_user_id.in_(user_ids),
+            Shift.date.in_(dates_set),
+        ).all()
+        shift_map = {(s.keycloak_user_id, s.date): s for s in shifts}
+
+    leave_map = {}
+    if user_ids and dates_set:
+        leaves = db.query(Leave).filter(
+            Leave.keycloak_user_id.in_(user_ids),
+            Leave.approval_status == "approved",
+            Leave.start_date <= max(dates_set),
+            Leave.end_date >= min(dates_set),
+        ).all()
+        for l in leaves:
+            current = max(l.start_date, min(dates_set))
+            end = min(l.end_date, max(dates_set))
+            while current <= end:
+                leave_map[(l.keycloak_user_id, current)] = l
+                current += timedelta(days=1)
+
+    modified_by_map = {}
+    if modified_by_ids:
+        mb_emps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(modified_by_ids)).all()
+        modified_by_map = {e.keycloak_user_id: e for e in mb_emps}
+
+    result = [_to_response_with_email_batched(r, emp_map, loc_map, sd_map, shift_map, leave_map, modified_by_map) for r in records]
+    covered = {(r.keycloak_user_id, r.attendance_date) for r in records}
+
+    if from_date and to_date:
+        f = date.fromisoformat(from_date)
+        t = date.fromisoformat(to_date)
+
+        leave_list = db.query(Leave).filter(
+            and_(
+                Leave.keycloak_user_id.in_(keycloak_user_ids),
+                Leave.approval_status == "approved",
+                Leave.start_date <= t,
+                Leave.end_date >= f,
+            )
+        ).all()
+        leave_covered = set()
+        for l in leave_list:
+            if l.keycloak_user_id:
+                ld = max(l.start_date, f)
+                rd = min(l.end_date, t)
+                current = ld
+                while current <= rd:
+                    leave_covered.add((l.keycloak_user_id, current))
+                    current += timedelta(days=1)
+
+        shift_query = db.query(Shift).filter(
+            and_(
+                Shift.keycloak_user_id.in_(keycloak_user_ids),
+                Shift.date >= f,
+                Shift.date <= t,
+            )
+        )
+        if project_id:
+            shift_query = shift_query.filter(Shift.project_id == project_id)
+        if work_status:
+            shift_query = shift_query.filter(Shift.work_location_status == work_status)
+        for s in shift_query.order_by(Shift.date.desc()).all():
+            if (s.keycloak_user_id, s.date) in leave_covered:
+                continue
+            if (s.keycloak_user_id, s.date) in covered:
+                continue
+            emp = emp_map.get(s.keycloak_user_id)
+            result.append(_build_virtual_record(db, s, emp))
+            covered.add((s.keycloak_user_id, s.date))
+
+        for l in leave_list:
+            if not l.keycloak_user_id:
+                continue
+            ld = max(l.start_date, f)
+            rd = min(l.end_date, t)
+            current = ld
+            while current <= rd:
+                if (l.keycloak_user_id, current) not in covered:
+                    emp = emp_map.get(l.keycloak_user_id)
+                    record = {
+                        "id": None, "keycloakUserId": l.keycloak_user_id,
+                        "attendanceDate": current.isoformat(),
+                        "checkInTime": None, "checkInLat": None, "checkInLng": None, "checkInLocationName": None,
+                        "checkOutTime": None, "checkOutLat": None, "checkOutLng": None, "checkOutLocationName": None,
+                        "locationId": None, "officeName": None,
+                        "workLocationStatus": None, "shiftCode": None, "shiftName": None,
+                        "totalHours": None, "isLate": False, "status": "present",
+                        "isManualEntry": False, "isSynced": False, "remarks": None,
+                        "userEmail": emp.user_email if emp else "",
+                        "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else "",
+                        "userDesignation": emp.designation if emp else None,
+                        "derivedStatus": "on_leave",
+                        "isAtAssignedLocation": None,
+                        "dayName": current.strftime("%A"),
+                        "shiftProject": None,
+                        "onLeave": True,
+                        "leaveType": l.leave_type,
+                        "leaveStartDate": l.start_date.isoformat() if l.start_date else None,
+                        "leaveEndDate": l.end_date.isoformat() if l.end_date else None,
+                        "leaveStartDay": l.start_date.strftime("%A") if l.start_date else None,
+                        "leaveEndDay": l.end_date.strftime("%A") if l.end_date else None,
+                        "endedBy": None, "endedByRole": None,
+                    }
+                    result.append(record)
+                    covered.add((l.keycloak_user_id, current))
+                current += timedelta(days=1)
+
+    if search:
+        term = (search or "").strip().lower()[:100]
+        if term:
+            fields = ["shiftCode", "shiftName", "officeName", "shiftProject", "workLocationStatus", "leaveType"]
+            if include_name_search:
+                fields = ["userName", "userEmail"] + fields
+            result = [r for r in result if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+    allowed_sort = {"attendanceDate", "checkInTime", "checkOutTime", "workStatus", "totalHours", "userName"}
+    sort_by = sort_by if sort_by in allowed_sort else "attendanceDate"
+    sort_key = "workLocationStatus" if sort_by == "workStatus" else sort_by
+    if sort_key == "totalHours":
+        result.sort(key=lambda r: r.get("totalHours") if r.get("totalHours") is not None else 0, reverse=(sort_dir == "desc"))
+    else:
+        result.sort(key=lambda r: r.get(sort_key) or "", reverse=(sort_dir == "desc"))
+
+    total = len(result)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+    if export:
+        return {"records": result, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+    offset = (page - 1) * page_size
+    records_out = result[offset:offset + page_size]
+    return {"records": records_out, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+
+
+@router.get("/my-attendance")
+async def get_my_attendance(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("attendanceDate", description="attendanceDate, checkInTime, checkOutTime, workStatus, totalHours, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    per_diem: Optional[bool] = Query(None, description="Filter per-diem eligible (true/false)"),
+    conveyance: Optional[bool] = Query(None, description="Filter conveyance eligible (true/false)"),
+    entry_type: Optional[str] = Query(None, description="regular or manual"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
+    search: Optional[str] = Query(None, description="Search shift code, project, office"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    keycloak_user_id = current_user["sub"]
+    result = _get_attendance_paginated(
+        db, keycloak_user_ids=[keycloak_user_id],
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        per_diem=per_diem, conveyance=conveyance,
+        entry_type=entry_type, status_filter=status, is_late=is_late,
+        search=search, include_name_search=False,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_attendance_excel(result["records"])
+        audit_logger.info(
+            f"Attendance history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_my_attendance",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"my_attendance_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
+
+@router.get("/team-attendance")
+async def get_team_attendance(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("attendanceDate", description="attendanceDate, checkInTime, checkOutTime, workStatus, totalHours, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    per_diem: Optional[bool] = Query(None, description="Filter per-diem eligible (true/false)"),
+    conveyance: Optional[bool] = Query(None, description="Filter conveyance eligible (true/false)"),
+    entry_type: Optional[str] = Query(None, description="regular or manual"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
+    search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
+    member_keycloak_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
+    if not member_keycloak_ids:
+        return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+    result = _get_attendance_paginated(
+        db, keycloak_user_ids=member_keycloak_ids,
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        per_diem=per_diem, conveyance=conveyance,
+        entry_type=entry_type, status_filter=status, is_late=is_late,
+        search=search, include_name_search=True,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_attendance_excel(result["records"])
+        audit_logger.info(
+            f"Team attendance history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_team_attendance",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"team_attendance_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result

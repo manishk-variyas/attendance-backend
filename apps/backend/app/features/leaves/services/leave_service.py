@@ -734,6 +734,64 @@ class LeaveBusinessService:
         }
         return stats
 
+    async def get_leave_balance(self, user_id: str) -> Dict[str, Any]:
+        today = date.today()
+
+        balance_doc = self.balance_db.db.execute(
+            select(LeaveBalance).where(
+                LeaveBalance.keycloak_user_id == user_id,
+                LeaveBalance.year == today.year,
+                LeaveBalance.month.is_(None),
+            )
+        ).scalars().first()
+        if not balance_doc:
+            balance_doc = self.balance_db.db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.keycloak_user_id == user_id,
+                    LeaveBalance.year == today.year,
+                ).order_by(LeaveBalance.month.desc())
+            ).scalars().first()
+
+        el_accrued = float(balance_doc.total_earned) if balance_doc and balance_doc.total_earned else 0.0
+        co_accrued = float(balance_doc.accrued_compoff) if balance_doc and balance_doc.accrued_compoff else 0.0
+
+        leaves = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id == user_id,
+                Leave.approval_status == LeaveStatus.APPROVED.value,
+                Leave.start_date >= date(today.year, 1, 1),
+                Leave.end_date <= today,
+            )
+        ).scalars().all()
+
+        el_used = 0.0
+        co_used = 0.0
+        upl_used = 0.0
+        for lv in leaves:
+            days = (lv.end_date - lv.start_date).days + 1
+            if lv.leave_type == LeaveType.EL.value:
+                el_used += days
+            elif lv.leave_type == LeaveType.PL.value:
+                co_used += days
+            elif lv.leave_type == LeaveType.UPL.value:
+                upl_used += days
+
+        el_balance = el_accrued - el_used
+        co_balance = co_accrued - co_used
+
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
+        ).scalars().first()
+
+        return {
+            "employee_id": emp.employee_id if emp else None,
+            "as_of_date": today.isoformat(),
+            "earned_leave": {"accrued": el_accrued, "availed": el_used, "balance": el_balance},
+            "comp_off": {"accrued": co_accrued, "availed": co_used, "balance": co_balance},
+            "unpaid_leave": upl_used,
+            "total_available_leave": el_balance + co_balance - upl_used,
+        }
+
     async def approve_leave(self, leave_id: str, current_user: dict) -> bool:
         """
         Approve a leave application with balance validation.

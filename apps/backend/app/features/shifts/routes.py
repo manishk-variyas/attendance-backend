@@ -579,6 +579,158 @@ async def get_shift_history(
     return {"total": len(records), "records": records}
 
 
+def _build_shifts_excel(records: list) -> BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Shifts"
+    ws.append(["Date", "Day", "Employee", "Designation", "Project", "Shift Code", "Shift Name",
+               "Work Status", "Status", "Shift Start", "Shift End", "Check In", "Check Out",
+               "Total Hours", "Late (hrs)", "Work Address"])
+    for r in records:
+        ws.append([
+            r.get("date") or "",
+            r.get("dayName") or "",
+            r.get("userName") or "",
+            r.get("userDesignation") or "",
+            r.get("projectName") or "",
+            r.get("shift") or "",
+            r.get("shiftName") or "",
+            r.get("workStatus") or "",
+            r.get("status") or "",
+            r.get("shiftStartTime") or "",
+            r.get("shiftEndTime") or "",
+            r.get("checkInTime") or "",
+            r.get("checkOutTime") or "",
+            r.get("totalHours") if r.get("totalHours") is not None else "",
+            r.get("lateByHours") if r.get("lateByHours") is not None else "",
+            r.get("workAddress") or "",
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+@router.get("/my-history")
+async def get_my_shift_history(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: Ended, In Progress, on_leave, Missed, Not checked in, Yet to start"),
+    search: Optional[str] = Query(None, description="Search shift code, project, work address"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+    result = await shift_service.get_shifts_paginated(
+        db, emails=[email],
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status,
+        search=search, include_name_search=False,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_shifts_excel(result["records"])
+        audit_logger.info(
+            f"Shift history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_shifts",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"my_shifts_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
+
+@router.get("/team-history")
+async def get_team_shift_history(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: Ended, In Progress, on_leave, Missed, Not checked in, Yet to start"),
+    search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
+    member_emails = [e.user_email for e in emps if e.user_email]
+    if not member_emails:
+        return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+    result = await shift_service.get_shifts_paginated(
+        db, emails=member_emails,
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status,
+        search=search, include_name_search=True,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_shifts_excel(result["records"])
+        audit_logger.info(
+            f"Team shift history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_team_shifts",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"team_shifts_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
+
 
 
 @router.put("/{shift_id}")
@@ -700,14 +852,6 @@ async def delete_shift_by_date(
         is_write=True,
     )
 
-    existing_att = db.query(Attendance).filter(
-        Attendance.keycloak_user_id == emp.keycloak_user_id,
-        Attendance.attendance_date == td,
-        Attendance.check_in_time.isnot(None),
-    ).first()
-    if existing_att:
-        raise HTTPException(status_code=400, detail="Cannot delete shift. User has already checked in for this date. Clear the attendance record first.")
-
     deleted = await shift_service.delete_shift_by_date(db, emp.keycloak_user_id, td)
     if not deleted:
         raise HTTPException(status_code=404, detail="No shift found for this date")
@@ -748,15 +892,6 @@ async def delete_shift(
         target_project_id=shift.project_id,
         is_write=True,
     )
-
-    existing_att = db.query(Attendance).filter(
-        Attendance.keycloak_user_id == shift.keycloak_user_id,
-        Attendance.attendance_date >= shift.date,
-        Attendance.attendance_date <= (shift.end_date or shift.date),
-        Attendance.check_in_time.isnot(None),
-    ).first()
-    if existing_att:
-        raise HTTPException(status_code=400, detail="Cannot delete shift. User has already checked in for this date range. Clear the attendance record first.")
 
     deleted = await shift_service.delete_shift(db, shift_id)
     if not deleted:

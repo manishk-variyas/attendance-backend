@@ -73,6 +73,21 @@ class LeaveStats(BaseModel):
     year: Optional[int] = None
     month: Optional[int] = None
 
+
+class LeaveBalanceItem(BaseModel):
+    accrued: float = 0.0
+    availed: float = 0.0
+    balance: float = 0.0
+
+
+class LeaveBalanceSummary(BaseModel):
+    employee_id: Optional[str] = None
+    as_of_date: str
+    earned_leave: LeaveBalanceItem
+    comp_off: LeaveBalanceItem
+    unpaid_leave: float = 0.0
+    total_available_leave: float = 0.0
+
 class HolidayType(str, Enum):
     GAZETTED = "GAZETTED"
     RESTRICTED = "RESTRICTED"

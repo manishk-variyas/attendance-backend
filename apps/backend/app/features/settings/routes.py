@@ -8,7 +8,7 @@ from app.features.auth.dependencies import get_current_user, require_admin
 from app.utils.storage import storage_service
 from app.services.database.system_setting_service import SystemSettingService
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, time
 import io
 import logging
 
@@ -36,6 +36,7 @@ async def get_settings(db: Session = Depends(get_db)):
         "grace_minutes": doc.grace_minutes,
         "checkout_reminder_grace_hours": doc.checkout_reminder_grace_hours,
         "auto_checkout_enabled": doc.auto_checkout_enabled,
+        "auto_checkout_cutoff_time": doc.auto_checkout_cutoff_time.isoformat() if doc.auto_checkout_cutoff_time else "22:00",
         "incorporation_date": doc.incorporation_date.isoformat() if doc.incorporation_date else "2016-06-09",
         "updated_at": doc.updated_at,
     }
@@ -76,6 +77,7 @@ async def update_settings(
     grace_minutes: int = Form(None),
     checkout_reminder_grace_hours: int = Form(None),
     auto_checkout_enabled: bool = Form(None),
+    auto_checkout_cutoff_time: str = Form(None),
     incorporation_date: str = Form(None),
     db: Session = Depends(get_db),
     _: None = Depends(require_admin),
@@ -86,6 +88,11 @@ async def update_settings(
         raise HTTPException(status_code=400, detail="Grace minutes must be between 1 and 120.")
     if checkout_reminder_grace_hours is not None and (checkout_reminder_grace_hours < 1 or checkout_reminder_grace_hours > 24):
         raise HTTPException(status_code=400, detail="Checkout reminder grace hours must be between 1 and 24.")
+    if auto_checkout_cutoff_time:
+        try:
+            time.fromisoformat(auto_checkout_cutoff_time)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid auto_checkout_cutoff_time format. Use HH:MM.")
     if incorporation_date:
         try:
             inc = date.fromisoformat(incorporation_date)
@@ -131,6 +138,7 @@ async def update_settings(
         grace_minutes=grace_minutes,
         checkout_reminder_grace_hours=checkout_reminder_grace_hours,
         auto_checkout_enabled=auto_checkout_enabled if auto_checkout_enabled is not None else None,
+        auto_checkout_cutoff_time=auto_checkout_cutoff_time,
         incorporation_date=incorporation_date,
     )
     settings = svc.fetch()

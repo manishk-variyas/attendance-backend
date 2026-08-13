@@ -136,6 +136,13 @@ def setup_logging() -> None:
     error_logger.addHandler(_build_console_handler(logging.ERROR))
     error_logger.propagate = False
 
+    # Sweeper logger - logs background cron job runs (auto-checkout, reminders)
+    sweeper_logger = logging.getLogger("app.sweeper")
+    sweeper_logger.setLevel(logging.INFO)
+    sweeper_logger.addHandler(_build_handler("sweeper.log", logging.INFO))
+    sweeper_logger.addHandler(_build_console_handler(logging.INFO))
+    sweeper_logger.propagate = False
+
     # Root logger - general application logs
     root = logging.getLogger()
     root.setLevel(logging.INFO)

@@ -68,6 +68,9 @@ def _run_migrations():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='auto_checkout_enabled') THEN
                     ALTER TABLE system_settings ADD COLUMN auto_checkout_enabled BOOLEAN DEFAULT TRUE;
                 END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='auto_checkout_cutoff_time') THEN
+                    ALTER TABLE system_settings ADD COLUMN auto_checkout_cutoff_time TIME DEFAULT '22:00';
+                END IF;
             END $$;
         """))
         conn.commit()

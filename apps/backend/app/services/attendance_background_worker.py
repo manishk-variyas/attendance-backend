@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime, date, time, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -12,9 +11,10 @@ from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
+from app.models.system_setting import SystemSetting
 from app.services.email_service import email_service
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app.sweeper")
 
 
 def _safe_zone(tz_str: str) -> ZoneInfo:
@@ -31,11 +31,19 @@ def _shift_end_datetime(shift_date: date, start_time, end_time, tz: ZoneInfo) ->
 
 
 def run_attendance_background_sweep():
-    """Runs periodic background sweep for auto-checkout (10 PM cutoff) and missed check-in email alerts."""
+    """Runs periodic background sweep for auto-checkout and missed check-in email alerts."""
     db: Session = SessionLocal()
+    auto_checked_out = 0
+    reminders_sent = 0
     try:
         now_utc = datetime.now(timezone.utc)
         today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        logger.info("[Background Sweeper] Sweep started")
+
+        # ── 0. Company settings (auto-checkout toggle + cutoff time) ───────────────
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
+        cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
 
         # ── 1. Auto-Checkout Night Sweeper ─────────────────────────────────────────
         open_attendances = db.query(Attendance).filter(
@@ -44,6 +52,9 @@ def run_attendance_background_sweep():
                 Attendance.attendance_date >= today_ist - timedelta(days=3),
             )
         ).all()
+
+        if not auto_checkout_enabled:
+            open_attendances = []
 
         for att in open_attendances:
             try:
@@ -58,13 +69,14 @@ def run_attendance_background_sweep():
                 effective_date = att.attendance_date
                 shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
 
-                # 10:00 PM (22:00) Night Cutoff
-                cutoff_time = datetime.combine(effective_date, time(22, 0), tzinfo=tz)
+                # Configurable night cutoff (default 10:00 PM)
+                cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
                 cutoff_dt = max(cutoff_time, shift_end)
 
                 if now_utc > cutoff_dt:
-                    att.check_out_time = shift_end
-                    att.remarks = ", ".join(filter(None, [att.remarks, "Auto-checkout: shift ended (10 PM cutoff)"]))
+                    att.check_out_time = cutoff_dt
+                    cutoff_str = cutoff_time_setting.strftime("%I:%M %p")
+                    att.remarks = ", ".join(filter(None, [att.remarks, f"Auto-checkout: shift ended ({cutoff_str} cutoff)"]))
                     
                     shift_rec = db.query(Shift).filter(
                         Shift.keycloak_user_id == att.keycloak_user_id,
@@ -75,6 +87,7 @@ def run_attendance_background_sweep():
                         shift_rec.status = "Ended"
                     
                     db.commit()
+                    auto_checked_out += 1
                     logger.info(f"[Background Sweeper] Auto-checked out attendance {att.id} for user {att.keycloak_user_id}")
             except Exception as e:
                 db.rollback()
@@ -133,6 +146,7 @@ def run_attendance_background_sweep():
                                 shift_date=shift.date.isoformat(),
                                 shift_start_time=start_str,
                             )
+                            reminders_sent += 1
                             logger.info(f"[Background Sweeper] Sent missed check-in email to {user_email} for shift {shift.date}")
 
                     shift.checkin_reminder_sent = True
@@ -141,18 +155,9 @@ def run_attendance_background_sweep():
                 db.rollback()
                 logger.error(f"[Background Sweeper] Error processing shift reminder {shift.id}: {e}")
 
+        logger.info(f"[Background Sweeper] Sweep completed - auto_checked_out={auto_checked_out}, reminders_sent={reminders_sent}")
+
     except Exception as outer_err:
         logger.error(f"[Background Sweeper] Sweeper loop error: {outer_err}")
     finally:
         db.close()
-
-
-async def attendance_sweep_loop(interval_seconds: int = 900):
-    """Background asyncio task that runs the attendance sweeper periodically."""
-    logger.info("[Background Sweeper] Starting attendance background sweep loop...")
-    while True:
-        try:
-            run_attendance_background_sweep()
-        except Exception as e:
-            logger.error(f"[Background Sweeper] Unexpected loop exception: {e}")
-        await asyncio.sleep(interval_seconds)

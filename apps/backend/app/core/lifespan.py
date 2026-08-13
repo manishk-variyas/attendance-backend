@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.database import init_db
-from app.services.attendance_background_worker import attendance_sweep_loop
 
 
 logger = logging.getLogger(__name__)
@@ -15,15 +14,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Starting up Backend API...")
     init_db()
-    
-    # Start background attendance sweeper (runs every 15 minutes)
-    sweep_task = asyncio.create_task(attendance_sweep_loop(interval_seconds=900))
-    
+    # Note: The attendance background sweeper (auto-checkout + missed check-in
+    # reminders) is NOT started here. It runs as a standalone cron job
+    # (scripts/attendance_sweeper.py) so it executes exactly once per interval
+    # regardless of how many gunicorn workers are running.
+
     yield
-    
+
     logger.info("Shutting down Backend API...")
-    sweep_task.cancel()
-    try:
-        await sweep_task
-    except asyncio.CancelledError:
-        logger.info("[Background Sweeper] Attendance background task shutdown cleanly.")

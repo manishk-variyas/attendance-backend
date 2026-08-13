@@ -13,3 +13,8 @@
 
 # Auto-close overdue attendance daily at 1 AM
 0 1 * * * cd /app && uv run python scripts/auto_close_attendance.py 2>&1 | tee -a /app/logs/auto_close_attendance.log
+
+# Attendance sweeper: auto-checkout (configurable cutoff) + missed check-in reminders
+# Runs as a single cron process (not per gunicorn worker) every 15 minutes.
+# Logs are written to logs/sweeper.log via the app.sweeper logger.
+*/15 * * * * cd /app && uv run python scripts/attendance_sweeper.py >/dev/null 2>&1

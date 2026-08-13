@@ -17,8 +17,9 @@ class SystemSettingService(BaseService[SystemSetting]):
     def upsert(self, company_name: str = "", logo_content_type: str = None, created_by: str = None, updated_by: str = None,
                default_shift_start_time: str = None, default_shift_end_time: str = None,
                default_timezone: str = None, grace_minutes: int = None,
-               checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None,
-               incorporation_date: str = None) -> SystemSetting:
+                checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None,
+                auto_checkout_cutoff_time: str = None,
+                incorporation_date: str = None) -> SystemSetting:
         existing = self.fetch()
         now = datetime.utcnow()
         data = {"company_name": company_name, "updated_at": now}
@@ -40,6 +41,8 @@ class SystemSettingService(BaseService[SystemSetting]):
             data["checkout_reminder_grace_hours"] = checkout_reminder_grace_hours
         if auto_checkout_enabled is not None:
             data["auto_checkout_enabled"] = auto_checkout_enabled
+        if auto_checkout_cutoff_time is not None:
+            data["auto_checkout_cutoff_time"] = datetime.strptime(auto_checkout_cutoff_time, "%H:%M").time() if auto_checkout_cutoff_time else None
         if incorporation_date is not None:
             data["incorporation_date"] = date.fromisoformat(incorporation_date) if incorporation_date else None
         if existing:

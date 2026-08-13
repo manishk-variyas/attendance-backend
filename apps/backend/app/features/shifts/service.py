@@ -322,6 +322,7 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveId": str(leave.id) if leave else None,
                 "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
                 "conveyanceEligible": s.conveyance_eligible,
@@ -357,6 +358,7 @@ class ShiftService:
                 if current not in shifted_dates:
                     result.append({
                         "id": None,
+                        "leaveId": str(lv.id),
                         "userId": None,
                         "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else email,
                         "userEmail": email,
@@ -478,6 +480,7 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveId": str(leave.id) if leave else None,
                 "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
                 "conveyanceEligible": s.conveyance_eligible,
@@ -523,6 +526,7 @@ class ShiftService:
                             "shift": None, "workStatus": None, "status": "on_leave",
                             "workAddress": None, "pincode": None,
                             "leaveType": lv.leave_type,
+                            "leaveId": str(lv.id),
                             "leaveStatus": "on_leave",
                             "perDiemEligible": False, "conveyanceEligible": False,
                             "date": current.isoformat(),
@@ -540,6 +544,207 @@ class ShiftService:
 
         result.sort(key=lambda x: x["date"], reverse=False)
         return result
+
+    async def get_shifts_paginated(
+        self, db: Session, emails: List[str],
+        from_date: str = None, to_date: str = None,
+        work_status: str = None, project_id: int = None,
+        status: str = None,
+        search: str = None, include_name_search: bool = False,
+        sort_by: str = "date", sort_dir: str = "asc",
+        page: int = 1, page_size: int = 50,
+        export: bool = False,
+    ) -> dict:
+        query = db.query(Shift).filter(Shift.user_email.in_(emails))
+        if from_date:
+            query = query.filter(Shift.date >= date.fromisoformat(from_date))
+        if to_date:
+            query = query.filter(Shift.date <= date.fromisoformat(to_date))
+        if work_status:
+            query = query.filter(Shift.work_location_status == work_status)
+        if project_id:
+            query = query.filter(Shift.project_id == project_id)
+        shifts = query.all()
+
+        if not shifts:
+            return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        grace_min = company.grace_minutes if company and company.grace_minutes else 2
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+        user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
+        shift_codes = list({s.shift_code for s in shifts if s.shift_code})
+        min_date = min(s.date for s in shifts)
+        max_date = max(s.date for s in shifts)
+
+        att_query = db.query(Attendance).filter(
+            Attendance.keycloak_user_id.in_(user_ids),
+            Attendance.attendance_date.between(min_date - timedelta(days=1), max_date + timedelta(days=1)),
+        ).all()
+        att_map = {(a.keycloak_user_id, a.attendance_date): a for a in att_query}
+
+        sd_map = {}
+        if shift_codes:
+            sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+            sd_map = {s.shift_code: s for s in sds}
+
+        leaves = db.query(Leave).filter(
+            Leave.keycloak_user_id.in_(user_ids),
+            Leave.approval_status == "approved",
+            Leave.start_date <= max_date,
+            Leave.end_date >= min_date,
+        ).all()
+
+        kemp_map = {}
+        if user_ids:
+            kemps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(user_ids)).all()
+            kemp_map = {e.keycloak_user_id: e for e in kemps}
+
+        result = []
+        for s in shifts:
+            emp = kemp_map.get(s.keycloak_user_id)
+            sd = sd_map.get(s.shift_code)
+            leave = next((l for l in leaves if l.keycloak_user_id == s.keycloak_user_id and l.start_date <= s.date and l.end_date >= s.date), None)
+            att = _lookup_attendance(att_map, s.keycloak_user_id, s.date, s.shift_code)
+
+            derived_status = s.status
+            if att and att.check_out_time:
+                derived_status = "Ended"
+            elif att and not att.check_out_time and s.date <= today:
+                derived_status = "In Progress"
+            elif leave:
+                derived_status = "on_leave"
+            elif sd and sd.start_time:
+                try:
+                    tz = ZoneInfo(sd.timezone or "Asia/Kolkata")
+                except Exception:
+                    tz = ZoneInfo("Asia/Kolkata")
+                start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
+                if datetime.now(tz) > start_dt:
+                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
+                else:
+                    derived_status = "Yet to start"
+
+            late_by = None
+            if att and att.is_late and att.check_in_time and sd and sd.start_time:
+                try:
+                    tz = ZoneInfo(sd.timezone or "Asia/Kolkata")
+                except Exception:
+                    tz = ZoneInfo("Asia/Kolkata")
+                shift_start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
+                cutoff = shift_start_dt + timedelta(minutes=grace_min)
+                if att.check_in_time > cutoff:
+                    late_by = round((att.check_in_time - cutoff).total_seconds() / 3600, 1)
+
+            result.append({
+                "id": str(s.id),
+                "userId": s.redmine_user_id,
+                "userEmail": s.user_email,
+                "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else s.user_email,
+                "userDesignation": emp.designation if emp else None,
+                "projectId": s.project_id,
+                "projectName": s.project_name,
+                "shift": s.shift_code,
+                "shiftName": sd.shift_name if sd else None,
+                "workStatus": s.work_location_status,
+                "status": derived_status,
+                "workAddress": s.work_address,
+                "pincode": s.pincode,
+                "leaveType": leave.leave_type if leave else None,
+                "leaveId": str(leave.id) if leave else None,
+                "leaveStatus": "on_leave" if leave else None,
+                "perDiemEligible": s.per_diem_eligible,
+                "conveyanceEligible": s.conveyance_eligible,
+                "date": s.date.isoformat() if s.date else None,
+                "dayName": s.date.strftime("%A") if s.date else None,
+                "endDate": s.end_date.isoformat() if s.end_date else None,
+                "shiftStartTime": s.shift_start_time.isoformat() if s.shift_start_time else None,
+                "shiftEndTime": s.shift_end_time.isoformat() if s.shift_end_time else None,
+                "checkInTime": att.check_in_time.isoformat() if att and att.check_in_time else None,
+                "checkOutTime": att.check_out_time.isoformat() if att and att.check_out_time else None,
+                "checkInLocationName": att.check_in_location_name if att else None,
+                "checkInLat": float(att.check_in_lat) if att and att.check_in_lat else None,
+                "checkInLng": float(att.check_in_lng) if att and att.check_in_lng else None,
+                "checkOutLocationName": att.check_out_location_name if att else None,
+                "checkOutLat": float(att.check_out_lat) if att and att.check_out_lat else None,
+                "checkOutLng": float(att.check_out_lng) if att and att.check_out_lng else None,
+                "isLate": att.is_late if att else False,
+                "lateByHours": late_by,
+                "totalHours": float(att.total_hours) if att and att.total_hours else None,
+                "createdAt": s.created_at,
+            })
+
+        shifted_dates = {(s.user_email, s.date) for s in shifts}
+        for lv in leaves:
+            if not lv.keycloak_user_id:
+                continue
+            # Skip leave injection when filtering by work status — leave rows have no work type
+            if work_status:
+                break
+            lemp = kemp_map.get(lv.keycloak_user_id)
+            lv_email = lemp.user_email if lemp else None
+            current = lv.start_date
+            while current <= lv.end_date:
+                if (lv_email, current) not in shifted_dates:
+                    result.append({
+                        "id": None,
+                        "leaveId": str(lv.id),
+                        "userId": None,
+                        "userEmail": lv_email,
+                        "userName": f"{lemp.first_name} {lemp.middle_name or ''} {lemp.last_name}".strip().replace("  ", " ") if lemp else lv_email,
+                        "userDesignation": lemp.designation if lemp else None,
+                        "projectId": None, "projectName": None,
+                        "shift": None, "shiftName": None,
+                        "workStatus": None, "status": "on_leave",
+                        "workAddress": None, "pincode": None,
+                        "leaveType": lv.leave_type,
+                        "leaveStatus": "on_leave",
+                        "perDiemEligible": False, "conveyanceEligible": False,
+                        "date": current.isoformat(),
+                        "dayName": current.strftime("%A"),
+                        "endDate": current.isoformat(),
+                        "shiftStartTime": None, "shiftEndTime": None,
+                        "checkInTime": None, "checkOutTime": None,
+                        "checkInLat": None, "checkInLng": None,
+                        "checkOutLat": None, "checkOutLng": None,
+                        "checkInLocationName": None, "checkOutLocationName": None,
+                        "isLate": False, "lateByHours": None, "totalHours": None,
+                        "createdAt": None,
+                    })
+                current += timedelta(days=1)
+
+        # Search filter
+        if search:
+            term = search.strip().lower()
+            fields = ["userName", "userEmail", "shift", "shiftName", "projectName", "workAddress", "workStatus", "leaveType"]
+            if not include_name_search:
+                fields = [f for f in fields if f != "userName"]
+            result = [r for r in result if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+        # Status filter (case-insensitive, multi-select)
+        if status:
+            statuses = {s.strip().lower() for s in status.split(",") if s.strip()}
+            if statuses:
+                result = [r for r in result if str(r.get("status") or "").lower() in statuses]
+
+        # Sort
+        allowed_sort = {"date", "shiftStartTime", "shiftCode", "workStatus", "userName"}
+        sort_by = sort_by if sort_by in allowed_sort else "date"
+        # "shiftCode" maps to "shift" key in the record
+        sort_key = "shift" if sort_by == "shiftCode" else sort_by
+        result.sort(key=lambda r: (r.get(sort_key) or ""), reverse=(sort_dir == "desc"))
+
+        # Paginate
+        total = len(result)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        if export:
+            return {"records": result, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+        offset = (page - 1) * page_size
+        records = result[offset:offset + page_size]
+
+        return {"records": records, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
 
     async def update_shift(self, db: Session, shift_id: str, data: dict) -> Optional[dict]:
         svc = self._svc(db)
@@ -598,7 +803,7 @@ class ShiftService:
             Attendance.attendance_date >= shift.date,
             Attendance.attendance_date <= (shift.end_date or shift.date),
             Attendance.shift_code == shift.shift_code,
-        ).update({Attendance.shift_code: None}, synchronize_session=False)
+        ).delete(synchronize_session=False)
         db.delete(shift)
         db.commit()
         return True
@@ -617,7 +822,7 @@ class ShiftService:
                 Attendance.keycloak_user_id == keycloak_user_id,
                 Attendance.attendance_date == target_date,
                 Attendance.shift_code == shift.shift_code,
-            ).update({Attendance.shift_code: None}, synchronize_session=False)
+            ).delete(synchronize_session=False)
 
             if shift.date == shift.end_date:
                 db.delete(shift)
