@@ -850,9 +850,7 @@ class LeaveBusinessService:
             return ["CO", "PL"]
         return [code]
 
-    async def get_leave_balance_grid(self, employee_uuid: str, fiscal_year: int, current_user: dict) -> Dict[str, Any]:
-        emp = self._editable_employee(current_user, employee_uuid)
-
+    def _build_leave_balance_grid(self, emp, fiscal_year: int) -> Dict[str, Any]:
         types = self.leave_db.db.execute(
             select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
         ).scalars().all()
@@ -900,6 +898,21 @@ class LeaveBusinessService:
             },
             "types": types_out,
         }
+
+    async def get_leave_balance_grid(self, employee_uuid: str, fiscal_year: int, current_user: dict) -> Dict[str, Any]:
+        emp = self._editable_employee(current_user, employee_uuid)
+        return self._build_leave_balance_grid(emp, fiscal_year)
+
+    async def get_self_leave_balance_grid(self, current_user: dict, fiscal_year: int = None) -> Dict[str, Any]:
+        if fiscal_year is None:
+            fiscal_year = self._fiscal_year_for(date.today())
+        user_id = current_user.get("sub")
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
+        ).scalars().first()
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
+        return self._build_leave_balance_grid(emp, fiscal_year)
 
     async def save_leave_balance_bulk(self, payload: EmployeeLeaveBalanceBulkCreate, current_user: dict) -> Dict[str, Any]:
         emp = self._editable_employee(current_user, payload.id)

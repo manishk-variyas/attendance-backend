@@ -54,13 +54,25 @@ async def get_balance(
 ):
     return await leave_service.get_employee_leave_balance_summary(current_user.get("sub"))
 
-@router.get("/self-balance")
+@router.get("/self-leave-balance")
+@limiter.limit("30/minute")
 async def get_self_leave_balance(
+    request: Request,
     fiscal_year: int = Query(None, ge=2000, description="Fiscal year (default current)"),
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     return await leave_service.get_self_leave_balance(current_user, fiscal_year)
+
+@router.get("/self-leave-balance-grid")
+@limiter.limit("30/minute")
+async def get_self_leave_balance_grid(
+    request: Request,
+    fiscal_year: int = Query(None, ge=2000, description="Fiscal year (default current)"),
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    return await leave_service.get_self_leave_balance_grid(current_user, fiscal_year)
 
 @router.get("/admin/{email}", response_model=List[LeaveHistoryItem])
 async def get_user_leave_history(
