@@ -142,6 +142,14 @@ app.include_router(leaves_router, prefix="/api", tags=["leaves"])
 from app.features.leaves.admin_routes import router as leave_balance_router
 app.include_router(leave_balance_router, prefix="/api", tags=["admin-leave-balances"])
 
+# Register Admin Leave Type routes
+from app.features.leaves.leave_type_routes import router as leave_type_router
+app.include_router(leave_type_router, prefix="/api", tags=["admin-leave-types"])
+
+# Register Admin Leave Balance Manager routes
+from app.features.leaves.leave_balance_manager_routes import router as leave_balance_manager_router
+app.include_router(leave_balance_manager_router, prefix="/api", tags=["admin-leave-balance-manager"])
+
 # Register Country routes
 from app.features.countries import router as countries_router
 app.include_router(countries_router, prefix="/api", tags=["countries"])

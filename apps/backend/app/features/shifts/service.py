@@ -717,7 +717,7 @@ class ShiftService:
 
         # Search filter
         if search:
-            term = search.strip().lower()
+            term = search.strip().lower()[:100]
             fields = ["userName", "userEmail", "shift", "shiftName", "projectName", "workAddress", "workStatus", "leaveType"]
             if not include_name_search:
                 fields = [f for f in fields if f != "userName"]

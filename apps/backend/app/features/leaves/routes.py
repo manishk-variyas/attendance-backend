@@ -15,6 +15,7 @@ from app.features.leaves.schemas.leaves import (
     LeaveHistoryItem, 
     LeaveStats, 
     LeaveBalanceSummary,
+    EmployeeLeaveBalanceSummary,
     Holiday,
     BatchLeaveRequest,
     CancelLeaveRequest,
@@ -46,12 +47,20 @@ async def get_stats(
     stats = await leave_service.get_leave_stats(user_id, year, month)
     return stats
 
-@router.get("/balance", response_model=LeaveBalanceSummary)
+@router.get("/balance", response_model=EmployeeLeaveBalanceSummary)
 async def get_balance(
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
-    return await leave_service.get_leave_balance(current_user.get("sub"))
+    return await leave_service.get_employee_leave_balance_summary(current_user.get("sub"))
+
+@router.get("/self-balance")
+async def get_self_leave_balance(
+    fiscal_year: int = Query(None, ge=2000, description="Fiscal year (default current)"),
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
+):
+    return await leave_service.get_self_leave_balance(current_user, fiscal_year)
 
 @router.get("/admin/{email}", response_model=List[LeaveHistoryItem])
 async def get_user_leave_history(
@@ -119,6 +128,164 @@ async def get_history(
 
     records = await leave_service.get_leave_history(user_id, from_date, to_date)
     return {"total": len(records), "records": records}
+
+
+def _build_leaves_excel(records: list) -> BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Leaves"
+    ws.append(["Date", "Day", "Employee", "Designation", "Leave Type", "Status",
+               "Days", "Reason", "Contact", "Is Traveling"])
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+
+    for r in records:
+        days = ""
+        if r.get("start_date") and r.get("end_date"):
+            try:
+                days = (r["end_date"] - r["start_date"]).days + 1
+            except TypeError:
+                days = ""
+        ws.append([
+            _fmt(r.get("start_date")),
+            r["start_date"].strftime("%A") if r.get("start_date") and hasattr(r["start_date"], "strftime") else "",
+            r.get("userName") or "",
+            r.get("userDesignation") or "",
+            r.get("leave_type") or "",
+            r.get("status") or "",
+            days,
+            r.get("reason") or "",
+            r.get("contact_number") or "",
+            "Yes" if r.get("is_traveling") else "No",
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+@router.get("/my-leaves")
+async def get_my_leaves(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("start_date", description="start_date, end_date, leave_type, status, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    leave_type: Optional[str] = Query(None, description="Comma-separated: EL,PL,UPL"),
+    status: Optional[str] = Query(None, description="Comma-separated: pending,approved,rejected,emergency,cancelled,cancellation_requested,cancellation_rejected"),
+    search: Optional[str] = Query(None, description="Search reason, comment, leave type, status"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+):
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+    result = await leave_service.get_leaves_paginated(
+        emails=[email],
+        from_date=from_date, to_date=to_date,
+        leave_type=leave_type, status=status,
+        search=search, include_name_search=False,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_leaves_excel(result["records"])
+        audit_logger.info(
+            f"Leave history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_my_leaves",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"my_leaves_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
+
+@router.get("/team-leaves")
+async def get_team_leaves(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("start_date", description="start_date, end_date, leave_type, status, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    leave_type: Optional[str] = Query(None, description="Comma-separated: EL,PL,UPL"),
+    status: Optional[str] = Query(None, description="Comma-separated: pending,approved,rejected,emergency,cancelled,cancellation_requested,cancellation_rejected"),
+    search: Optional[str] = Query(None, description="Search by name, email, reason, comment"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(leave_service.leave_db.db)
+    rm_user = sql.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    emp_q = leave_service.leave_db.db.query(EmployeeMaster).filter(
+        EmployeeMaster.redmine_user_id.in_(member_rm_ids)
+    ).all()
+    member_emails = [e.user_email for e in emp_q if e.user_email]
+    if not member_emails:
+        return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+    result = await leave_service.get_leaves_paginated(
+        emails=member_emails,
+        from_date=from_date, to_date=to_date,
+        leave_type=leave_type, status=status,
+        search=search, include_name_search=True,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_leaves_excel(result["records"])
+        audit_logger.info(
+            f"Team leave history exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_team_leaves",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"team_leaves_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
 
 @router.get("/holidays")
 async def get_holidays(
@@ -342,6 +509,92 @@ async def get_pending_leaves(
 
     pending_list = await leave_service.get_pending_leaves(current_user, from_date, to_date)
     return pending_list
+
+
+def _build_pending_excel(records: list) -> BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Pending Leaves"
+    ws.append(["Date", "Employee", "Designation", "Leave Type", "Request", "Days",
+               "Reason", "EL Remaining", "CompOff Remaining"])
+
+    def _fmt(v):
+        if v is None:
+            return ""
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+
+    for r in records:
+        bal = r.get("balance") or {}
+        ws.append([
+            _fmt(r.get("start_date")),
+            r.get("userName") or "",
+            r.get("userDesignation") or "",
+            r.get("leave_type") or "",
+            "Cancellation" if r.get("status") == "cancellation_requested" else "New Leave",
+            r.get("requested_days") or 0,
+            r.get("reason") or "",
+            (bal.get("EL") or {}).get("remaining"),
+            (bal.get("CompOff") or {}).get("remaining"),
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+@router.get("/pending-leaves")
+async def get_pending_leaves_paginated(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("created_at", description="created_at, start_date, leave_type, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    leave_type: Optional[str] = Query(None, description="Comma-separated: EL,PL,UPL"),
+    request_type: Optional[str] = Query(None, description="new or cancellation"),
+    search: Optional[str] = Query(None, description="Search by name, email, reason, comment"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+):
+    roles = current_user.get("roles", [])
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    result = await leave_service.get_pending_leaves_paginated(
+        current_user,
+        from_date=from_date, to_date=to_date,
+        leave_type=leave_type, request_type=request_type,
+        search=search,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size, export=export,
+    )
+    if export:
+        output = _build_pending_excel(result["records"])
+        audit_logger.info(
+            f"Pending leaves exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_pending_leaves",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"pending_leaves_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    return result
+
 
 @router.post("/batch/approve")
 async def batch_approve_leaves(

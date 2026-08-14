@@ -75,6 +75,53 @@ def _run_migrations():
         """))
         conn.commit()
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS leave_types (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                code VARCHAR(20) UNIQUE NOT NULL,
+                name VARCHAR(100) UNIQUE NOT NULL,
+                is_paid BOOLEAN NOT NULL DEFAULT TRUE,
+                carry_forward_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+                carry_forward_cap FLOAT,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        conn.commit()
+
+        conn.execute(text("""
+            ALTER TABLE leave_types DROP COLUMN IF EXISTS description
+        """))
+        conn.commit()
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS employee_leave_balances (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                keycloak_user_id VARCHAR(255) NOT NULL,
+                leave_type_id UUID NOT NULL REFERENCES leave_types(id),
+                fiscal_year INTEGER NOT NULL,
+                carry_forward DOUBLE PRECISION NOT NULL DEFAULT 0,
+                adjustment DOUBLE PRECISION NOT NULL DEFAULT 0,
+                modified_by VARCHAR(255),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (keycloak_user_id, leave_type_id, fiscal_year)
+            )
+        """))
+        conn.commit()
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS employee_leave_balance_monthly (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                leave_balance_id UUID NOT NULL REFERENCES employee_leave_balances(id) ON DELETE CASCADE,
+                month INTEGER NOT NULL,
+                accrued DOUBLE PRECISION NOT NULL DEFAULT 0,
+                UNIQUE (leave_balance_id, month)
+            )
+        """))
+        conn.commit()
+
 
 def get_db():
     """

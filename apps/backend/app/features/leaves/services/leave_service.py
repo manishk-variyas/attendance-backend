@@ -9,13 +9,15 @@ import openpyxl
 import httpx
 from pydantic import ValidationError
 
-from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest
+from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest, EmployeeLeaveBalanceBulkCreate
 from app.features.redmine.sql_service import RedmineSQLService
 from app.services.database.leave_service import LeaveService as LeaveDBService, LeaveBalanceService
 from app.services.database.holiday_service import HolidayService as HolidayDBService
 from app.services.email_service import email_service
 from app.models.leave import Leave
 from app.models.leave_balance import LeaveBalance
+from app.models.leave_type import LeaveTypeConfig
+from app.models.employee_leave_balance import EmployeeLeaveBalance, EmployeeLeaveBalanceMonthly
 from app.models.holiday import Holiday
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
@@ -483,6 +485,51 @@ class LeaveBusinessService:
             records.append(d)
         return records
 
+    async def get_leaves_paginated(
+        self, emails: List[str],
+        from_date: str = None, to_date: str = None,
+        leave_type: str = None, status: str = None,
+        search: str = None, include_name_search: bool = False,
+        sort_by: str = "start_date", sort_dir: str = "asc",
+        page: int = 1, page_size: int = 50, export: bool = False,
+    ) -> Dict[str, Any]:
+        stmt = select(Leave).where(Leave.user_email.in_(emails))
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        if leave_type:
+            types = [t.strip().upper() for t in leave_type.split(",") if t.strip()]
+            if types:
+                stmt = stmt.where(Leave.leave_type.in_(types))
+        if status:
+            statuses = [s.strip().lower() for s in status.split(",") if s.strip()]
+            if statuses:
+                stmt = stmt.where(Leave.approval_status.in_(statuses))
+
+        results = self.leave_db.db.execute(stmt).scalars().all()
+        records = self._enrich_leaves_with_employee(results)
+
+        if search:
+            term = (search or "").strip().lower()[:100]
+            if term:
+                fields = ["reason", "comment", "leave_type", "status", "contact_number"]
+                if include_name_search:
+                    fields = ["userName", "user_email"] + fields
+                records = [r for r in records if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+        allowed_sort = {"start_date", "end_date", "leave_type", "status", "userName"}
+        sort_by = sort_by if sort_by in allowed_sort else "start_date"
+        records.sort(key=lambda r: str(r.get(sort_by) or ""), reverse=(sort_dir == "desc"))
+
+        total = len(records)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        if export:
+            return {"records": records, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+        offset = (page - 1) * page_size
+        records_out = records[offset:offset + page_size]
+        return {"records": records_out, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+
     async def get_user_leave_history(self, email: str, current_user: dict, from_date: str = None, to_date: str = None) -> List[Dict[str, Any]]:
         roles = current_user.get("roles", [])
         sql = RedmineSQLService(self.leave_db.db)
@@ -790,6 +837,412 @@ class LeaveBusinessService:
             "comp_off": {"accrued": co_accrued, "availed": co_used, "balance": co_balance},
             "unpaid_leave": upl_used,
             "total_available_leave": el_balance + co_balance - upl_used,
+        }
+
+    @staticmethod
+    def _fiscal_year_for(d: date) -> int:
+        return d.year if d.month >= 4 else d.year - 1
+
+    @staticmethod
+    def _leave_codes_for_type(code: str) -> list:
+        # Old leaves table stored comp-off as "PL"; new leave_types uses "CO"
+        if code == "CO":
+            return ["CO", "PL"]
+        return [code]
+
+    async def get_leave_balance_grid(self, employee_uuid: str, fiscal_year: int, current_user: dict) -> Dict[str, Any]:
+        emp = self._editable_employee(current_user, employee_uuid)
+
+        types = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
+        ).scalars().all()
+
+        balances = self.leave_db.db.execute(
+            select(EmployeeLeaveBalance).where(
+                EmployeeLeaveBalance.keycloak_user_id == emp.keycloak_user_id,
+                EmployeeLeaveBalance.fiscal_year == fiscal_year,
+            )
+        ).scalars().all()
+        balance_map = {b.leave_type_id: b for b in balances}
+
+        monthly_map = {}
+        if balances:
+            monthly = self.leave_db.db.execute(
+                select(EmployeeLeaveBalanceMonthly).where(
+                    EmployeeLeaveBalanceMonthly.leave_balance_id.in_([b.id for b in balances])
+                )
+            ).scalars().all()
+            for m in monthly:
+                monthly_map.setdefault(m.leave_balance_id, {})[m.month] = m.accrued
+
+        types_out = []
+        for t in types:
+            b = balance_map.get(t.id)
+            bm = monthly_map.get(b.id, {}) if b else {}
+            types_out.append({
+                "code": t.code,
+                "name": t.name,
+                "is_paid": t.is_paid,
+                "carry_forward": b.carry_forward if b else 0,
+                "adjustment": b.adjustment if b else 0,
+                "months": {m: bm.get(m, 0) for m in range(1, 13)},
+            })
+
+        return {
+            "id": str(emp.id),
+            "fiscal_year": fiscal_year,
+            "employee": {
+                "id": str(emp.id),
+                "employee_id": emp.employee_id,
+                "userEmail": emp.user_email,
+                "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " "),
+                "designation": emp.designation,
+            },
+            "types": types_out,
+        }
+
+    async def save_leave_balance_bulk(self, payload: EmployeeLeaveBalanceBulkCreate, current_user: dict) -> Dict[str, Any]:
+        emp = self._editable_employee(current_user, payload.id)
+
+        types = self.leave_db.db.execute(select(LeaveTypeConfig)).scalars().all()
+        type_map = {t.code: t for t in types}
+
+        now = datetime.now(timezone.utc)
+        created = 0
+        updated = 0
+        for entry in payload.types:
+            lt = type_map.get(entry.code)
+            if not lt:
+                continue
+
+            bal = self.leave_db.db.execute(
+                select(EmployeeLeaveBalance).where(
+                    EmployeeLeaveBalance.keycloak_user_id == emp.keycloak_user_id,
+                    EmployeeLeaveBalance.leave_type_id == lt.id,
+                    EmployeeLeaveBalance.fiscal_year == payload.fiscal_year,
+                )
+            ).scalars().first()
+
+            if bal:
+                bal.carry_forward = entry.carry_forward
+                bal.adjustment = entry.adjustment
+                bal.modified_by = current_user.get("email")
+                bal.updated_at = now
+                updated += 1
+            else:
+                bal = EmployeeLeaveBalance(
+                    keycloak_user_id=emp.keycloak_user_id,
+                    leave_type_id=lt.id,
+                    fiscal_year=payload.fiscal_year,
+                    carry_forward=entry.carry_forward,
+                    adjustment=entry.adjustment,
+                    modified_by=current_user.get("email"),
+                )
+                self.leave_db.db.add(bal)
+                self.leave_db.db.flush()
+                created += 1
+
+            existing_monthly = {
+                m.month: m for m in self.leave_db.db.execute(
+                    select(EmployeeLeaveBalanceMonthly).where(
+                        EmployeeLeaveBalanceMonthly.leave_balance_id == bal.id
+                    )
+                ).scalars().all()
+            }
+            for month in range(1, 13):
+                acc = float(entry.months.get(month, 0) or 0)
+                mb = existing_monthly.get(month)
+                if mb:
+                    mb.accrued = acc
+                else:
+                    self.leave_db.db.add(EmployeeLeaveBalanceMonthly(
+                        leave_balance_id=bal.id,
+                        month=month,
+                        accrued=acc,
+                    ))
+
+        self.leave_db.db.commit()
+        return {"created": created, "updated": updated, "id": payload.id, "fiscal_year": payload.fiscal_year}
+
+    async def get_employee_leave_balance_summary(self, user_id: str) -> Dict[str, Any]:
+        today = date.today()
+        fiscal_year = self._fiscal_year_for(today)
+
+        types = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
+        ).scalars().all()
+
+        balances = self.leave_db.db.execute(
+            select(EmployeeLeaveBalance).where(
+                EmployeeLeaveBalance.keycloak_user_id == user_id,
+                EmployeeLeaveBalance.fiscal_year == fiscal_year,
+            )
+        ).scalars().all()
+        balance_map = {b.leave_type_id: b for b in balances}
+
+        monthly_map = {}
+        if balances:
+            monthly = self.leave_db.db.execute(
+                select(EmployeeLeaveBalanceMonthly).where(
+                    EmployeeLeaveBalanceMonthly.leave_balance_id.in_([b.id for b in balances])
+                )
+            ).scalars().all()
+            for m in monthly:
+                monthly_map.setdefault(m.leave_balance_id, []).append(m)
+
+        # derive availed (approved leaves within current fiscal year, up to today)
+        fiscal_start = date(fiscal_year, 4, 1)
+        leaves = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id == user_id,
+                Leave.approval_status == LeaveStatus.APPROVED.value,
+                Leave.start_date >= fiscal_start,
+                Leave.end_date <= today,
+            )
+        ).scalars().all()
+
+        result = []
+        total_available = 0.0
+        for t in types:
+            b = balance_map.get(t.id)
+            carry = float(b.carry_forward) if b and b.carry_forward else 0.0
+            adj = float(b.adjustment) if b and b.adjustment else 0.0
+            monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
+            total = carry + adj + monthly_total
+
+            codes = self._leave_codes_for_type(t.code)
+            availed = sum(
+                (lv.end_date - lv.start_date).days + 1
+                for lv in leaves if lv.leave_type in codes
+            )
+            balance = total - availed
+            result.append({"code": t.code, "name": t.name, "total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)})
+            total_available += balance
+
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
+        ).scalars().first()
+
+        return {
+            "id": str(emp.id) if emp else None,
+            "employee_id": emp.employee_id if emp else None,
+            "as_of_date": today.isoformat(),
+            "leave_balances": result,
+            "total_available_leave": round(total_available, 2),
+        }
+
+    def _editable_employee(self, current_user: dict, employee_uuid: str):
+        from uuid import UUID
+        try:
+            uuid_val = UUID(str(employee_uuid))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="Invalid employee id")
+
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.id == uuid_val)
+        ).scalars().first()
+        if not emp or not emp.keycloak_user_id:
+            raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
+
+        roles = current_user.get("roles", [])
+        if "Admin" in roles:
+            return emp
+
+        sql = RedmineSQLService(self.leave_db.db)
+        pm_user = sql.get_user_by_email(current_user.get("email"))
+        if not pm_user:
+            raise HTTPException(status_code=403, detail="Not authorized")
+        member_ids = sql.get_team_member_ids(int(pm_user["id"]))
+        member_ids.add(int(pm_user["id"]))
+        if emp.redmine_user_id not in member_ids:
+            raise HTTPException(status_code=403, detail="You can only edit leave balances for team members")
+        return emp
+
+    async def get_leave_balance_list(
+        self, current_user: dict, fiscal_year: int,
+        search: str = None, sort_by: str = "userName", sort_dir: str = "asc",
+        page: int = 1, page_size: int = 50,
+    ) -> Dict[str, Any]:
+        roles = current_user.get("roles", [])
+        email = current_user.get("email")
+        today = date.today()
+
+        emp_query = self.leave_db.db.query(EmployeeMaster).filter(EmployeeMaster.is_active.is_(True))
+
+        if "Admin" not in roles:
+            sql = RedmineSQLService(self.leave_db.db)
+            pm_user = sql.get_user_by_email(email)
+            if not pm_user:
+                return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0, "as_of_date": today.isoformat()}
+            member_ids = sql.get_team_member_ids(int(pm_user["id"]))
+            member_ids.add(int(pm_user["id"]))
+            emp_query = emp_query.filter(EmployeeMaster.redmine_user_id.in_(member_ids))
+
+        if search:
+            term = (search or "").strip()[:100]
+            if term:
+                emp_query = emp_query.filter(or_(
+                    EmployeeMaster.user_email.ilike(f"%{term}%"),
+                    EmployeeMaster.first_name.ilike(f"%{term}%"),
+                    EmployeeMaster.last_name.ilike(f"%{term}%"),
+                    EmployeeMaster.employee_id.ilike(f"%{term}%"),
+                ))
+
+        employees = emp_query.all()
+        if not employees:
+            return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0, "as_of_date": today.isoformat()}
+
+        user_ids = [e.keycloak_user_id for e in employees if e.keycloak_user_id]
+
+        balances = self.leave_db.db.execute(
+            select(EmployeeLeaveBalance).where(
+                EmployeeLeaveBalance.keycloak_user_id.in_(user_ids),
+                EmployeeLeaveBalance.fiscal_year == fiscal_year,
+            )
+        ).scalars().all()
+        balance_map = {}
+        for b in balances:
+            balance_map.setdefault(b.keycloak_user_id, []).append(b)
+
+        monthly_map = {}
+        if balances:
+            monthly = self.leave_db.db.execute(
+                select(EmployeeLeaveBalanceMonthly).where(
+                    EmployeeLeaveBalanceMonthly.leave_balance_id.in_([b.id for b in balances])
+                )
+            ).scalars().all()
+            for m in monthly:
+                monthly_map.setdefault(m.leave_balance_id, []).append(m)
+
+        types = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
+        ).scalars().all()
+
+        fiscal_start = date(fiscal_year, 4, 1)
+        today = date.today()
+        leaves = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id.in_(user_ids),
+                Leave.approval_status == LeaveStatus.APPROVED.value,
+                Leave.start_date >= fiscal_start,
+                Leave.end_date <= today,
+            )
+        ).scalars().all()
+        leave_map = {}
+        for lv in leaves:
+            leave_map.setdefault(lv.keycloak_user_id, []).append(lv)
+
+        records = []
+        for e in employees:
+            uid = e.keycloak_user_id
+            emp_balances = balance_map.get(uid, [])
+            type_summary = {}
+            total_available = 0.0
+            for t in types:
+                b = next((x for x in emp_balances if x.leave_type_id == t.id), None)
+                carry = float(b.carry_forward) if b and b.carry_forward else 0.0
+                adj = float(b.adjustment) if b and b.adjustment else 0.0
+                monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
+                total = carry + adj + monthly_total
+                codes = self._leave_codes_for_type(t.code)
+                availed = sum((lv.end_date - lv.start_date).days + 1 for lv in leave_map.get(uid, []) if lv.leave_type in codes)
+                balance = total - availed
+                type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
+                total_available += balance
+
+            records.append({
+                "id": str(e.id),
+                "employee_id": e.employee_id,
+                "userName": f"{e.first_name} {e.middle_name or ''} {e.last_name}".strip().replace("  ", " "),
+                "userEmail": e.user_email,
+                "designation": e.designation,
+                "reports_to_name": e.reports_to_name,
+                "leave_balance": type_summary,
+                "total_available_leave": round(total_available, 2),
+            })
+
+        allowed_sort = {"userName", "designation", "employee_id", "total_available_leave"}
+        sort_by = sort_by if sort_by in allowed_sort else "userName"
+        if sort_by == "total_available_leave":
+            records.sort(key=lambda r: r.get("total_available_leave") or 0, reverse=(sort_dir == "desc"))
+        else:
+            records.sort(key=lambda r: str(r.get(sort_by) or ""), reverse=(sort_dir == "desc"))
+
+        total = len(records)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        offset = (page - 1) * page_size
+        records_out = records[offset:offset + page_size]
+        return {"records": records_out, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages, "as_of_date": today.isoformat()}
+
+    async def get_self_leave_balance(self, current_user: dict, fiscal_year: int = None) -> Dict[str, Any]:
+        if fiscal_year is None:
+            fiscal_year = self._fiscal_year_for(date.today())
+        today = date.today()
+        user_id = current_user.get("sub")
+
+        emp = self.leave_db.db.execute(
+            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
+        ).scalars().first()
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
+
+        types = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
+        ).scalars().all()
+
+        balances = self.leave_db.db.execute(
+            select(EmployeeLeaveBalance).where(
+                EmployeeLeaveBalance.keycloak_user_id == user_id,
+                EmployeeLeaveBalance.fiscal_year == fiscal_year,
+            )
+        ).scalars().all()
+        balance_map = {b.leave_type_id: b for b in balances}
+
+        monthly_map = {}
+        if balances:
+            monthly = self.leave_db.db.execute(
+                select(EmployeeLeaveBalanceMonthly).where(
+                    EmployeeLeaveBalanceMonthly.leave_balance_id.in_([b.id for b in balances])
+                )
+            ).scalars().all()
+            for m in monthly:
+                monthly_map.setdefault(m.leave_balance_id, []).append(m)
+
+        fiscal_start = date(fiscal_year, 4, 1)
+        leaves = self.leave_db.db.execute(
+            select(Leave).where(
+                Leave.keycloak_user_id == user_id,
+                Leave.approval_status == LeaveStatus.APPROVED.value,
+                Leave.start_date >= fiscal_start,
+                Leave.end_date <= today,
+            )
+        ).scalars().all()
+
+        type_summary = {}
+        total_available = 0.0
+        for t in types:
+            b = balance_map.get(t.id)
+            carry = float(b.carry_forward) if b and b.carry_forward else 0.0
+            adj = float(b.adjustment) if b and b.adjustment else 0.0
+            monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
+            total = carry + adj + monthly_total
+            codes = self._leave_codes_for_type(t.code)
+            availed = sum((lv.end_date - lv.start_date).days + 1 for lv in leaves if lv.leave_type in codes)
+            balance = total - availed
+            type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
+            total_available += balance
+
+        return {
+            "id": str(emp.id),
+            "employee_id": emp.employee_id,
+            "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " "),
+            "userEmail": emp.user_email,
+            "designation": emp.designation,
+            "reports_to_name": emp.reports_to_name,
+            "fiscal_year": fiscal_year,
+            "as_of_date": today.isoformat(),
+            "leave_balance": type_summary,
+            "total_available_leave": round(total_available, 2),
         }
 
     async def approve_leave(self, leave_id: str, current_user: dict) -> bool:
@@ -1213,6 +1666,129 @@ class LeaveBusinessService:
             pending.append(d)
 
         return pending
+
+    async def get_pending_leaves_paginated(
+        self, current_user: dict,
+        from_date: str = None, to_date: str = None,
+        leave_type: str = None, request_type: str = None,
+        search: str = None,
+        sort_by: str = "created_at", sort_dir: str = "asc",
+        page: int = 1, page_size: int = 50, export: bool = False,
+    ) -> Dict[str, Any]:
+        roles = current_user.get("roles", [])
+
+        if request_type == "new":
+            statuses = [LeaveStatus.PENDING.value]
+        elif request_type == "cancellation":
+            statuses = [LeaveStatus.CANCELLATION_REQUESTED.value]
+        else:
+            statuses = [LeaveStatus.PENDING.value, LeaveStatus.CANCELLATION_REQUESTED.value]
+
+        if "Admin" in roles:
+            stmt = select(Leave).where(Leave.approval_status.in_(statuses))
+        else:
+            sql = RedmineSQLService(self.leave_db.db)
+            pm_user = sql.get_user_by_email(current_user.get("email"))
+            if not pm_user:
+                return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+            pm_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == current_user.get("email"))
+            ).scalars().first()
+            pm_redmine_id = pm_emp.redmine_user_id if pm_emp else None
+            if not pm_redmine_id:
+                return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+            team_member_ids = sql.get_team_member_ids(int(pm_user["id"]))
+            team_member_ids.add(int(pm_user["id"]))
+            team_emps = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.redmine_user_id.in_(team_member_ids))
+            ).scalars().all()
+            team_keycloak_ids = [e.keycloak_user_id for e in team_emps]
+            stmt = select(Leave).where(
+                Leave.approval_status.in_(statuses),
+                or_(
+                    Leave.approver_id == pm_redmine_id,
+                    Leave.keycloak_user_id.in_(team_keycloak_ids),
+                ),
+            )
+
+        if from_date:
+            stmt = stmt.where(Leave.start_date >= date.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Leave.end_date <= date.fromisoformat(to_date))
+        if leave_type:
+            types = [t.strip().upper() for t in leave_type.split(",") if t.strip()]
+            if types:
+                stmt = stmt.where(Leave.leave_type.in_(types))
+
+        results = self.leave_db.db.execute(stmt).scalars().all()
+
+        emails = {r.user_email for r in results if r.user_email}
+        emp_map = {}
+        if emails:
+            emps = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email.in_(emails))
+            ).scalars().all()
+            for e in emps:
+                emp_map[e.user_email] = e
+
+        records = []
+        for r in results:
+            d = r.to_dict()
+            emp = emp_map.get(r.user_email)
+            d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
+            d["userDesignation"] = emp.designation if emp else None
+            balance = self.balance_db.db.execute(
+                select(LeaveBalance).where(
+                    LeaveBalance.keycloak_user_id == r.keycloak_user_id,
+                    LeaveBalance.year == r.start_date.year,
+                    LeaveBalance.month.is_(None),
+                )
+            ).scalars().first()
+            if not balance:
+                balance = self.balance_db.db.execute(
+                    select(LeaveBalance).where(
+                        LeaveBalance.keycloak_user_id == r.keycloak_user_id,
+                        LeaveBalance.year == r.start_date.year,
+                    ).order_by(LeaveBalance.month.desc())
+                ).scalars().first()
+            requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
+            d["requested_days"] = requested_days
+            d["balance"] = {
+                "EL": {
+                    "total": balance.total_earned if balance else 0,
+                    "used": balance.used_earned if balance else 0,
+                    "remaining": (balance.total_earned or 0) - (balance.used_earned or 0) if balance else 0,
+                },
+                "CompOff": {
+                    "total": balance.accrued_compoff if balance else 0,
+                    "used": balance.consumed_compoff if balance else 0,
+                    "remaining": (balance.accrued_compoff or 0) - (balance.consumed_compoff or 0) if balance else 0,
+                },
+                "Unpaid": {
+                    "total": 0,
+                    "used": balance.unpaid if balance else 0,
+                    "remaining": 0,
+                },
+            }
+            records.append(d)
+
+        if search:
+            term = (search or "").strip().lower()[:100]
+            if term:
+                fields = ["userName", "user_email", "reason", "comment", "leave_type"]
+                records = [r for r in records if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+        allowed_sort = {"created_at", "start_date", "leave_type", "userName"}
+        sort_by = sort_by if sort_by in allowed_sort else "created_at"
+        records.sort(key=lambda r: str(r.get(sort_by) or ""), reverse=(sort_dir == "desc"))
+
+        total = len(records)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        if export:
+            return {"records": records, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+        offset = (page - 1) * page_size
+        records_out = records[offset:offset + page_size]
+        return {"records": records_out, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
 
     async def request_cancel_leave(self, leave_id: str, current_user: dict, remark: str) -> dict:
         leave = self.leave_db.fetch_one(Leave, id=leave_id)

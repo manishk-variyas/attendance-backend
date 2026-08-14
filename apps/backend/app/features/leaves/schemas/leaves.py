@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, date
-from typing import List, Optional
+from typing import List, Optional, Dict
 from enum import Enum
 
 class LeaveType(str, Enum):
@@ -170,4 +170,80 @@ class LeaveBalanceResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class LeaveTypeCreate(BaseModel):
+    code: str = Field(..., min_length=1, max_length=20)
+    name: str = Field(..., min_length=1, max_length=100)
+    is_paid: bool = True
+    carry_forward_allowed: bool = False
+    carry_forward_cap: Optional[float] = Field(None, ge=0)
+
+    @field_validator("code")
+    @classmethod
+    def upper_code(cls, v: str) -> str:
+        return v.strip().upper()
+
+
+class LeaveTypeUpdate(BaseModel):
+    code: Optional[str] = Field(None, min_length=1, max_length=20)
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    is_paid: Optional[bool] = None
+    carry_forward_allowed: Optional[bool] = None
+    carry_forward_cap: Optional[float] = Field(None, ge=0)
+    is_active: Optional[bool] = None
+
+    @field_validator("code")
+    @classmethod
+    def upper_code(cls, v: str) -> str:
+        return v.strip().upper() if v else v
+
+
+class LeaveTypeResponse(BaseModel):
+    id: str
+    code: str
+    name: str
+    is_paid: bool
+    carry_forward_allowed: bool
+    carry_forward_cap: Optional[float] = None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LeaveTypeBalanceEntry(BaseModel):
+    code: str = Field(..., min_length=1, max_length=20)
+    carry_forward: float = Field(0, ge=0)
+    adjustment: float = Field(0)
+    months: Dict[int, float] = Field(default_factory=dict)
+
+    @field_validator("code")
+    @classmethod
+    def upper_code(cls, v: str) -> str:
+        return v.strip().upper()
+
+
+class EmployeeLeaveBalanceBulkCreate(BaseModel):
+    id: str = Field(..., description="EmployeeMaster primary key (UUID)")
+    fiscal_year: int = Field(..., ge=2000)
+    types: List[LeaveTypeBalanceEntry]
+
+
+class LeaveBalanceSummaryItem(BaseModel):
+    code: str
+    name: str
+    total: float = 0.0
+    availed: float = 0.0
+    balance: float = 0.0
+
+
+class EmployeeLeaveBalanceSummary(BaseModel):
+    id: Optional[str] = None
+    employee_id: Optional[str] = None
+    as_of_date: str
+    leave_balances: List[LeaveBalanceSummaryItem]
+    total_available_leave: float = 0.0
 
