@@ -314,6 +314,7 @@ async def request_wfh(
             approver_email, applicant_name,
             start_date.isoformat(), end_date.isoformat(),
             payload.reason or "No reason provided",
+            resuming_date.isoformat() if resuming_date else "",
         )
 
     response = {"message": "WFH request submitted successfully", "created": created}
@@ -502,7 +503,8 @@ async def approve_wfh_request(
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, email_service.send_wfh_approved,
         result.user_email, applicant_name,
-        result.start_date.isoformat(), result.end_date.isoformat())
+        result.start_date.isoformat(), result.end_date.isoformat(),
+        result.resuming_date.isoformat() if result.resuming_date else "")
 
     return result.to_dict()
 
@@ -549,7 +551,8 @@ async def reject_wfh_request(
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, email_service.send_wfh_rejected,
         result.user_email, applicant_name,
-        result.start_date.isoformat(), result.end_date.isoformat())
+        result.start_date.isoformat(), result.end_date.isoformat(),
+        result.resuming_date.isoformat() if result.resuming_date else "")
 
     return result.to_dict()
 

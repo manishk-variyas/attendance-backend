@@ -31,7 +31,7 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None, is_active: bool = True, last_activity_at: datetime = None) -> str:
+async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None, is_active: bool = True, last_activity_at: datetime = None, realm: str | None = None) -> str:
     session_id = generate_session_id()
     expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
 
@@ -41,6 +41,7 @@ async def create_session(user_data: dict, keycloak_refresh_token: str = None, ex
         "email": user_data.get("email"),
         "roles": user_data.get("roles", []),
         "is_active": is_active,
+        "realm": realm,
     }
     if keycloak_refresh_token:
         session_data["kc_refresh_token"] = keycloak_refresh_token

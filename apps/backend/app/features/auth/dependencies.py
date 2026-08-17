@@ -37,6 +37,7 @@ async def get_current_user(request: Request) -> dict:
         "username": session_data.get("username"),
         "email": session_data.get("email"),
         "roles": session_data.get("roles", []),
+        "realm": session_data.get("realm"),
     }
 
 

@@ -49,39 +49,39 @@ class EmailService:
             logger.error(f"Failed to send email '{subject}': {e}")
             return False
 
-    def send_wfh_requested(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
+    def send_wfh_requested(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
         subject = f"WFH Request — {applicant_name} ({start} → {end})"
-        body = _template("wfh_requested", applicant_name=applicant_name, start=start, end=end, reason=reason)
+        body = _template("wfh_requested", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_wfh_approved(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+    def send_wfh_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
         subject = f"WFH Approved — {start} → {end}"
-        body = _template("wfh_approved", applicant_name=applicant_name, start=start, end=end)
+        body = _template("wfh_approved", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_wfh_rejected(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+    def send_wfh_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
         subject = f"WFH Rejected — {start} → {end}"
-        body = _template("wfh_rejected", applicant_name=applicant_name, start=start, end=end)
+        body = _template("wfh_rejected", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
+    def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
         subject = f"Leave Applied — {applicant_name} ({start} → {end})"
-        body = _template("leave_applied", applicant_name=applicant_name, start=start, end=end, reason=reason)
+        body = _template("leave_applied", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_leave_applied_confirmation(self, to: str, applicant_name: str, start: str, end: str, reason: str) -> bool:
+    def send_leave_applied_confirmation(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
         subject = f"Leave Submitted — {start} → {end}"
-        body = _template("leave_applied_confirmation", applicant_name=applicant_name, start=start, end=end, reason=reason)
+        body = _template("leave_applied_confirmation", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_leave_approved(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+    def send_leave_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
         subject = f"Leave Approved — {applicant_name} ({start} → {end})"
-        body = _template("leave_approved", applicant_name=applicant_name, start=start, end=end)
+        body = _template("leave_approved", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
         return self.send([to], subject, body)
 
-    def send_leave_rejected(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+    def send_leave_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
         subject = f"Leave Rejected — {applicant_name} ({start} → {end})"
-        body = _template("leave_rejected", applicant_name=applicant_name, start=start, end=end)
+        body = _template("leave_rejected", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
         return self.send([to], subject, body)
 
     def send_cancel_requested(self, to: str, applicant_name: str, start: str, end: str, remark: str) -> bool:
@@ -124,9 +124,10 @@ _EMAIL_TEMPLATES = {
             <tr><td>Applicant</td><td>{applicant_name}</td></tr>
             <tr><td>Start Date</td><td>{start}</td></tr>
             <tr><td>End Date</td><td>{end}</td></tr>
+            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
-        <p class="cta">Please login to the Attendance Portal to <strong>approve</strong> or <strong>reject</strong> this request.</p>
+        <p class="cta">Please login to the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
     """,
     "leave_applied_confirmation": """
         <div class="badge badge-info">Confirmation</div>
@@ -135,9 +136,11 @@ _EMAIL_TEMPLATES = {
         <table class="details">
             <tr><td>Start Date</td><td>{start}</td></tr>
             <tr><td>End Date</td><td>{end}</td></tr>
+            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
         <p>You will receive an email notification once your manager reviews the request.</p>
+        <p class="cta">View your request on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
     """,
     "leave_approved": """
         <div class="badge badge-success">Approved</div>
@@ -146,8 +149,10 @@ _EMAIL_TEMPLATES = {
         <table class="details">
             <tr><td>Start Date</td><td>{start}</td></tr>
             <tr><td>End Date</td><td>{end}</td></tr>
+            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>Your leave credits have been adjusted accordingly. Please plan your work handover before the leave period.</p>
+        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
     """,
     "leave_rejected": """
         <div class="badge badge-danger">Rejected</div>
@@ -156,8 +161,10 @@ _EMAIL_TEMPLATES = {
         <table class="details">
             <tr><td>Start Date</td><td>{start}</td></tr>
             <tr><td>End Date</td><td>{end}</td></tr>
+            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>If you have questions about this decision, please contact your manager directly.</p>
+        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
     """,
     "cancel_requested": """
         <div class="badge badge-warning">Cancellation Request</div>
@@ -193,11 +200,13 @@ _EMAIL_TEMPLATES = {
         <h2 style="color:#2563eb;margin:0 0 8px">WFH Request</h2>
         <p>{applicant_name} has requested Work From Home.</p>
         <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
+            <tr><td style="font-weight:600;color:#5e6c84">Applicant</td><td>{applicant_name}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
         </table>
-        <p>Please review and approve or reject this request.</p>
+        <p class="cta">Please login to the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a> to approve or reject this request.</p>
     """,
     "wfh_approved": """
         <h2 style="color:#16a34a;margin:0 0 8px">WFH Approved</h2>
@@ -205,12 +214,20 @@ _EMAIL_TEMPLATES = {
         <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
             <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
         </table>
+        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a>.</p>
     """,
     "wfh_rejected": """
         <h2 style="color:#dc2626;margin:0 0 8px">WFH Rejected</h2>
         <p>{applicant_name}, your Work From Home request ({start} → {end}) has been rejected.</p>
+        <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
+        </table>
         <p>Please contact your manager if you have any questions.</p>
+        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a>.</p>
     """,
 }
 

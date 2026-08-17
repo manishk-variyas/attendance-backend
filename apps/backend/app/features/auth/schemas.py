@@ -11,7 +11,7 @@ Schemas vs Models:
 - Schemas (here): API input/output validation (Pydantic)
 - Models (models/): Database tables (SQLAlchemy)
 """
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List
 from zoneinfo import available_timezones
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
@@ -35,6 +35,7 @@ class LoginRequest(BaseModel):
     """Request schema for the login endpoint."""
     username: str
     password: str
+    realm: Optional[str] = None  # Optional Keycloak realm; None → default realm
 
 
 class SessionResponse(BaseModel):
@@ -54,6 +55,19 @@ class SignupRequest(BaseModel):
     password: str = Field(..., max_length=20)
     timezone: str = Field(default="UTC", description="IANA timezone name, e.g. 'Asia/Kolkata'")
     role: str = Field(default="Technical Resource", description="Keycloak realm role")
+    realm: Optional[str] = None  # Optional Keycloak realm; None → default realm
+    first_name: Optional[str] = Field(
+        default="NA",
+        max_length=50,
+        validation_alias=AliasChoices("first_name", "firstName"),
+        description="User's first name",
+    )
+    last_name: Optional[str] = Field(
+        default="NA",
+        max_length=50,
+        validation_alias=AliasChoices("last_name", "lastName"),
+        description="User's last name",
+    )
 
     @field_validator("password")
     @classmethod
@@ -63,6 +77,13 @@ class SignupRequest(BaseModel):
         if len(v) > 20:
             raise ValueError("Password must be at most 20 characters")
         return v
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> str:
+        if not v or not v.strip():
+            return "NA"
+        return v.strip()
 
     @field_validator("timezone")
     @classmethod
@@ -98,6 +119,7 @@ class SignupResponse(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    realm: Optional[str] = None  # Optional Keycloak realm; None → default realm
 
 
 class ResetPasswordRequest(BaseModel):

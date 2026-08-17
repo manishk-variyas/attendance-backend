@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     REALM: str = "attendance-app"  # Keycloak realm name
     KEYCLOAK_CLIENT_ID: str = "backend-client"  # Client ID for this backend app
     KEYCLOAK_CLIENT_SECRET: str = ""  # Set via .env — no hardcoded default
+    # Optional additional Keycloak realms, as a JSON array, e.g.
+    # '[{"name":"acme","keycloak_url":"http://keycloak:8080","realm":"acme","client_id":"backend-client-acme","client_secret":"..."}]'
+    # Empty by default → only the default REALM is available (current behavior).
+    EXTRA_REALMS: str = ""
 
     # Session settings
     SECRET_KEY: str = ""  # Set via .env — no hardcoded default

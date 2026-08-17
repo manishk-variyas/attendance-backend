@@ -16,6 +16,14 @@ from jose import jwt
 logger = logging.getLogger(__name__)
 
 
+def get_token_issuer(access_token: str) -> str:
+    """Return the `iss` claim of a token, or empty string on failure."""
+    try:
+        return jwt.get_unverified_claims(access_token).get("iss", "")
+    except Exception:
+        return ""
+
+
 def get_user_info_from_token(access_token: str) -> dict:
     """
     Extract user information from a Keycloak access token.

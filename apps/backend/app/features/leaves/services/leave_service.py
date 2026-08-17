@@ -259,6 +259,7 @@ class LeaveBusinessService:
         start_str = str(dates[0])
         end_str = str(dates[-1])
         reason_str = leave_data.reason or leave_data.comment or ""
+        resuming_str = leave_data.resuming_date.strftime("%Y-%m-%d") if leave_data.resuming_date else ""
 
         self._send_email_bg(
             email_service.send_leave_applied_confirmation,
@@ -267,6 +268,7 @@ class LeaveBusinessService:
             start_str,
             end_str,
             reason_str,
+            resuming_str,
         )
 
         if leave_data.approver_id:
@@ -281,6 +283,7 @@ class LeaveBusinessService:
                     start_str,
                     end_str,
                     reason_str,
+                    resuming_str,
                 )
 
         return {"leave_id": leave_ids[0], "leave_ids": leave_ids, "created": len(leave_ids), "balance": balance_info}
@@ -1162,6 +1165,7 @@ class LeaveBusinessService:
             self._get_employee_name(leave.user_email),
             str(leave.start_date),
             str(leave.end_date),
+            leave.resuming_date.strftime("%Y-%m-%d") if leave.resuming_date else "",
         )
 
         return True
@@ -1208,6 +1212,7 @@ class LeaveBusinessService:
             self._get_employee_name(leave.user_email),
             str(leave.start_date),
             str(leave.end_date),
+            leave.resuming_date.strftime("%Y-%m-%d") if leave.resuming_date else "",
         )
 
         return True

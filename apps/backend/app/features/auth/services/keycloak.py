@@ -9,6 +9,10 @@ This module provides functions to interact with Keycloak's API:
 Keycloak is the identity provider that handles user authentication.
 This backend acts as a client to Keycloak, using the client credentials
 flow (client_id + client_secret) plus user credentials when needed.
+
+Every function accepts an optional `realm` (logical realm name). `None`
+(and any caller that omits it) resolves to the default realm — identical
+URLs and behavior to the pre-multi-realm code.
 """
 import json
 import logging
@@ -17,11 +21,16 @@ import httpx
 from fastapi import HTTPException
 
 from app.core.config import settings
+from app.features.auth.realm_registry import get_realm_config
 
 logger = logging.getLogger(__name__)
 
 
-async def refresh_keycloak_token(refresh_token: str) -> dict:
+def _cfg_for(realm: str | None):
+    return get_realm_config(realm)
+
+
+async def refresh_keycloak_token(refresh_token: str, realm: str | None = None) -> dict:
     """
     Refresh an expired access token using a refresh token.
     
@@ -36,13 +45,14 @@ async def refresh_keycloak_token(refresh_token: str) -> dict:
     Raises:
         HTTPException: If refresh fails (invalid/expired refresh token)
     """
+    cfg = _cfg_for(realm)
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            settings.TOKEN_URL,
+            cfg.token_url,
             data={
                 "grant_type": "refresh_token",
-                "client_id": settings.KEYCLOAK_CLIENT_ID,
-                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "client_id": cfg.client_id,
+                "client_secret": cfg.client_secret,
                 "refresh_token": refresh_token,
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -54,7 +64,7 @@ async def refresh_keycloak_token(refresh_token: str) -> dict:
     return response.json()
 
 
-async def revoke_keycloak_token(refresh_token: str) -> bool:
+async def revoke_keycloak_token(refresh_token: str, realm: str | None = None) -> bool:
     """
     Revoke a refresh token in Keycloak (logout).
     
@@ -64,12 +74,13 @@ async def revoke_keycloak_token(refresh_token: str) -> bool:
     Returns:
         bool: True if revocation was successful, False otherwise
     """
+    cfg = _cfg_for(realm)
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            settings.LOGOUT_URL,
+            cfg.logout_url,
             data={
-                "client_id": settings.KEYCLOAK_CLIENT_ID,
-                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "client_id": cfg.client_id,
+                "client_secret": cfg.client_secret,
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
             },
@@ -86,22 +97,24 @@ async def revoke_keycloak_token(refresh_token: str) -> bool:
         return False
 
 
-async def get_jwks() -> dict:
+async def get_jwks(realm: str | None = None) -> dict:
+    cfg = _cfg_for(realm)
     async with httpx.AsyncClient() as client:
-        response = await client.get(settings.JWKS_URL)
+        response = await client.get(cfg.jwks_url)
         response.raise_for_status()
         return response.json()
 
 
-async def get_admin_token() -> str:
+async def get_admin_token(realm: str | None = None) -> str:
     """Get admin access token using client credentials."""
+    cfg = _cfg_for(realm)
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{settings.KEYCLOAK_URL}/realms/{settings.REALM}/protocol/openid-connect/token",
+            cfg.token_url,
             data={
                 "grant_type": "client_credentials",
-                "client_id": settings.KEYCLOAK_CLIENT_ID,
-                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "client_id": cfg.client_id,
+                "client_secret": cfg.client_secret,
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
@@ -110,18 +123,27 @@ async def get_admin_token() -> str:
     return response.json()["access_token"]
 
 
-async def create_keycloak_user(username: str, email: str) -> str:
+async def create_keycloak_user(
+    username: str,
+    email: str,
+    realm: str | None = None,
+    first_name: str = "NA",
+    last_name: str = "NA",
+) -> str:
     """Create a user in Keycloak. Returns user ID."""
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users",
+            f"{cfg.admin_base}/users",
             json={
                 "username": username,
                 "email": email,
                 "enabled": True,
                 "emailVerified": False,
+                "firstName": first_name,
+                "lastName": last_name,
             },
             headers={
                 "Authorization": f"Bearer {admin_token}",
@@ -141,13 +163,14 @@ async def create_keycloak_user(username: str, email: str) -> str:
     return user_id
 
 
-async def set_keycloak_password(user_id: str, password: str) -> bool:
+async def set_keycloak_password(user_id: str, password: str, realm: str | None = None) -> bool:
     """Set password for a user in Keycloak."""
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
 
     async with httpx.AsyncClient() as client:
         response = await client.put(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/reset-password",
+            f"{cfg.admin_base}/users/{user_id}/reset-password",
             json={
                 "type": "password",
                 "value": password,
@@ -162,24 +185,26 @@ async def set_keycloak_password(user_id: str, password: str) -> bool:
     return response.status_code == 204
 
 
-async def get_realm_roles() -> list:
+async def get_realm_roles(realm: str | None = None) -> list:
     """Fetch all realm roles from Keycloak."""
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/roles",
+            f"{cfg.admin_base}/roles",
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         resp.raise_for_status()
         return [{"id": r["id"], "name": r["name"]} for r in resp.json()]
 
 
-async def get_user_realm_roles(user_id: str) -> list:
+async def get_user_realm_roles(user_id: str, realm: str | None = None) -> list:
     """Get realm role names assigned to a specific user."""
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            f"{cfg.admin_base}/users/{user_id}/role-mappings/realm",
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         if resp.status_code != 200:
@@ -187,17 +212,18 @@ async def get_user_realm_roles(user_id: str) -> list:
         return [r["name"] for r in resp.json()]
 
 
-async def add_realm_role_to_user(user_id: str, role_name: str) -> bool:
+async def add_realm_role_to_user(user_id: str, role_name: str, realm: str | None = None) -> bool:
     """Assign a realm role to a Keycloak user."""
-    roles = await get_realm_roles()
+    roles = await get_realm_roles(realm)
     role = next((r for r in roles if r["name"] == role_name), None)
     if not role:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
 
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            f"{cfg.admin_base}/users/{user_id}/role-mappings/realm",
             json=[{"id": role["id"], "name": role["name"]}],
             headers={
                 "Authorization": f"Bearer {admin_token}",
@@ -207,17 +233,18 @@ async def add_realm_role_to_user(user_id: str, role_name: str) -> bool:
     return resp.status_code == 204
 
 
-async def remove_realm_role_from_user(user_id: str, role_name: str) -> bool:
+async def remove_realm_role_from_user(user_id: str, role_name: str, realm: str | None = None) -> bool:
     """Remove a realm role from a Keycloak user."""
-    roles = await get_realm_roles()
+    roles = await get_realm_roles(realm)
     role = next((r for r in roles if r["name"] == role_name), None)
     if not role:
         return False
 
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     async with httpx.AsyncClient() as client:
         resp = await client.delete(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}/role-mappings/realm",
+            f"{cfg.admin_base}/users/{user_id}/role-mappings/realm",
             json=[{"id": role["id"], "name": role["name"]}],
             headers={
                 "Authorization": f"Bearer {admin_token}",
@@ -227,17 +254,18 @@ async def remove_realm_role_from_user(user_id: str, role_name: str) -> bool:
     return resp.status_code == 204
 
 
-async def get_keycloak_user_by_email(email: str) -> dict:
+async def get_keycloak_user_by_email(email: str, realm: str | None = None) -> dict:
     """
     Look up a Keycloak user by email address via Admin API.
     
     Returns the first matching user dict with keys: id, username, email.
     Returns empty dict if no user found.
     """
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users",
+            f"{cfg.admin_base}/users",
             params={"email": email, "max": 1},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
@@ -250,9 +278,10 @@ async def get_keycloak_user_by_email(email: str) -> dict:
     return {"id": u["id"], "username": u.get("username", ""), "email": u.get("email", "")}
 
 
-async def update_keycloak_user(user_id: str, data: dict) -> bool:
+async def update_keycloak_user(user_id: str, data: dict, realm: str | None = None) -> bool:
     """Update a Keycloak user's profile."""
-    admin_token = await get_admin_token()
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
     payload = {}
     if "email" in data:
         payload["email"] = data["email"]
@@ -268,7 +297,7 @@ async def update_keycloak_user(user_id: str, data: dict) -> bool:
 
     async with httpx.AsyncClient() as client:
         resp = await client.put(
-            f"{settings.KEYCLOAK_URL}/admin/realms/{settings.REALM}/users/{user_id}",
+            f"{cfg.admin_base}/users/{user_id}",
             json=payload,
             headers={
                 "Authorization": f"Bearer {admin_token}",

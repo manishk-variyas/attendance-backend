@@ -36,10 +36,11 @@ from app.core.limiter import limiter, LOGIN_RATE_LIMIT
 from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user, get_keycloak_user_by_email
 from app.features.auth.dependencies import get_current_user, require_admin
+from app.features.auth.realm_registry import get_realm_config, DEFAULT_REALM_NAME, token_issuer_matches_realm
 from app.models.employee_master import EmployeeMaster
 from app.models.password_reset import PasswordResetToken
 from app.services.database.base_service import BaseService
-from app.utils.jwt import get_user_info_from_token
+from app.utils.jwt import get_user_info_from_token, get_token_issuer
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
 from app.utils.email import send_password_reset_email, send_password_changed_email
 from app.middleware.logging import _get_client_ip
@@ -69,14 +70,16 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     correlation_id = request.state.correlation_id
     client_ip = _get_client_ip(request)
 
+    rc = get_realm_config(payload.realm)
+
     # Send credentials to Keycloak to verify
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            settings.TOKEN_URL,
+            rc.token_url,
             data={
                 "grant_type": "password",
-                "client_id": settings.KEYCLOAK_CLIENT_ID,
-                "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
+                "client_id": rc.client_id,
+                "client_secret": rc.client_secret,
                 "username": payload.username,
                 "password": payload.password,
                 "scope": "openid profile email offline_access",
@@ -92,6 +95,15 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
 
     # Extract tokens from Keycloak's response
     tokens = response.json()
+
+    # When a realm is explicitly requested, pin the token's issuer to it.
+    # Only enforced for non-default (extra) realms — the default realm must
+    # keep byte-identical behavior. Compared by realm-path suffix so host
+    # differences (keycloak:8080 vs localhost:8080) don't cause false 401s.
+    if payload.realm and payload.realm != DEFAULT_REALM_NAME and not token_issuer_matches_realm(get_token_issuer(tokens.get("access_token")), rc):
+        log_login(correlation_id, payload.username, success=False, client_ip=client_ip, extra={"reason": "issuer_mismatch"})
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
     # Decode the JWT to get user info (username, email, roles)
     user_data = get_user_info_from_token(tokens.get("access_token"))
 
@@ -113,7 +125,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
         is_active = emp.is_active if emp else True
 
     # Enforce single session per user
-    session_id = await create_session(user_data, tokens.get("refresh_token"), is_active=is_active)
+    session_id = await create_session(user_data, tokens.get("refresh_token"), is_active=is_active, realm=payload.realm)
     await enforce_session_limit(user_data.get("sub"), max_sessions=1)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
@@ -173,7 +185,7 @@ async def refresh_session_endpoint(
 
     try:
         # Ask Keycloak for new tokens using the refresh token
-        new_tokens = await refresh_keycloak_token(refresh_token)
+        new_tokens = await refresh_keycloak_token(refresh_token, realm=session_data.get("realm"))
     except HTTPException:
         # If refresh fails, the refresh token is expired - delete session and ask user to login again
         await delete_session(old_session_id)
@@ -194,7 +206,7 @@ async def refresh_session_endpoint(
     # Create new session with new refresh token, delete old session
     # Preserve last_activity_at so the idle clock survives the rotation.
     old_last_activity = await get_session_last_activity(old_session_id)
-    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True), last_activity_at=old_last_activity)
+    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True), last_activity_at=old_last_activity, realm=session_data.get("realm"))
     await delete_session(old_session_id)
 
     log_session_refresh(correlation_id, username=user_data.get("username"), success=True, client_ip=client_ip)
@@ -253,7 +265,7 @@ async def logout(request: Request):
             refresh_token = session_data.get("kc_refresh_token")
             # Tell Keycloak to revoke the refresh token so it can't be used again
             if refresh_token:
-                await revoke_keycloak_token(refresh_token)
+                await revoke_keycloak_token(refresh_token, realm=session_data.get("realm"))
 
         # Remove the session from the database
         await delete_session(session_id)
@@ -324,7 +336,7 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
     client_ip = _get_client_ip(request)
 
     try:
-        kc_user = await get_keycloak_user_by_email(payload.email)
+        kc_user = await get_keycloak_user_by_email(payload.email, realm=payload.realm)
         if not kc_user:
             log_security_event(
                 correlation_id, "forgot_password",
@@ -361,6 +373,7 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
             "email": kc_user["email"],
             "jti": token_id,
             "purpose": "password_reset",
+            "realm": payload.realm,
             "iat": now,
             "exp": now + timedelta(minutes=expire_minutes),
         }
@@ -428,6 +441,7 @@ async def reset_password(request: Request, payload: ResetPasswordRequest):
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
     user_sub = claims["sub"]
     user_email = claims.get("email", "")
+    reset_realm = claims.get("realm")  # None → default realm
 
     db = SessionLocal()
     try:
@@ -446,7 +460,7 @@ async def reset_password(request: Request, payload: ResetPasswordRequest):
             await asyncio.sleep(5)
             raise HTTPException(status_code=400, detail="Too many failed attempts. Please request a new reset link.")
 
-        success = await set_keycloak_password(user_sub, payload.password)
+        success = await set_keycloak_password(user_sub, payload.password, realm=reset_realm)
         if not success:
             stored.reset_attempts += 1
             db.commit()
@@ -520,11 +534,17 @@ async def signup(
 
     try:
         logger.info(f"Admin {current_user.get('username')} is creating user {signup_data.username}")
-        user_id = await create_keycloak_user(signup_data.username, signup_data.email)
-        await set_keycloak_password(user_id, signup_data.password)
+        user_id = await create_keycloak_user(
+            signup_data.username,
+            signup_data.email,
+            realm=signup_data.realm,
+            first_name=signup_data.first_name,
+            last_name=signup_data.last_name,
+        )
+        await set_keycloak_password(user_id, signup_data.password, realm=signup_data.realm)
 
         # Assign Keycloak realm role (defaults to "Technical Resource")
-        await add_realm_role_to_user(user_id, signup_data.role)
+        await add_realm_role_to_user(user_id, signup_data.role, realm=signup_data.realm)
 
         logger.info(f"User {signup_data.username} created via signup")
         log_security_event(
