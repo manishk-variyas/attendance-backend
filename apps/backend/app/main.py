@@ -130,17 +130,9 @@ app.include_router(auth_router)
 # Register Redmine integration routes
 app.include_router(redmine_router, prefix="/api", tags=["redmine"])
 
-# Register Recording routes
-from app.features.recordings.routes import router as recordings_router
-app.include_router(recordings_router, prefix="/api", tags=["recordings"])
-
 # Register Leave Management routes
 from app.features.leaves.routes import router as leaves_router
 app.include_router(leaves_router, prefix="/api", tags=["leaves"])
-
-# Register Admin Leave Balance routes
-from app.features.leaves.admin_routes import router as leave_balance_router
-app.include_router(leave_balance_router, prefix="/api", tags=["admin-leave-balances"])
 
 # Register Admin Leave Type routes
 from app.features.leaves.leave_type_routes import router as leave_type_router

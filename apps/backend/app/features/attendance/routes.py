@@ -12,7 +12,7 @@ from sqlalchemy import and_, or_, text
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse
+from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse, TodayShiftsResponse, ShiftCheckInRequest
 from app.features.attendance.admin_routes import _to_response_with_email_batched, _build_virtual_record
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
@@ -21,8 +21,10 @@ from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.location import UserLocation
 from app.models.holiday import Holiday
-from app.models.leave_balance import LeaveBalance
 from app.models.leave import Leave
+from app.models.shift_attendance import ShiftAttendance
+from app.features.attendance.services.shift_attendance_service import shift_attendance_service
+from app.features.leaves.services.balance_utils import credit_comp_off
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
@@ -106,21 +108,9 @@ def _credit_comp_off_if_holiday(db: Session, attendance: Attendance) -> None:
         return
 
     keycloak_id = attendance.keycloak_user_id
-    balance = db.query(LeaveBalance).filter(LeaveBalance.keycloak_user_id == keycloak_id).first()
-    if balance:
-        balance.accrued_compoff = (balance.accrued_compoff or 0) + 1
-    else:
-        db.add(LeaveBalance(
-            keycloak_user_id=keycloak_id,
-            year=attendance.attendance_date.year,
-            total_earned=12.0,
-            used_earned=0.0,
-            accrued_compoff=1,
-            consumed_compoff=0,
-            unpaid=0,
-        ))
+    credit_comp_off(db, keycloak_id, attendance.attendance_date)
     attendance.comp_off_credited = True
-    attendance.remarks = (attendance.remarks or "") + " | Comp-off credited: " + holiday.holiday_name
+    attendance.remarks = ", ".join(filter(None, [attendance.remarks, f"Compoff Auto Credited - {holiday.holiday_name}"]))
     db.commit()
     logger.info(f"Comp-off credited: {keycloak_id} for {holiday.holiday_name} on {attendance.attendance_date}")
 
@@ -445,7 +435,7 @@ async def check_out(
         if not attendance.server_received_at:
             attendance.server_received_at = datetime.now(timezone.utc)
     if target_date != today:
-        attendance.remarks = (attendance.remarks or "") + (" | Next-day checkout" if attendance.remarks else "Next-day checkout")
+        attendance.remarks = ", ".join(filter(None, [attendance.remarks, "Next-day checkout"]))
     attendance.check_out_lat = payload.latitude
     attendance.check_out_lng = payload.longitude
 
@@ -577,7 +567,7 @@ async def complete_attendance(
         existing.is_synced = True
         if not existing.server_received_at:
             existing.server_received_at = datetime.now(timezone.utc)
-        existing.remarks = (existing.remarks or "") + (" | " if existing.remarks else "") + "Next-day completion"
+        existing.remarks = ", ".join(filter(None, [existing.remarks, "Next-day completion"]))
         if payload.remarks:
             existing.remarks += f" ({payload.remarks})"
         db.commit()
@@ -833,6 +823,145 @@ async def get_today_attendance(
     if on_leave_today:
         return {"status": "on_leave", "shift": None, "attendance": None, "remainingHours": None}
     return {"status": "no_shift", "shift": None, "attendance": None, "remainingHours": None}
+
+
+@router.get("/today/shifts", response_model=TodayShiftsResponse)
+async def get_today_shifts(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    keycloak_user_id = current_user["sub"]
+    now = datetime.now(timezone.utc)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+    # All shifts covering today (a shift covers today if date <= today <= end_date)
+    shifts_today = db.query(Shift).filter(
+        and_(
+            Shift.keycloak_user_id == keycloak_user_id,
+            Shift.date <= today,
+            or_(Shift.end_date.is_(None), Shift.end_date >= today),
+        )
+    ).order_by(Shift.date.asc(), Shift.shift_start_time.asc()).all()
+
+    on_leave_today = db.query(Leave).filter(
+        Leave.keycloak_user_id == keycloak_user_id,
+        Leave.approval_status.in_(["approved", "emergency"]),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+    ).first()
+
+    # Shift definitions by code
+    shift_codes = {s.shift_code for s in shifts_today if s.shift_code}
+    sd_map = {}
+    if shift_codes:
+        sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+        sd_map = {sd.shift_code: sd for sd in sds}
+
+    # New per-shift punches by shift_id
+    shift_ids = [s.id for s in shifts_today]
+    punch_map = {}
+    if shift_ids:
+        punches = db.query(ShiftAttendance).filter(ShiftAttendance.shift_id.in_(shift_ids)).all()
+        punch_map = {p.shift_id: p for p in punches}
+
+    entries = []
+    for s in shifts_today:
+        sd = sd_map.get(s.shift_code)
+        tz = _safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
+        start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz) if (sd and sd.start_time) else None
+        end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if (sd and sd.end_time) else None
+
+        punch = punch_map.get(s.id)
+
+        # Per-shift status
+        if on_leave_today or s.work_location_status == "LEAVE":
+            status = "on_leave"
+        elif punch and punch.check_out_time:
+            status = "completed"
+        elif punch and not punch.check_out_time:
+            status = "overnight" if punch.attendance_date < today else "in_progress"
+            if end_dt and now > end_dt:
+                status = "shift_ended"
+        elif end_dt and now > end_dt:
+            status = "missed"
+        else:
+            status = "yet_to_start"
+
+        remaining = None
+        if punch:
+            if punch.check_out_time:
+                remaining = 0.0
+            elif end_dt:
+                remaining = round(max((end_dt - now).total_seconds() / 3600, 0.0), 2)
+
+        entries.append({
+            "shiftId": str(s.id),
+            "shift_code": s.shift_code,
+            "shift_name": sd.shift_name if sd else None,
+            "date": s.date.isoformat(),
+            "start_time": start_dt.isoformat() if start_dt else (s.shift_start_time.isoformat() if s.shift_start_time else None),
+            "end_time": end_dt.isoformat() if end_dt else None,
+            "work_location_status": s.work_location_status,
+            "project_id": s.project_id,
+            "project_name": s.project_name,
+            "status": status,
+            "attendance": _shift_attendance_to_dict(punch) if punch else None,
+            "remainingHours": remaining,
+        })
+
+    # Overall status
+    if not entries:
+        overall = "on_leave" if on_leave_today else "no_shift"
+    elif any(e["status"] in ("in_progress", "overnight", "shift_ended") for e in entries):
+        overall = "in_progress"
+    elif any(e["status"] == "yet_to_start" for e in entries):
+        overall = "yet_to_start"
+    elif any(e["status"] == "completed" for e in entries):
+        overall = "completed"
+    elif any(e["status"] == "on_leave" for e in entries):
+        overall = "on_leave"
+    else:
+        overall = "no_shift"
+
+    return {"status": overall, "date": today.isoformat(), "shifts": entries}
+
+
+def _shift_attendance_to_dict(p: ShiftAttendance) -> dict:
+    return {
+        "checkInTime": p.check_in_time.isoformat() if p.check_in_time else None,
+        "checkInLat": float(p.check_in_lat) if p.check_in_lat else None,
+        "checkInLng": float(p.check_in_lng) if p.check_in_lng else None,
+        "checkInLocationName": p.check_in_location_name,
+        "checkOutTime": p.check_out_time.isoformat() if p.check_out_time else None,
+        "checkOutLat": float(p.check_out_lat) if p.check_out_lat else None,
+        "checkOutLng": float(p.check_out_lng) if p.check_out_lng else None,
+        "checkOutLocationName": p.check_out_location_name,
+        "workLocationStatus": p.work_location_status,
+        "isLate": p.is_late,
+        "totalHours": float(p.total_hours) if p.total_hours else None,
+        "shiftCode": p.shift_code,
+        "status": p.status,
+        "updatedAt": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+@router.post("/shifts/check-in", status_code=status.HTTP_201_CREATED)
+async def shift_check_in(
+    payload: ShiftCheckInRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    punch = shift_attendance_service.check_in(
+        db,
+        current_user["sub"],
+        payload.shiftId,
+        payload.latitude,
+        payload.longitude,
+        payload.clientTimestamp,
+    )
+    return _shift_attendance_to_dict(punch)
 
 
 def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> Optional[tuple]:

@@ -2,15 +2,21 @@ import json
 import os
 import logging
 import httpx
-from fastapi import APIRouter, HTTPException, Depends, status, Query, UploadFile, File, Form
+import openpyxl
+from io import BytesIO
+from fastapi import APIRouter, HTTPException, Depends, status, Query, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
-from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from datetime import date, timedelta, datetime
+from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
 from app.features.auth.dependencies import get_current_user
+from app.core.limiter import limiter
+from app.utils.audit import audit_logger
+from app.middleware.logging import _get_client_ip
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.features.shifts.service import shift_service
@@ -272,6 +278,181 @@ async def get_all_project_issues(
     return issues
 
 
+def _parse_issue_date(value: Optional[str], add_day: bool = False):
+    if not value:
+        return None
+    try:
+        d = date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    return d + timedelta(days=1) if add_day else d
+
+
+def _paginated_response(records: list, total: int, page: int, page_size: int) -> dict:
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+    return {"records": records, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+
+
+def _build_issues_excel(records: list) -> BytesIO:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Issues"
+    ws.append(["ID", "Subject", "Description", "Status", "Priority", "Tracker", "Project",
+               "Assigned To", "Author", "Created On", "Updated On", "Start Date", "Due Date",
+               "Estimated Hours", "Done Ratio"])
+    for r in records:
+        ws.append([
+            r.get("id"),
+            r.get("subject"),
+            r.get("description"),
+            r.get("status"),
+            r.get("priority"),
+            r.get("tracker"),
+            r.get("project_name"),
+            r.get("assigned_to_name"),
+            r.get("author_name"),
+            r.get("created_on"),
+            r.get("updated_on"),
+            r.get("start_date"),
+            r.get("due_date"),
+            r.get("estimated_hours"),
+            r.get("done_ratio"),
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+
+def _export_issues(request: Request, current_user: dict, records: list, label: str):
+    output = _build_issues_excel(records)
+    audit_logger.info(
+        f"Issues exported by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": f"export_{label}_issues",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "exported_rows": len(records),
+            },
+        },
+    )
+    filename = f"{label}_issues_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/my-issues/paginated", response_model=IssueListResponse)
+@limiter.limit("30/minute")
+async def get_my_issues_paginated(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    sort_by: str = Query("updated_on", description="updated_on, created_on, subject, priority, status, due_date, done_ratio, project_name"),
+    sort_dir: str = Query("desc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    status_id: Optional[int] = Query(None, description="Filter by status id"),
+    priority_id: Optional[int] = Query(None, description="Filter by priority id"),
+    tracker_id: Optional[int] = Query(None, description="Filter by tracker id"),
+    project_id: Optional[int] = Query(None, description="Filter by project id"),
+    search: Optional[str] = Query(None, description="Search subject or author name"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in ["Admin", "Project Manager", "Project Coordinator", "Technical Resource"]):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+
+    is_tr = "Technical Resource" in roles and "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles
+
+    records, total = sql.get_issues_paginated(
+        scope_user_id=rm_user["id"],
+        include_authored=is_tr,
+        status_id=status_id,
+        priority_id=priority_id,
+        tracker_id=tracker_id,
+        project_id=project_id,
+        search=(search or "").strip()[:100] or None,
+        from_date=_parse_issue_date(from_date),
+        to_date=_parse_issue_date(to_date, add_day=True),
+        sort_by=sort_by,
+        sort_dir=sort_dir if sort_dir in ("asc", "desc") else "desc",
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        export=export,
+    )
+    if export:
+        return _export_issues(request, current_user, records, "my")
+    return _paginated_response(records, total, page, page_size)
+
+
+@router.get("/team-issues", response_model=IssueListResponse)
+@limiter.limit("30/minute")
+async def get_team_issues_paginated(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    sort_by: str = Query("updated_on", description="updated_on, created_on, subject, priority, status, due_date, done_ratio, project_name"),
+    sort_dir: str = Query("desc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    status_id: Optional[int] = Query(None, description="Filter by status id"),
+    priority_id: Optional[int] = Query(None, description="Filter by priority id"),
+    tracker_id: Optional[int] = Query(None, description="Filter by tracker id"),
+    project_id: Optional[int] = Query(None, description="Filter by project id"),
+    search: Optional[str] = Query(None, description="Search subject or author name"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in ["Admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+
+    is_admin = "Admin" in roles
+    team_ids = None
+    if not is_admin:
+        team_ids = sql.get_team_member_ids(rm_user["id"])
+        team_ids.add(rm_user["id"])
+
+    records, total = sql.get_issues_paginated(
+        admin_all=is_admin,
+        team_ids=team_ids,
+        status_id=status_id,
+        priority_id=priority_id,
+        tracker_id=tracker_id,
+        project_id=project_id,
+        search=(search or "").strip()[:100] or None,
+        from_date=_parse_issue_date(from_date),
+        to_date=_parse_issue_date(to_date, add_day=True),
+        sort_by=sort_by,
+        sort_dir=sort_dir if sort_dir in ("asc", "desc") else "desc",
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        export=export,
+    )
+    if export:
+        return _export_issues(request, current_user, records, "team")
+    return _paginated_response(records, total, page, page_size)
+
+
 @router.get("/projects/{project_id}/issues", response_model=List[IssueResponse])
 async def get_project_issues(
     project_id: int,
@@ -410,6 +591,9 @@ async def get_project_members(
         emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == m.get("user_id")).first()
         if emp:
             m["email"] = emp.user_email
+            emp_name = f"{emp.first_name or ''} {emp.middle_name or ''} {emp.last_name or ''}".strip().replace("  ", " ")
+            if emp_name:
+                m["name"] = emp_name
 
     return members
 
@@ -561,10 +745,10 @@ async def list_categories(
 
 @router.post("/redmine/issues", status_code=201)
 async def create_redmine_issue(
-    data: str = Form(...),
-    files: list[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    data: str = Form(...),
+    files: list[UploadFile] = File(None),
 ):
     roles = current_user.get("roles", [])
     email = current_user.get("email")
@@ -752,9 +936,9 @@ async def delete_attachment(
 @router.post("/redmine/issues/{issue_id}/attachments")
 async def upload_issue_attachment(
     issue_id: int,
-    file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    file: UploadFile = File(...),
 ):
     roles = current_user.get("roles", [])
     if not roles:
@@ -862,10 +1046,10 @@ async def delete_redmine_issue(
 @router.put("/redmine/issues/{issue_id}")
 async def update_redmine_issue(
     issue_id: int,
-    data: str = Form(...),
-    files: list[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
+    data: str = Form(...),
+    files: list[UploadFile] = File(None),
 ):
     roles = current_user.get("roles", [])
     email = current_user.get("email")

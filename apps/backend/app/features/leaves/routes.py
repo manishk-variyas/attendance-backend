@@ -13,9 +13,8 @@ from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
     LeaveHistoryItem, 
-    LeaveStats, 
-    LeaveBalanceSummary,
     EmployeeLeaveBalanceSummary,
+    LeaveTypeOption,
     Holiday,
     BatchLeaveRequest,
     CancelLeaveRequest,
@@ -26,6 +25,7 @@ from app.features.leaves.services.leave_service import LeaveBusinessService
 from app.middleware.logging import _get_client_ip
 from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
+from app.models.leave_type import LeaveTypeConfig
 from app.models.holiday import Holiday as HolidayModel
 from app.services.database.dependencies import get_leave_business_service
 from app.features.redmine.service import redmine_service
@@ -36,23 +36,30 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/leaves", tags=["leaves"])
 
-@router.get("/stats", response_model=LeaveStats)
-async def get_stats(
-    year: Optional[int] = Query(None, ge=2000, description="Year (default: current)"),
-    month: Optional[int] = Query(None, ge=1, le=12, description="Filter by month"),
-    current_user: dict = Depends(get_current_user),
-    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
-):
-    user_id = current_user.get("sub")
-    stats = await leave_service.get_leave_stats(user_id, year, month)
-    return stats
-
 @router.get("/balance", response_model=EmployeeLeaveBalanceSummary)
 async def get_balance(
     current_user: dict = Depends(get_current_user),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     return await leave_service.get_employee_leave_balance_summary(current_user.get("sub"))
+
+@router.get("/leave-types", response_model=List[LeaveTypeOption])
+@limiter.limit("30/minute")
+async def list_active_leave_types(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    types = (
+        db.query(LeaveTypeConfig)
+        .filter(LeaveTypeConfig.is_active.is_(True))
+        .order_by(LeaveTypeConfig.name)
+        .all()
+    )
+    return [
+        LeaveTypeOption(id=str(t.id), code=t.code, name=t.name, is_paid=t.is_paid)
+        for t in types
+    ]
 
 @router.get("/self-leave-balance")
 @limiter.limit("30/minute")
@@ -406,9 +413,9 @@ from fastapi import UploadFile, File
 @router.post("/holidays/upload")
 async def upload_holidays(
     request: Request,
-    file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
-    _:None = Depends(require_admin),
+    _: None = Depends(require_admin),
+    file: UploadFile = File(...),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """Upload Excel file to sync holidays. (Admins only)"""
@@ -768,6 +775,12 @@ async def get_leave_by_id(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    try:
+        from uuid import UUID
+        UUID(leave_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Leave not found")
+
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -797,6 +810,10 @@ async def get_leave_by_id(
 
     emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
     data = leave.to_dict()
+    lt = db.query(LeaveTypeConfig).filter(LeaveTypeConfig.code == leave.leave_type).first()
+    if not lt and leave.leave_type == "PL":
+        lt = db.query(LeaveTypeConfig).filter(LeaveTypeConfig.code == "CO").first()
+    data["leave_type_name"] = lt.name if lt else leave.leave_type
     if emp:
         data["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
         data["userDesignation"] = emp.designation

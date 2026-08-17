@@ -14,7 +14,8 @@ class SystemSettingService(BaseService[SystemSetting]):
         stmt = select(SystemSetting).where(SystemSetting.id == "company")
         return self.db.execute(stmt).scalars().first()
 
-    def upsert(self, company_name: str = "", logo_content_type: str = None, created_by: str = None, updated_by: str = None,
+    def upsert(self, company_name: str = "", logo_content_type: str = None, background_content_type: str = None,
+               created_by: str = None, updated_by: str = None,
                default_shift_start_time: str = None, default_shift_end_time: str = None,
                default_timezone: str = None, grace_minutes: int = None,
                 checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None,
@@ -25,6 +26,8 @@ class SystemSettingService(BaseService[SystemSetting]):
         data = {"company_name": company_name, "updated_at": now}
         if logo_content_type:
             data["logo_content_type"] = logo_content_type
+        if background_content_type:
+            data["background_content_type"] = background_content_type
         if created_by:
             data["created_by"] = created_by
         if updated_by:

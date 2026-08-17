@@ -27,6 +27,18 @@ def _issue_row_to_dict(r) -> dict:
     )
 
 
+_ISSUE_SORT_COLUMNS = {
+    "updated_on": "i.updated_on",
+    "created_on": "i.created_on",
+    "subject": "i.subject",
+    "priority": "p.name",
+    "status": "st.name",
+    "due_date": "i.due_date",
+    "done_ratio": "i.done_ratio",
+    "project_name": "pr.name",
+}
+
+
 class RedmineSQLService:
     def __init__(self, db: Session):
         self.db = db
@@ -258,6 +270,142 @@ class RedmineSQLService:
         ).fetchall()
         return [_issue_row_to_dict(r) for r in rows]
 
+    def get_issues_paginated(
+        self,
+        *,
+        scope_user_id: int = None,
+        include_authored: bool = False,
+        team_ids: list = None,
+        admin_all: bool = False,
+        status_id: int = None,
+        priority_id: int = None,
+        tracker_id: int = None,
+        project_id: int = None,
+        search: str = None,
+        from_date=None,
+        to_date=None,
+        sort_by: str = "updated_on",
+        sort_dir: str = "desc",
+        limit: int = 25,
+        offset: int = 0,
+        export: bool = False,
+    ):
+        where = []
+        params = {}
+
+        if admin_all:
+            pass
+        elif team_ids:
+            where.append("i.project_id IN (SELECT m.project_id FROM redmine.members m WHERE m.user_id = ANY(:team_ids))")
+            params["team_ids"] = list(team_ids)
+        elif scope_user_id is not None:
+            if include_authored:
+                where.append("(i.assigned_to_id = :uid OR i.author_id = :uid)")
+            else:
+                where.append("i.assigned_to_id = :uid")
+            params["uid"] = scope_user_id
+
+        if status_id is not None:
+            where.append("i.status_id = :status_id")
+            params["status_id"] = status_id
+        if priority_id is not None:
+            where.append("i.priority_id = :priority_id")
+            params["priority_id"] = priority_id
+        if tracker_id is not None:
+            where.append("i.tracker_id = :tracker_id")
+            params["tracker_id"] = tracker_id
+        if project_id is not None:
+            where.append("i.project_id = :project_id")
+            params["project_id"] = project_id
+        if search:
+            where.append("(i.subject ILIKE :q OR auth.firstname || ' ' || auth.lastname ILIKE :q)")
+            params["q"] = f"%{search}%"
+        if from_date is not None:
+            where.append("i.updated_on >= :from_date")
+            params["from_date"] = from_date
+        if to_date is not None:
+            where.append("i.updated_on < :to_date")
+            params["to_date"] = to_date
+
+        where_sql = " AND ".join(where) if where else "TRUE"
+
+        sort_col = _ISSUE_SORT_COLUMNS.get(sort_by, "i.updated_on")
+        direction = "DESC" if sort_dir == "desc" else "ASC"
+
+        columns = """
+            i.id, i.subject, i.description, st.name as status,
+            p.name as priority, t.name as tracker,
+            i.project_id, pr.name as project_name,
+            u.firstname || ' ' || u.lastname as assigned_to,
+            i.created_on, i.updated_on,
+            i.start_date, i.due_date, i.estimated_hours,
+            i.done_ratio, i.is_private,
+            st.id as status_id, p.id as priority_id, t.id as tracker_id,
+            i.assigned_to_id,
+            i.author_id, auth.firstname || ' ' || auth.lastname as author_name,
+            COALESCE(
+                (SELECT json_agg(json_build_object(
+                    'id', a.id, 'filename', a.filename,
+                    'content_type', a.content_type, 'filesize', a.filesize
+                )) FROM redmine.attachments a
+                WHERE a.container_id = i.id AND a.container_type = 'Issue'),
+                '[]'::json
+            ) as attachments,
+            COALESCE(
+                (SELECT json_agg(json_build_object(
+                    'id', cf.id, 'name', cf.name, 'value', cv.value
+                ) ORDER BY cf.id)
+                FROM redmine.custom_values cv
+                JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                '[]'::json
+            ) as custom_fields
+        """
+
+        base_from = """
+            FROM redmine.issues i
+            JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
+            LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+            LEFT JOIN redmine.users auth ON auth.id = i.author_id
+            JOIN redmine.issue_statuses st ON st.id = i.status_id
+            JOIN redmine.enumerations p ON p.id = i.priority_id
+            JOIN redmine.trackers t ON t.id = i.tracker_id
+        """
+
+        total = self.db.execute(
+            text(f"""
+                SELECT COUNT(*)
+                FROM redmine.issues i
+                JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
+                LEFT JOIN redmine.users auth ON auth.id = i.author_id
+                WHERE {where_sql}
+            """),
+            params,
+        ).scalar() or 0
+
+        if export:
+            rows = self.db.execute(
+                text(f"""
+                    SELECT {columns}
+                    {base_from}
+                    WHERE {where_sql}
+                    ORDER BY {sort_col} {direction} NULLS LAST
+                """),
+                params,
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                text(f"""
+                    SELECT {columns}
+                    {base_from}
+                    WHERE {where_sql}
+                    ORDER BY {sort_col} {direction} NULLS LAST
+                    LIMIT :limit OFFSET :offset
+                """),
+                {**params, "limit": limit, "offset": offset},
+            ).fetchall()
+
+        return [_issue_row_to_dict(r) for r in rows], total
 
     def get_issue_by_id_enriched(self, issue_id: int) -> dict | None:
         row = self.db.execute(

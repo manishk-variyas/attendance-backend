@@ -31,7 +31,7 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None, is_active: bool = True) -> str:
+async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None, is_active: bool = True, last_activity_at: datetime = None) -> str:
     session_id = generate_session_id()
     expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
 
@@ -45,13 +45,15 @@ async def create_session(user_data: dict, keycloak_refresh_token: str = None, ex
     if keycloak_refresh_token:
         session_data["kc_refresh_token"] = keycloak_refresh_token
 
+    now = datetime.now(timezone.utc)
     db = _db()
     try:
         s = Session(
             id=session_id,
             user_sub=user_data.get("sub"),
             data=session_data,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=expire_hours),
+            expires_at=now + timedelta(hours=expire_hours),
+            last_activity_at=last_activity_at or now,
         )
         db.add(s)
         db.commit()
@@ -62,18 +64,44 @@ async def create_session(user_data: dict, keycloak_refresh_token: str = None, ex
     return session_id
 
 
-async def get_session(session_id: str) -> Optional[dict]:
+async def get_session(session_id: str, touch_activity: bool = True) -> Optional[dict]:
     db = _db()
     try:
         s = db.query(Session).filter(Session.id == session_id).first()
         if not s:
             return None
-        if datetime.now(timezone.utc) > s.expires_at:
+        now = datetime.now(timezone.utc)
+        if now > s.expires_at:
             db.delete(s)
             db.commit()
             logger.info(f"Session expired: {session_id[:8]}...")
             return None
+
+        # Idle timeout — sliding window based on last real activity.
+        last = s.last_activity_at or s.created_at
+        if now - last > timedelta(minutes=settings.SESSION_IDLE_TIMEOUT_MINUTES):
+            db.delete(s)
+            db.commit()
+            logger.info(f"Session idle expired: {session_id[:8]}...")
+            return None
+
+        # Throttled activity touch (avoid a DB write on every request).
+        if touch_activity and (now - last) > timedelta(seconds=settings.SESSION_ACTIVITY_FLUSH_SECONDS):
+            s.last_activity_at = now
+            db.commit()
+
         return s.data
+    finally:
+        db.close()
+
+
+async def get_session_last_activity(session_id: str) -> Optional[datetime]:
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s:
+            return None
+        return s.last_activity_at
     finally:
         db.close()
 

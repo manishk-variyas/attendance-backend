@@ -79,6 +79,14 @@ class IssueResponse(BaseModel):
     custom_fields: list[dict] = []
 
 
+class IssueListResponse(BaseModel):
+    records: List[IssueResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class ProjectMember(BaseModel):
     user_id: int
     name: str

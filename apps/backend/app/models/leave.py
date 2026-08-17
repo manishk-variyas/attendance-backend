@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Date, Boolean, DateTime, text
+from sqlalchemy import Column, String, Integer, Date, Boolean, DateTime, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID, JSON
 from app.core.models import Base
 
@@ -30,7 +30,8 @@ class Leave(Base):
     user_email = Column(String(255), nullable=False, index=True)
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)
-    leave_type = Column(String(3), nullable=False)
+    leave_type = Column(String(20), nullable=False)
+    leave_type_id = Column(UUID(as_uuid=True), ForeignKey("leave_types.id"), nullable=True, index=True)
     reason = Column(String(1000), nullable=True)
     comment = Column(String(1000), nullable=True)
     is_traveling = Column(Boolean, nullable=True)
@@ -63,6 +64,7 @@ class Leave(Base):
             "start_date": self.start_date,
             "end_date": self.end_date,
             "leave_type": self.leave_type,
+            "leave_type_id": str(self.leave_type_id) if self.leave_type_id else None,
             "reason": self.reason,
             "comment": self.comment,
             "is_traveling": self.is_traveling,

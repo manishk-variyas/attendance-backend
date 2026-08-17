@@ -9,6 +9,7 @@ class SystemSetting(Base):
     id = Column(String(50), primary_key=True)
     company_name = Column(String(255), nullable=False, server_default=text("''"))
     logo_content_type = Column(String(100), nullable=True)
+    background_content_type = Column(String(100), nullable=True)
     created_by = Column(String(255), nullable=True)
     updated_by = Column(String(255), nullable=True)
     default_shift_start_time = Column(Time, nullable=True)
@@ -26,6 +27,7 @@ class SystemSetting(Base):
             "id": self.id,
             "company_name": self.company_name,
             "logo_url": "",
+            "background_url": "",
             "default_shift_start_time": self.default_shift_start_time.isoformat() if self.default_shift_start_time else None,
             "default_shift_end_time": self.default_shift_end_time.isoformat() if self.default_shift_end_time else None,
             "default_timezone": self.default_timezone,

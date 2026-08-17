@@ -12,3 +12,4 @@ class Session(Base):
     data = Column(JSONB, nullable=False, server_default=text("'{}'"))
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    last_activity_at = Column(DateTime(timezone=True), nullable=True)

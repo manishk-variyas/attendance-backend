@@ -9,13 +9,13 @@ import openpyxl
 import httpx
 from pydantic import ValidationError
 
-from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, LeaveType, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest, EmployeeLeaveBalanceBulkCreate
+from app.features.leaves.schemas.leaves import LeaveApplyRequest, LeaveStatus, Holiday as HolidaySchema, CancelLeaveRequest, CancelLeaveRejectRequest, EmployeeLeaveBalanceBulkCreate
+from app.features.leaves.services.balance_utils import fiscal_year_for, leave_codes_for_type, type_total, availed_days, balance_for, apply_balance
 from app.features.redmine.sql_service import RedmineSQLService
-from app.services.database.leave_service import LeaveService as LeaveDBService, LeaveBalanceService
+from app.services.database.leave_service import LeaveService as LeaveDBService
 from app.services.database.holiday_service import HolidayService as HolidayDBService
 from app.services.email_service import email_service
 from app.models.leave import Leave
-from app.models.leave_balance import LeaveBalance
 from app.models.leave_type import LeaveTypeConfig
 from app.models.employee_leave_balance import EmployeeLeaveBalance, EmployeeLeaveBalanceMonthly
 from app.models.holiday import Holiday
@@ -24,13 +24,12 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.system_setting import SystemSetting
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
-from sqlalchemy import select, and_, or_, func, insert
+from sqlalchemy import select, and_, or_, insert
 
 class LeaveBusinessService:
-    def __init__(self, leave_db: LeaveDBService, holiday_db: HolidayDBService, balance_db: LeaveBalanceService):
+    def __init__(self, leave_db: LeaveDBService, holiday_db: HolidayDBService):
         self.leave_db = leave_db
         self.holiday_db = holiday_db
-        self.balance_db = balance_db
 
     def _get_employee_name(self, email: str) -> str:
         if not email:
@@ -136,6 +135,17 @@ class LeaveBusinessService:
 
     async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> dict:
         """Submit a new leave application with overlap protection."""
+        lt = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(
+                LeaveTypeConfig.code == leave_data.leave_type,
+                LeaveTypeConfig.is_active.is_(True),
+            )
+        ).scalars().first()
+        if not lt:
+            raise HTTPException(status_code=400, detail=f"Invalid or inactive leave type: {leave_data.leave_type}")
+        leave_type_code = lt.code
+        leave_type_id = lt.id
+
         IST = ZoneInfo("Asia/Kolkata")
         from_ist = leave_data.start_date
         if from_ist.tzinfo is None:
@@ -224,7 +234,8 @@ class LeaveBusinessService:
                 "user_email": email,
                 "start_date": current_date,
                 "end_date": current_date,
-                "leave_type": leave_data.leave_type.value,
+                "leave_type": leave_type_code,
+                "leave_type_id": leave_type_id,
                 "reason": leave_data.comment or leave_data.reason,
                 "comment": leave_data.comment,
                 "is_traveling": leave_data.is_traveling,
@@ -240,25 +251,9 @@ class LeaveBusinessService:
         self.leave_db.db.commit()
         leave_ids = [str(row.id) for row in result]
 
-        balance = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == user_id,
-                LeaveBalance.year == leave_data.start_date.year,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-
         balance_info = {"requested_days": requested_days, "remaining": None, "will_be_negative": None}
-        if balance and leave_data.leave_type in (LeaveType.EL, LeaveType.PL):
-            if leave_data.leave_type == LeaveType.EL:
-                if balance.total_earned is None:
-                    remaining = None
-                else:
-                    remaining = balance.total_earned - (balance.used_earned or 0.0)
-            else:
-                remaining = (balance.accrued_compoff or 0.0) - (balance.consumed_compoff or 0.0)
-            balance_info["remaining"] = remaining
-            balance_info["will_be_negative"] = remaining < requested_days if remaining is not None else None
+        if lt.is_paid:
+            balance_info = self._compute_apply_balance(user_id, lt, sd, requested_days)
 
         applicant_name = self._get_employee_name(email)
         start_str = str(dates[0])
@@ -292,6 +287,16 @@ class LeaveBusinessService:
 
     def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
         today = date.today()
+
+        lt = self.leave_db.db.execute(
+            select(LeaveTypeConfig).where(
+                LeaveTypeConfig.code == "EL",
+                LeaveTypeConfig.is_active.is_(True),
+            )
+        ).scalars().first()
+        if not lt:
+            raise HTTPException(status_code=400, detail="Earned Leave (EL) is not configured as an active leave type.")
+        leave_type_id = lt.id
 
         existing_leave = self.leave_db.db.execute(
             select(Leave).where(
@@ -371,33 +376,13 @@ class LeaveBusinessService:
             shift.work_location_status = "LEAVE"
             self.leave_db.db.commit()
 
-        balance = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == leave_data.keycloak_user_id,
-                LeaveBalance.year == leave_data.start_date.year,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-        if not balance:
-            self.balance_db.create(LeaveBalance,
-                keycloak_user_id=user_id,
-                year=today.year,
-                total_earned=12.0,
-                used_earned=1,
-                accrued_compoff=0,
-                consumed_compoff=0,
-                unpaid=0,
-            )
-        else:
-            balance.used_earned = (balance.used_earned or 0) + 1
-            self.leave_db.db.commit()
-
         leave_doc = {
             "keycloak_user_id": user_id,
             "user_email": email,
             "start_date": today,
             "end_date": today,
-            "leave_type": LeaveType.EL.value,
+            "leave_type": "EL",
+            "leave_type_id": leave_type_id,
             "reason": reason or "Emergency leave",
             "approval_status": LeaveStatus.EMERGENCY.value,
         }
@@ -483,7 +468,23 @@ class LeaveBusinessService:
                     d["cancellation_rejected_by"] = f"{name} ({desig})" if desig else name
 
             records.append(d)
+
+        name_map = self._leave_type_name_map()
+        for d in records:
+            d["leave_type_name"] = self._leave_type_display_name(d.get("leave_type"), name_map)
         return records
+
+    def _leave_type_name_map(self) -> Dict[str, str]:
+        types = self.leave_db.db.execute(select(LeaveTypeConfig)).scalars().all()
+        return {t.code: t.name for t in types}
+
+    @staticmethod
+    def _leave_type_display_name(code: str, name_map: Dict[str, str]) -> str:
+        if code in name_map:
+            return name_map[code]
+        if code == "PL" and "CO" in name_map:
+            return name_map["CO"]
+        return code
 
     async def get_leaves_paginated(
         self, emails: List[str],
@@ -726,129 +727,15 @@ class LeaveBusinessService:
         excel_bytes = self._create_holiday_template_excel(holidays)
         return {"source": source, "total": len(holidays), "excel": excel_bytes, "holidays": holidays}
 
-    async def get_leave_stats(self, user_id: str, year: int = None, month: int = None) -> Dict[str, Any]:
-        yr = year or date.today().year
-        mo = month or date.today().month
-        if mo:
-            balance_doc = self.balance_db.db.execute(
-                select(LeaveBalance).where(
-                    LeaveBalance.keycloak_user_id == user_id,
-                    LeaveBalance.year == yr,
-                    LeaveBalance.month == mo,
-                )
-            ).scalars().first()
-            if not balance_doc:
-                balance_doc = self.balance_db.db.execute(
-                    select(LeaveBalance).where(
-                        LeaveBalance.keycloak_user_id == user_id,
-                        LeaveBalance.year == yr,
-                        LeaveBalance.month.is_(None),
-                    )
-                ).scalars().first()
-        else:
-            balance_doc = self.balance_db.db.execute(
-                select(LeaveBalance).where(
-                    LeaveBalance.keycloak_user_id == user_id,
-                    LeaveBalance.year == yr,
-                    LeaveBalance.month.is_(None),
-                )
-            ).scalars().first()
-        
-        stmt = select(Leave.leave_type, func.count(Leave.id)).where(
-            Leave.keycloak_user_id == user_id, 
-            Leave.approval_status == LeaveStatus.APPROVED.value
-        ).group_by(Leave.leave_type)
-        
-        used_cursor = self.leave_db.db.execute(stmt).all()
-        used_map = {row[0]: float(row[1]) for row in used_cursor}
-
-        stmt_pending = select(func.count(Leave.id)).where(
-            Leave.keycloak_user_id == user_id,
-            Leave.approval_status == LeaveStatus.PENDING.value
-        )
-        pending_count = self.leave_db.db.execute(stmt_pending).scalar()
-
-        stats = {
-            "total_earned": balance_doc.total_earned if balance_doc else 0.0,
-            "used_earned": balance_doc.used_earned if balance_doc else 0.0,
-            "total_paid": balance_doc.accrued_compoff if balance_doc else 0.0,
-            "used_paid": balance_doc.consumed_compoff if balance_doc else 0.0,
-            "total_unpaid": 0,
-            "used_unpaid": used_map.get(LeaveType.UPL.value, 0.0),
-            "pending_applications": pending_count or 0,
-            "year": yr,
-            "month": month or mo,
-        }
-        return stats
-
-    async def get_leave_balance(self, user_id: str) -> Dict[str, Any]:
-        today = date.today()
-
-        balance_doc = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == user_id,
-                LeaveBalance.year == today.year,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-        if not balance_doc:
-            balance_doc = self.balance_db.db.execute(
-                select(LeaveBalance).where(
-                    LeaveBalance.keycloak_user_id == user_id,
-                    LeaveBalance.year == today.year,
-                ).order_by(LeaveBalance.month.desc())
-            ).scalars().first()
-
-        el_accrued = float(balance_doc.total_earned) if balance_doc and balance_doc.total_earned else 0.0
-        co_accrued = float(balance_doc.accrued_compoff) if balance_doc and balance_doc.accrued_compoff else 0.0
-
-        leaves = self.leave_db.db.execute(
-            select(Leave).where(
-                Leave.keycloak_user_id == user_id,
-                Leave.approval_status == LeaveStatus.APPROVED.value,
-                Leave.start_date >= date(today.year, 1, 1),
-                Leave.end_date <= today,
-            )
-        ).scalars().all()
-
-        el_used = 0.0
-        co_used = 0.0
-        upl_used = 0.0
-        for lv in leaves:
-            days = (lv.end_date - lv.start_date).days + 1
-            if lv.leave_type == LeaveType.EL.value:
-                el_used += days
-            elif lv.leave_type == LeaveType.PL.value:
-                co_used += days
-            elif lv.leave_type == LeaveType.UPL.value:
-                upl_used += days
-
-        el_balance = el_accrued - el_used
-        co_balance = co_accrued - co_used
-
-        emp = self.leave_db.db.execute(
-            select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
-        ).scalars().first()
-
-        return {
-            "employee_id": emp.employee_id if emp else None,
-            "as_of_date": today.isoformat(),
-            "earned_leave": {"accrued": el_accrued, "availed": el_used, "balance": el_balance},
-            "comp_off": {"accrued": co_accrued, "availed": co_used, "balance": co_balance},
-            "unpaid_leave": upl_used,
-            "total_available_leave": el_balance + co_balance - upl_used,
-        }
-
     @staticmethod
     def _fiscal_year_for(d: date) -> int:
-        return d.year if d.month >= 4 else d.year - 1
+        return fiscal_year_for(d)
 
-    @staticmethod
-    def _leave_codes_for_type(code: str) -> list:
-        # Old leaves table stored comp-off as "PL"; new leave_types uses "CO"
-        if code == "CO":
-            return ["CO", "PL"]
-        return [code]
+    def _compute_apply_balance(self, user_id: str, lt: LeaveTypeConfig, start_date: date, requested_days: int) -> Dict[str, Any]:
+        return apply_balance(self.leave_db.db, user_id, lt, start_date, requested_days)
+
+    def _balance_for_code(self, user_id: str, code: str, fiscal_year: int) -> Dict[str, float]:
+        return balance_for(self.leave_db.db, user_id, code, fiscal_year)
 
     def _build_leave_balance_grid(self, emp, fiscal_year: int) -> Dict[str, Any]:
         types = self.leave_db.db.execute(
@@ -1003,16 +890,7 @@ class LeaveBusinessService:
             for m in monthly:
                 monthly_map.setdefault(m.leave_balance_id, []).append(m)
 
-        # derive availed (approved leaves within current fiscal year, up to today)
-        fiscal_start = date(fiscal_year, 4, 1)
-        leaves = self.leave_db.db.execute(
-            select(Leave).where(
-                Leave.keycloak_user_id == user_id,
-                Leave.approval_status == LeaveStatus.APPROVED.value,
-                Leave.start_date >= fiscal_start,
-                Leave.end_date <= today,
-            )
-        ).scalars().all()
+        # derive availed (all consumed leave days in the fiscal year, any date)
 
         result = []
         total_available = 0.0
@@ -1023,11 +901,8 @@ class LeaveBusinessService:
             monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
             total = carry + adj + monthly_total
 
-            codes = self._leave_codes_for_type(t.code)
-            availed = sum(
-                (lv.end_date - lv.start_date).days + 1
-                for lv in leaves if lv.leave_type in codes
-            )
+            codes = leave_codes_for_type(t.code)
+            availed = availed_days(self.leave_db.db, user_id, codes, fiscal_year)
             balance = total - availed
             result.append({"code": t.code, "name": t.name, "total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)})
             total_available += balance
@@ -1131,19 +1006,7 @@ class LeaveBusinessService:
             select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
         ).scalars().all()
 
-        fiscal_start = date(fiscal_year, 4, 1)
         today = date.today()
-        leaves = self.leave_db.db.execute(
-            select(Leave).where(
-                Leave.keycloak_user_id.in_(user_ids),
-                Leave.approval_status == LeaveStatus.APPROVED.value,
-                Leave.start_date >= fiscal_start,
-                Leave.end_date <= today,
-            )
-        ).scalars().all()
-        leave_map = {}
-        for lv in leaves:
-            leave_map.setdefault(lv.keycloak_user_id, []).append(lv)
 
         records = []
         for e in employees:
@@ -1157,8 +1020,8 @@ class LeaveBusinessService:
                 adj = float(b.adjustment) if b and b.adjustment else 0.0
                 monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
                 total = carry + adj + monthly_total
-                codes = self._leave_codes_for_type(t.code)
-                availed = sum((lv.end_date - lv.start_date).days + 1 for lv in leave_map.get(uid, []) if lv.leave_type in codes)
+                codes = leave_codes_for_type(t.code)
+                availed = availed_days(self.leave_db.db, uid, codes, fiscal_year)
                 balance = total - availed
                 type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
                 total_available += balance
@@ -1221,16 +1084,6 @@ class LeaveBusinessService:
             for m in monthly:
                 monthly_map.setdefault(m.leave_balance_id, []).append(m)
 
-        fiscal_start = date(fiscal_year, 4, 1)
-        leaves = self.leave_db.db.execute(
-            select(Leave).where(
-                Leave.keycloak_user_id == user_id,
-                Leave.approval_status == LeaveStatus.APPROVED.value,
-                Leave.start_date >= fiscal_start,
-                Leave.end_date <= today,
-            )
-        ).scalars().all()
-
         type_summary = {}
         total_available = 0.0
         for t in types:
@@ -1239,8 +1092,8 @@ class LeaveBusinessService:
             adj = float(b.adjustment) if b and b.adjustment else 0.0
             monthly_total = sum(float(m.accrued or 0) for m in monthly_map.get(b.id, [])) if b else 0.0
             total = carry + adj + monthly_total
-            codes = self._leave_codes_for_type(t.code)
-            availed = sum((lv.end_date - lv.start_date).days + 1 for lv in leaves if lv.leave_type in codes)
+            codes = leave_codes_for_type(t.code)
+            availed = availed_days(self.leave_db.db, user_id, codes, fiscal_year)
             balance = total - availed
             type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
             total_available += balance
@@ -1260,14 +1113,11 @@ class LeaveBusinessService:
 
     async def approve_leave(self, leave_id: str, current_user: dict) -> bool:
         """
-        Approve a leave application with balance validation.
-        
-        Checks:
-        - EL (Earned Leave): total_earned - used_earned >= requested days
-        - PL (Comp Off)    : accrued_compoff - consumed_compoff >= requested days
-        - UPL (Unpaid)     : no balance check needed
-        
-        On approval, updates leave_balances to consume the leave credit.
+        Approve a leave application.
+
+        Balance is derived on read: the leave's status becomes 'approved' and
+        therefore counts as used in every balance computation, so no explicit
+        deduction step is needed here.
         """
         leave = self.leave_db.fetch_one(Leave, id=leave_id)
         if not leave:
@@ -1292,22 +1142,12 @@ class LeaveBusinessService:
             if not sql.check_project_access(pm_user["id"], tr_user["id"]):
                 raise HTTPException(status_code=403, detail="You can only approve leaves for resources in your projects.")
 
-        # ── Calculate requested leave days ─────────────────────────────────
-        requested_days = (leave.end_date - leave.start_date).days + 1
-        balance = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-
-        # ── Balance check (info only, no block) ────────────────────────────
-        leave_type = leave.leave_type
-
         # ── Mark leave as approved ─────────────────────────────────────────
+        # Balance is derived on read: an approved leave automatically counts
+        # as used in every balance computation, so no explicit deduction here.
         now = datetime.utcnow()
         actor_email = current_user.get("email")
-        
+
         self.leave_db.update(
             Leave, leave_id, 
             approval_status=LeaveStatus.APPROVED.value, 
@@ -1315,15 +1155,6 @@ class LeaveBusinessService:
             approved_at=now, 
             approved_by=actor_email,
         )
-
-        # ── Update leave balance (consume credit) ──────────────────────────
-        # NOTE: Auto-deduction disabled — balance managed manually via admin panel.
-        # Uncomment below to re-enable automatic balance deduction on approval.
-        # if balance:
-        #     if leave_type == LeaveType.EL.value:
-        #         self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
-        #     elif leave_type == LeaveType.PL.value:
-        #         self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
 
         self._send_email_bg(
             email_service.send_leave_approved,
@@ -1501,7 +1332,6 @@ class LeaveBusinessService:
         }
 
     async def _do_approve(self, leave_id: str, leave, current_user: dict) -> None:
-        requested_days = (leave.end_date - leave.start_date).days + 1
         now = datetime.utcnow()
         actor_email = current_user.get("email")
         self.leave_db.update(
@@ -1509,20 +1339,6 @@ class LeaveBusinessService:
             approval_status=LeaveStatus.APPROVED.value,
             updated_at=now, approved_at=now, approved_by=actor_email,
         )
-        balance = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
-                LeaveBalance.year == leave.start_date.year,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-        # NOTE: Auto-deduction disabled — balance managed manually via admin panel.
-        # Uncomment below to re-enable automatic balance deduction on batch approval.
-        # if balance:
-        #     if leave.leave_type == LeaveType.EL.value:
-        #         self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) + requested_days, updated_at=now)
-        #     elif leave.leave_type == LeaveType.PL.value:
-        #         self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) + requested_days, updated_at=now)
 
     async def _do_reject(self, leave_id: str, leave, current_user: dict) -> None:
         now = datetime.utcnow()
@@ -1540,33 +1356,11 @@ class LeaveBusinessService:
         now = datetime.utcnow()
         actor_email = current_user.get("email")
 
-        # NOTE: Auto-restore disabled — balance managed manually via admin panel.
-        # Uncomment below to re-enable automatic balance reversal on cancellation.
-        # if leave.approval_status == LeaveStatus.APPROVED.value:
-        #     self._reverse_balance(leave)
-
         self.leave_db.update(
             Leave, leave_id,
             approval_status=LeaveStatus.CANCELLED.value,
             updated_at=now, cancelled_at=now, cancelled_by=actor_email,
         )
-
-    def _reverse_balance(self, leave) -> None:
-        requested_days = (leave.end_date - leave.start_date).days + 1
-        balance = self.balance_db.db.execute(
-            select(LeaveBalance).where(
-                LeaveBalance.keycloak_user_id == leave.keycloak_user_id,
-                LeaveBalance.year == leave.start_date.year,
-                LeaveBalance.month.is_(None),
-            )
-        ).scalars().first()
-        if not balance:
-            return
-        now = datetime.utcnow()
-        if leave.leave_type == LeaveType.EL.value:
-            self.balance_db.update(LeaveBalance, balance.id, used_earned=(balance.used_earned or 0) - requested_days, updated_at=now)
-        elif leave.leave_type == LeaveType.PL.value:
-            self.balance_db.update(LeaveBalance, balance.id, consumed_compoff=(balance.consumed_compoff or 0) - requested_days, updated_at=now)
 
     def _validate_cancel_date(self, leave) -> tuple[bool, str | None]:
         today = date.today()
@@ -1650,33 +1444,19 @@ class LeaveBusinessService:
             emp = emp_map.get(r.user_email)
             d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
             d["userDesignation"] = emp.designation if emp else None
-            balance = self.balance_db.db.execute(
-                select(LeaveBalance).where(
-                    LeaveBalance.keycloak_user_id == r.keycloak_user_id,
-                    LeaveBalance.year == r.start_date.year,
-                    LeaveBalance.month.is_(None),
-                )
-            ).scalars().first()
             requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
             d["requested_days"] = requested_days
+            fiscal_year = self._fiscal_year_for(r.start_date)
             d["balance"] = {
-                "EL": {
-                    "total": balance.total_earned if balance else 0,
-                    "used": balance.used_earned if balance else 0,
-                    "remaining": (balance.total_earned or 0) - (balance.used_earned or 0) if balance else 0,
-                },
-                "CompOff": {
-                    "total": balance.accrued_compoff if balance else 0,
-                    "used": balance.consumed_compoff if balance else 0,
-                    "remaining": (balance.accrued_compoff or 0) - (balance.consumed_compoff or 0) if balance else 0,
-                },
-                "Unpaid": {
-                    "total": 0,
-                    "used": balance.unpaid if balance else 0,
-                    "remaining": 0,
-                },
+                "EL": self._balance_for_code(r.keycloak_user_id, "EL", fiscal_year),
+                "CompOff": self._balance_for_code(r.keycloak_user_id, "CO", fiscal_year),
+                "Unpaid": self._balance_for_code(r.keycloak_user_id, "UPL", fiscal_year),
             }
             pending.append(d)
+
+        name_map = self._leave_type_name_map()
+        for d in pending:
+            d["leave_type_name"] = self._leave_type_display_name(d.get("leave_type"), name_map)
 
         return pending
 
@@ -1750,40 +1530,19 @@ class LeaveBusinessService:
             emp = emp_map.get(r.user_email)
             d["userName"] = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
             d["userDesignation"] = emp.designation if emp else None
-            balance = self.balance_db.db.execute(
-                select(LeaveBalance).where(
-                    LeaveBalance.keycloak_user_id == r.keycloak_user_id,
-                    LeaveBalance.year == r.start_date.year,
-                    LeaveBalance.month.is_(None),
-                )
-            ).scalars().first()
-            if not balance:
-                balance = self.balance_db.db.execute(
-                    select(LeaveBalance).where(
-                        LeaveBalance.keycloak_user_id == r.keycloak_user_id,
-                        LeaveBalance.year == r.start_date.year,
-                    ).order_by(LeaveBalance.month.desc())
-                ).scalars().first()
             requested_days = len(r.leave_dates) if r.leave_dates else (r.end_date - r.start_date).days + 1
             d["requested_days"] = requested_days
+            fiscal_year = self._fiscal_year_for(r.start_date)
             d["balance"] = {
-                "EL": {
-                    "total": balance.total_earned if balance else 0,
-                    "used": balance.used_earned if balance else 0,
-                    "remaining": (balance.total_earned or 0) - (balance.used_earned or 0) if balance else 0,
-                },
-                "CompOff": {
-                    "total": balance.accrued_compoff if balance else 0,
-                    "used": balance.consumed_compoff if balance else 0,
-                    "remaining": (balance.accrued_compoff or 0) - (balance.consumed_compoff or 0) if balance else 0,
-                },
-                "Unpaid": {
-                    "total": 0,
-                    "used": balance.unpaid if balance else 0,
-                    "remaining": 0,
-                },
+                "EL": self._balance_for_code(r.keycloak_user_id, "EL", fiscal_year),
+                "CompOff": self._balance_for_code(r.keycloak_user_id, "CO", fiscal_year),
+                "Unpaid": self._balance_for_code(r.keycloak_user_id, "UPL", fiscal_year),
             }
             records.append(d)
+
+        name_map = self._leave_type_name_map()
+        for d in records:
+            d["leave_type_name"] = self._leave_type_display_name(d.get("leave_type"), name_map)
 
         if search:
             term = (search or "").strip().lower()[:100]
@@ -1895,10 +1654,6 @@ class LeaveBusinessService:
                 raise HTTPException(status_code=403, detail="Not authorized to approve cancellation for this user")
 
         now = datetime.utcnow()
-
-        # NOTE: Auto-restore disabled — balance managed manually via admin panel.
-        # Uncomment below to re-enable automatic balance reversal on cancellation approval.
-        # self._reverse_balance(leave)
 
         self.leave_db.update(
             Leave, leave_id,
@@ -2022,8 +1777,6 @@ class LeaveBusinessService:
                     continue
 
             if action == "approve_cancel":
-                # NOTE: Auto-restore disabled — balance managed manually via admin panel.
-                # self._reverse_balance(leave)
                 self.leave_db.update(
                     Leave, leave_id,
                     approval_status=LeaveStatus.CANCELLED.value,

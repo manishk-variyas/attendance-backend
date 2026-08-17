@@ -11,6 +11,7 @@ from app.models.employee_master import EmployeeMaster
 from app.models.office_location import OfficeLocation
 from app.models.holiday import Holiday
 from app.models.leave import Leave
+from app.models.leave_type import LeaveTypeConfig
 from app.models.attendance import Attendance
 from app.models.system_setting import SystemSetting
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
@@ -31,6 +32,19 @@ def _lookup_attendance(att_map: dict, keycloak_user_id: str, shift_date: date, s
     if a and (shift_code is None or a.shift_code == shift_code):
         return a
     return None
+
+
+def _leave_type_name_map(db: Session) -> dict:
+    types = db.query(LeaveTypeConfig).all()
+    return {t.code: t.name for t in types}
+
+
+def _leave_type_display_name(code: str, name_map: dict) -> str:
+    if code in name_map:
+        return name_map[code]
+    if code == "PL" and "CO" in name_map:
+        return name_map["CO"]
+    return code
 
 
 class ShiftService:
@@ -271,6 +285,8 @@ class ShiftService:
             Leave.end_date >= min_date,
         ).all()
 
+        name_map = _leave_type_name_map(db)
+
         result = []
         for s in shifts:
             sd = sd_map.get(s.shift_code)
@@ -322,6 +338,8 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveTypeId": str(leave.leave_type_id) if leave and leave.leave_type_id else None,
+                "leaveTypeName": _leave_type_display_name(leave.leave_type, name_map) if leave else None,
                 "leaveId": str(leave.id) if leave else None,
                 "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
@@ -368,6 +386,8 @@ class ShiftService:
                         "workStatus": None, "status": "on_leave",
                         "workAddress": None, "pincode": None,
                         "leaveType": lv.leave_type,
+                        "leaveTypeId": str(lv.leave_type_id) if lv.leave_type_id else None,
+                        "leaveTypeName": _leave_type_display_name(lv.leave_type, name_map),
                         "perDiemEligible": False, "conveyanceEligible": False,
                         "date": current.isoformat(),
                         "dayName": current.strftime("%A"),
@@ -422,6 +442,8 @@ class ShiftService:
             Leave.start_date <= max_date,
             Leave.end_date >= min_date,
         ).all()
+
+        name_map = _leave_type_name_map(db)
 
         emp_map = {}
         if shift_user_emails:
@@ -480,6 +502,8 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveTypeId": str(leave.leave_type_id) if leave and leave.leave_type_id else None,
+                "leaveTypeName": _leave_type_display_name(leave.leave_type, name_map) if leave else None,
                 "leaveId": str(leave.id) if leave else None,
                 "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
@@ -526,6 +550,8 @@ class ShiftService:
                             "shift": None, "workStatus": None, "status": "on_leave",
                             "workAddress": None, "pincode": None,
                             "leaveType": lv.leave_type,
+                            "leaveTypeId": str(lv.leave_type_id) if lv.leave_type_id else None,
+                            "leaveTypeName": _leave_type_display_name(lv.leave_type, name_map),
                             "leaveId": str(lv.id),
                             "leaveStatus": "on_leave",
                             "perDiemEligible": False, "conveyanceEligible": False,
@@ -596,6 +622,8 @@ class ShiftService:
             Leave.end_date >= min_date,
         ).all()
 
+        name_map = _leave_type_name_map(db)
+
         kemp_map = {}
         if user_ids:
             kemps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(user_ids)).all()
@@ -653,6 +681,8 @@ class ShiftService:
                 "workAddress": s.work_address,
                 "pincode": s.pincode,
                 "leaveType": leave.leave_type if leave else None,
+                "leaveTypeId": str(leave.leave_type_id) if leave and leave.leave_type_id else None,
+                "leaveTypeName": _leave_type_display_name(leave.leave_type, name_map) if leave else None,
                 "leaveId": str(leave.id) if leave else None,
                 "leaveStatus": "on_leave" if leave else None,
                 "perDiemEligible": s.per_diem_eligible,
@@ -700,6 +730,8 @@ class ShiftService:
                         "workStatus": None, "status": "on_leave",
                         "workAddress": None, "pincode": None,
                         "leaveType": lv.leave_type,
+                        "leaveTypeId": str(lv.leave_type_id) if lv.leave_type_id else None,
+                        "leaveTypeName": _leave_type_display_name(lv.leave_type, name_map),
                         "leaveStatus": "on_leave",
                         "perDiemEligible": False, "conveyanceEligible": False,
                         "date": current.isoformat(),

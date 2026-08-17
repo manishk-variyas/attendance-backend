@@ -20,7 +20,7 @@ class LeaveStatus(str, Enum):
 class LeaveApplyRequest(BaseModel):
     start_date: datetime
     end_date: datetime
-    leave_type: LeaveType
+    leave_type: str = Field(..., min_length=1, max_length=20)
     reason: Optional[str] = None
     comment: Optional[str] = None
     is_traveling: Optional[bool] = None
@@ -28,6 +28,11 @@ class LeaveApplyRequest(BaseModel):
     resuming_date: Optional[datetime] = None
     leave_dates: Optional[List[datetime]] = None
     approver_id: Optional[int] = None
+
+    @field_validator("leave_type")
+    @classmethod
+    def upper_leave_type(cls, v: str) -> str:
+        return v.strip().upper()
 
 class LeaveHistoryItem(BaseModel):
     id: str
@@ -37,7 +42,9 @@ class LeaveHistoryItem(BaseModel):
     userDesignation: Optional[str] = None
     start_date: datetime
     end_date: datetime
-    leave_type: LeaveType
+    leave_type: str
+    leave_type_id: Optional[str] = None
+    leave_type_name: Optional[str] = None
     reason: Optional[str] = None
     comment: Optional[str] = None
     is_traveling: Optional[bool] = None
@@ -61,32 +68,6 @@ class LeaveHistoryItem(BaseModel):
     cancellation_rejected_by: Optional[str] = None
     cancellation_rejection_remark: Optional[str] = None
     cancellation_attempts: Optional[int] = None
-
-class LeaveStats(BaseModel):
-    total_earned: float = 0.0
-    used_earned: float = 0.0
-    total_paid: float = 0.0
-    used_paid: float = 0.0
-    total_unpaid: float = 0.0
-    used_unpaid: float = 0.0
-    pending_applications: int = 0
-    year: Optional[int] = None
-    month: Optional[int] = None
-
-
-class LeaveBalanceItem(BaseModel):
-    accrued: float = 0.0
-    availed: float = 0.0
-    balance: float = 0.0
-
-
-class LeaveBalanceSummary(BaseModel):
-    employee_id: Optional[str] = None
-    as_of_date: str
-    earned_leave: LeaveBalanceItem
-    comp_off: LeaveBalanceItem
-    unpaid_leave: float = 0.0
-    total_available_leave: float = 0.0
 
 class HolidayType(str, Enum):
     GAZETTED = "GAZETTED"
@@ -130,48 +111,6 @@ class BatchCancelLeaveRejectRequest(BaseModel):
     remark: str = Field(..., min_length=1, max_length=1000, description="Reason for rejecting the cancellation requests")
 
 
-class LeaveBalanceCreate(BaseModel):
-    user_email: Optional[str] = Field(None, description="Employee email")
-    keycloak_user_id: Optional[str] = Field(None, description="Employee keycloak ID")
-    year: int = Field(default_factory=lambda: datetime.now().year, ge=2000)
-    month: Optional[int] = Field(None, ge=1, le=12)
-    total_earned: float = 12.0
-    used_earned: float = 0.0
-    accrued_compoff: float = 0.0
-    consumed_compoff: float = 0.0
-    unpaid: float = 0.0
-
-
-class LeaveBalanceUpdate(BaseModel):
-    year: Optional[int] = None
-    month: Optional[int] = Field(None, ge=1, le=12)
-    total_earned: Optional[float] = None
-    used_earned: Optional[float] = None
-    accrued_compoff: Optional[float] = None
-    consumed_compoff: Optional[float] = None
-    unpaid: Optional[float] = None
-
-
-class LeaveBalanceResponse(BaseModel):
-    id: str
-    keycloak_user_id: str
-    year: int
-    month: Optional[int] = None
-    userName: Optional[str] = None
-    userDesignation: Optional[str] = None
-    total_earned: float
-    used_earned: float
-    accrued_compoff: float
-    consumed_compoff: float
-    unpaid: float
-    modified_by: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
 class LeaveTypeCreate(BaseModel):
     code: str = Field(..., min_length=1, max_length=20)
     name: str = Field(..., min_length=1, max_length=100)
@@ -212,6 +151,13 @@ class LeaveTypeResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class LeaveTypeOption(BaseModel):
+    id: str
+    code: str
+    name: str
+    is_paid: bool
 
 
 class LeaveTypeBalanceEntry(BaseModel):

@@ -178,10 +178,10 @@ async def get_profile_picture(
 
 @router.post("/me/profile-picture")
 async def upload_profile_picture(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
+    db: Session = Depends(get_db),
+    file: UploadFile = File(...),
 ):
     if not file.content_type or file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=400, detail="Only JPEG, PNG, and WebP images are allowed.")

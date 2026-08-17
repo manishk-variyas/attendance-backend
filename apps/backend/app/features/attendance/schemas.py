@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import List, Optional
 from datetime import datetime
 
 
@@ -16,6 +16,13 @@ class CheckOutRequest(BaseModel):
     clientTimestamp: Optional[datetime] = None
     date: Optional[str] = Field(None, description="YYYY-MM-DD for next-day checkout, defaults to today")
     remarks: Optional[str] = Field(None, max_length=100)
+
+
+class ShiftCheckInRequest(BaseModel):
+    shiftId: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    clientTimestamp: Optional[datetime] = None
 
 
 class AttendanceResponse(BaseModel):
@@ -123,3 +130,24 @@ class TodayAttendanceResponse(BaseModel):
     shift: Optional[TodayShiftInfo] = None
     attendance: Optional[TodayAttendance] = None
     remainingHours: Optional[float] = None
+
+
+class TodayShiftEntry(BaseModel):
+    shiftId: Optional[str] = None
+    shift_code: Optional[str] = None
+    shift_name: Optional[str] = None
+    date: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    work_location_status: Optional[str] = None
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
+    status: str
+    attendance: Optional[TodayAttendance] = None
+    remainingHours: Optional[float] = None
+
+
+class TodayShiftsResponse(BaseModel):
+    status: str
+    date: str
+    shifts: List[TodayShiftEntry]

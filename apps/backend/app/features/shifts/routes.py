@@ -12,11 +12,12 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftResponse, ShiftStats, ShiftHistoryItem, ShiftDefinitionCreate, ShiftDefinitionResponse
+from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftStats, ShiftDefinitionCreate, ShiftDefinitionResponse
 from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
 from app.middleware.logging import _get_client_ip
 from app.models.leave import Leave
+from app.models.leave_type import LeaveTypeConfig
 from app.models.shift import Shift
 from app.models.employee_master import EmployeeMaster
 from app.models.holiday import Holiday
@@ -465,6 +466,15 @@ async def get_shifts_by_range(
             Leave.approval_status == "approved",
         ).order_by(Leave.start_date)
         leaves = [lv.to_dict() for lv in db.execute(stmt).scalars().all()]
+        if leaves:
+            lt_types = db.query(LeaveTypeConfig).all()
+            ltype_map = {t.code: t.name for t in lt_types}
+            for lv in leaves:
+                code = lv.get("leave_type")
+                name = ltype_map.get(code)
+                if name is None and code == "PL":
+                    name = ltype_map.get("CO")
+                lv["leave_type_name"] = name or code
 
     timeline = {}
     for s in shifts:

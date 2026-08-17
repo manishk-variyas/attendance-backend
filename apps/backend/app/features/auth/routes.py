@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db, SessionLocal
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub
+from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user, get_keycloak_user_by_email
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.models.employee_master import EmployeeMaster
@@ -159,8 +159,8 @@ async def refresh_session_endpoint(
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="No session")
 
-    # Look up the session in the database
-    session_data = await get_session(old_session_id)
+    # Look up the session in the database (refresh must not reset idle clock)
+    session_data = await get_session(old_session_id, touch_activity=False)
     if not session_data:
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="Session not found")
@@ -192,7 +192,9 @@ async def refresh_session_endpoint(
     }
 
     # Create new session with new refresh token, delete old session
-    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True))
+    # Preserve last_activity_at so the idle clock survives the rotation.
+    old_last_activity = await get_session_last_activity(old_session_id)
+    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True), last_activity_at=old_last_activity)
     await delete_session(old_session_id)
 
     log_session_refresh(correlation_id, username=user_data.get("username"), success=True, client_ip=client_ip)
@@ -209,6 +211,19 @@ async def refresh_session_endpoint(
         path="/",
     )
     return response
+
+
+@router.post("/activity")
+@limiter.limit("30/minute")
+async def activity(request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Activity heartbeat — resets the backend idle clock for an active user.
+
+    The client calls this (throttled) on real user activity so an idle
+    session is not prematurely expired while the user is on the page but
+    making no other API calls. Requires a valid session (401 otherwise).
+    """
+    return {"ok": True}
 
 
 @router.post("/logout")

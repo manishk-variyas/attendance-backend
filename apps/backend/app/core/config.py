@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = ""  # Set via .env — no hardcoded default
     ALGORITHM: str = "HS256"  # JWT signing algorithm
     SESSION_EXPIRE_HOURS: int = 24  # How long sessions last in hours
+    SESSION_IDLE_TIMEOUT_MINUTES: int = 15  # Sliding idle window before auto-logout
+    SESSION_ACTIVITY_FLUSH_SECONDS: int = 60  # Throttle last-activity writes
 
     # URLs for different services
     BACKEND_URL: str = "http://localhost:8000"  # This backend's public URL

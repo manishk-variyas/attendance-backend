@@ -17,7 +17,8 @@ async def active_employee_middleware(request: Request, call_next) -> Response:
     if not session_id:
         return await call_next(request)
 
-    session_data = await get_session(session_id)
+    # Keepalive refresh must NOT reset the idle clock — only real activity does.
+    session_data = await get_session(session_id, touch_activity=(path != "/auth/refresh"))
     if not session_data:
         return await call_next(request)
 
