@@ -74,6 +74,15 @@ def _run_migrations():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='background_content_type') THEN
                     ALTER TABLE system_settings ADD COLUMN background_content_type VARCHAR(100);
                 END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='background_overlay_color') THEN
+                    ALTER TABLE system_settings ADD COLUMN background_overlay_color VARCHAR(7);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='trademark') THEN
+                    ALTER TABLE system_settings ADD COLUMN trademark VARCHAR(255) DEFAULT 'Variyas Labs Private Limited';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='website_url') THEN
+                    ALTER TABLE system_settings ADD COLUMN website_url VARCHAR(255) DEFAULT 'https://variyaslabs.com';
+                END IF;
             END $$;
         """))
         conn.commit()

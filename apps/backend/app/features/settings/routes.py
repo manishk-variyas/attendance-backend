@@ -13,6 +13,7 @@ from datetime import datetime, timezone, date, time
 import hashlib
 import io
 import logging
+import colorsys
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,9 @@ MAX_IMAGE_PIXELS = 25_000_000
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
-def _process_image_upload(upload: UploadFile, max_dims: tuple[int, int]) -> tuple[bytes, str]:
-    """Validate, sanitize and resize an uploaded image. Returns (jpeg_bytes, content_type)."""
+def _process_image_upload(upload: UploadFile, max_dims: tuple[int, int]) -> tuple[bytes, str, str]:
+    """Validate, sanitize and resize an uploaded image.
+    Returns (jpeg_bytes, content_type, overlay_color_hex)."""
     if not upload.content_type or not upload.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image files are allowed.")
     if upload.size is not None and upload.size > MAX_IMAGE_SIZE_BYTES:
@@ -48,22 +50,66 @@ def _process_image_upload(upload: UploadFile, max_dims: tuple[int, int]) -> tupl
     img.thumbnail(max_dims, Image.LANCZOS)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
+    overlay = _extract_overlay_color(img)
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=85, optimize=True)
-    return out.getvalue(), "image/jpeg"
+    return out.getvalue(), "image/jpeg", overlay
+
+
+def _extract_overlay_color(img: Image.Image) -> str:
+    """Derive a natural, muted overlay color from an image.
+
+    Finds the dominant color, then softens it (lower saturation) and darkens it
+    so white text stays readable without a harsh, forced tint. Returns '#rrggbb'.
+    """
+    thumb = img.resize((64, 64), Image.LANCZOS).convert("RGB")
+
+    try:
+        palette_img = thumb.quantize(colors=6, method=Image.MEDIANCUT)
+        counts = palette_img.getcolors(64 * 64)
+    except Exception:
+        counts = None
+
+    if not counts:
+        pixels = list(thumb.getdata())
+        n = len(pixels) or 1
+        dominant = (
+            sum(p[0] for p in pixels) // n,
+            sum(p[1] for p in pixels) // n,
+            sum(p[2] for p in pixels) // n,
+        )
+    else:
+        counts.sort(key=lambda c: c[0], reverse=True)
+        palette_index = counts[0][1]
+        palette = palette_img.getpalette()
+        dominant = tuple(palette[palette_index * 3: palette_index * 3 + 3])
+
+    r, g, b = (c / 255.0 for c in dominant)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    s = s * 0.40          # mute saturation so the tint feels natural
+    l = l * 0.30 + 0.18   # pull lightness toward a dark, readable base
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return "#{:02x}{:02x}{:02x}".format(
+        int(round(r2 * 255)), int(round(g2 * 255)), int(round(b2 * 255))
+    )
 
 @router.get("")
 async def get_settings(db: Session = Depends(get_db)):
     svc = SystemSettingService(db)
     doc = svc.fetch()
     if not doc:
-        return {"id": "company", "company_name": "", "logo_url": "", "background_url": ""}
+        return {"id": "company", "company_name": "", "logo_url": "", "background_url": "",
+                "background_overlay_color": "#1a2332",
+                "trademark": "Variyas Labs Private Limited", "website_url": "https://variyaslabs.com"}
     version = int(doc.updated_at.timestamp()) if doc.updated_at else 0
     return {
         "id": "company",
         "company_name": doc.company_name,
         "logo_url": f"/api/settings/logo?v={version}",
         "background_url": f"/api/settings/background?v={version}",
+        "background_overlay_color": doc.background_overlay_color or "#1a2332",
+        "trademark": doc.trademark,
+        "website_url": doc.website_url,
         "default_shift_start_time": doc.default_shift_start_time.isoformat() if doc.default_shift_start_time else None,
         "default_shift_end_time": doc.default_shift_end_time.isoformat() if doc.default_shift_end_time else None,
         "default_timezone": doc.default_timezone,
@@ -125,10 +171,16 @@ async def update_settings(
     auto_checkout_enabled: bool = Form(None),
     auto_checkout_cutoff_time: str = Form(None),
     incorporation_date: str = Form(None),
+    trademark: str = Form(None),
+    website_url: str = Form(None),
     db: Session = Depends(get_db),
 ):
     if len(company_name) > 255:
         raise HTTPException(status_code=400, detail="Company name must be at most 255 characters.")
+    if trademark is not None and len(trademark.strip()) > 255:
+        raise HTTPException(status_code=400, detail="Trademark must be at most 255 characters.")
+    if website_url is not None and len(website_url.strip()) > 255:
+        raise HTTPException(status_code=400, detail="Website URL must be at most 255 characters.")
     if grace_minutes is not None and (grace_minutes < 1 or grace_minutes > 120):
         raise HTTPException(status_code=400, detail="Grace minutes must be between 1 and 120.")
     if checkout_reminder_grace_hours is not None and (checkout_reminder_grace_hours < 1 or checkout_reminder_grace_hours > 24):
@@ -151,7 +203,7 @@ async def update_settings(
 
     logo_content_type = None
     if logo and logo.filename:
-        content, logo_content_type = _process_image_upload(logo, (600, 200))
+        content, logo_content_type, _ = _process_image_upload(logo, (600, 200))
         await storage_service.upload_file(
             content, LOGO_OBJECT_NAME,
             bucket_name=ASSETS_BUCKET,
@@ -159,8 +211,9 @@ async def update_settings(
         )
 
     background_content_type = None
+    background_overlay_color = None
     if background and background.filename:
-        content, background_content_type = _process_image_upload(background, (1920, 1080))
+        content, background_content_type, background_overlay_color = _process_image_upload(background, (1920, 1080))
         await storage_service.upload_file(
             content, BACKGROUND_OBJECT_NAME,
             bucket_name=ASSETS_BUCKET,
@@ -171,6 +224,7 @@ async def update_settings(
         company_name=company_name,
         logo_content_type=logo_content_type,
         background_content_type=background_content_type,
+        background_overlay_color=background_overlay_color,
         default_shift_start_time=default_shift_start_time,
         default_shift_end_time=default_shift_end_time,
         default_timezone=REDMINE_TO_IANA_TZ.get(default_timezone, default_timezone) if default_timezone else default_timezone,
@@ -179,6 +233,8 @@ async def update_settings(
         auto_checkout_enabled=auto_checkout_enabled if auto_checkout_enabled is not None else None,
         auto_checkout_cutoff_time=auto_checkout_cutoff_time,
         incorporation_date=incorporation_date,
+        trademark=trademark.strip() if trademark is not None else None,
+        website_url=website_url.strip() if website_url is not None else None,
     )
     settings = svc.fetch()
     return settings.to_dict() if settings else {"id": "company", "company_name": company_name}

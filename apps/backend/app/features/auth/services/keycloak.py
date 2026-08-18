@@ -278,6 +278,18 @@ async def get_keycloak_user_by_email(email: str, realm: str | None = None) -> di
     return {"id": u["id"], "username": u.get("username", ""), "email": u.get("email", "")}
 
 
+async def delete_keycloak_user(user_id: str, realm: str | None = None) -> bool:
+    """Permanently delete a Keycloak user via the Admin API."""
+    cfg = _cfg_for(realm)
+    admin_token = await get_admin_token(realm)
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{cfg.admin_base}/users/{user_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    return resp.status_code == 204
+
+
 async def update_keycloak_user(user_id: str, data: dict, realm: str | None = None) -> bool:
     """Update a Keycloak user's profile."""
     cfg = _cfg_for(realm)

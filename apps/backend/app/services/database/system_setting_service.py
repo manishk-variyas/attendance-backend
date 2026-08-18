@@ -20,7 +20,8 @@ class SystemSettingService(BaseService[SystemSetting]):
                default_timezone: str = None, grace_minutes: int = None,
                 checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None,
                 auto_checkout_cutoff_time: str = None,
-                incorporation_date: str = None) -> SystemSetting:
+                incorporation_date: str = None, trademark: str = None,
+                website_url: str = None, background_overlay_color: str = None) -> SystemSetting:
         existing = self.fetch()
         now = datetime.utcnow()
         data = {"company_name": company_name, "updated_at": now}
@@ -28,6 +29,12 @@ class SystemSettingService(BaseService[SystemSetting]):
             data["logo_content_type"] = logo_content_type
         if background_content_type:
             data["background_content_type"] = background_content_type
+        if background_overlay_color is not None:
+            data["background_overlay_color"] = background_overlay_color
+        if trademark is not None:
+            data["trademark"] = trademark
+        if website_url is not None:
+            data["website_url"] = website_url
         if created_by:
             data["created_by"] = created_by
         if updated_by:

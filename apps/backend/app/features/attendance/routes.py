@@ -774,9 +774,9 @@ async def get_today_attendance(
                     s = "shift_ended"
                 return _build_status_response(db, shift_att, today, s)
 
-        # Check for missed check-in email reminder (2 hours after shift start)
+        # Check for missed check-in email reminder (30 minutes after shift start)
         if not shift_att and not on_leave_today and not getattr(shift, "checkin_reminder_sent", False):
-            if now > start_dt + timedelta(hours=2):
+            if now > start_dt + timedelta(minutes=30):
                 user_email = current_user.get("email")
                 if not user_email:
                     emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
@@ -1380,6 +1380,53 @@ def _build_attendance_excel(records: list) -> BytesIO:
     return output
 
 
+def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: int) -> list:
+    flags = []
+    ci = attendance.check_in_time
+    if not ci:
+        return flags
+
+    th = attendance.total_hours
+    if th is not None and float(th) < 4.0:
+        flags.append("half_day")
+
+    tz_str = "Asia/Kolkata"
+    shift_start = sd.start_time if sd else None
+    shift_end = sd.end_time if sd else None
+    if sd:
+        tz_str = sd.timezone or "Asia/Kolkata"
+    if shift and shift.shift_start_time:
+        shift_start = shift.shift_start_time
+    if shift and shift.shift_end_time:
+        shift_end = shift.shift_end_time
+
+    tz = _safe_zone(tz_str)
+    d = attendance.attendance_date
+    if ci.tzinfo is None:
+        ci = ci.replace(tzinfo=tz)
+
+    if shift_start:
+        start_dt = datetime.combine(d, shift_start, tzinfo=tz)
+        if ci < start_dt - timedelta(minutes=grace_minutes):
+            flags.append("early_check_in")
+        elif ci > start_dt + timedelta(minutes=grace_minutes):
+            flags.append("late_check_in")
+
+    co = attendance.check_out_time
+    if shift_end and co:
+        if co.tzinfo is None:
+            co = co.replace(tzinfo=tz)
+        end_dt = datetime.combine(d, shift_end, tzinfo=tz)
+        if shift_start and shift_end <= shift_start:
+            end_dt += timedelta(days=1)
+        if co < end_dt - timedelta(minutes=grace_minutes):
+            flags.append("early_check_out")
+        elif co > end_dt + timedelta(minutes=grace_minutes):
+            flags.append("late_check_out")
+
+    return flags
+
+
 def _get_attendance_paginated(
     db: Session, keycloak_user_ids: List[str],
     from_date: Optional[str] = None, to_date: Optional[str] = None,
@@ -1388,6 +1435,7 @@ def _get_attendance_paginated(
     entry_type: Optional[str] = None, status_filter: Optional[str] = None,
     is_late: Optional[bool] = None,
     search: Optional[str] = None, include_name_search: bool = False,
+    attendance_status: Optional[str] = None,
     sort_by: str = "attendanceDate", sort_dir: str = "asc",
     page: int = 1, page_size: int = 50, export: bool = False,
 ) -> dict:
@@ -1415,6 +1463,11 @@ def _get_attendance_paginated(
         )).filter(Shift.project_id == project_id)
 
     records = query.all()
+
+    grace_minutes = 15
+    company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+    if company and company.grace_minutes:
+        grace_minutes = company.grace_minutes
 
     user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id})
     loc_ids = list({str(r.location_id) for r in records if r.location_id})
@@ -1466,7 +1519,12 @@ def _get_attendance_paginated(
         mb_emps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(modified_by_ids)).all()
         modified_by_map = {e.keycloak_user_id: e for e in mb_emps}
 
-    result = [_to_response_with_email_batched(r, emp_map, loc_map, sd_map, shift_map, leave_map, modified_by_map) for r in records]
+    result = []
+    for r in records:
+        rec = _to_response_with_email_batched(r, emp_map, loc_map, sd_map, shift_map, leave_map, modified_by_map)
+        shift = shift_map.get((r.keycloak_user_id, r.attendance_date))
+        rec["attendanceFlags"] = _compute_attendance_flags(r, shift, sd_map.get(r.shift_code), grace_minutes)
+        result.append(rec)
     covered = {(r.keycloak_user_id, r.attendance_date) for r in records}
 
     if from_date and to_date:
@@ -1508,7 +1566,9 @@ def _get_attendance_paginated(
             if (s.keycloak_user_id, s.date) in covered:
                 continue
             emp = emp_map.get(s.keycloak_user_id)
-            result.append(_build_virtual_record(db, s, emp))
+            vr = _build_virtual_record(db, s, emp)
+            vr["attendanceFlags"] = []
+            result.append(vr)
             covered.add((s.keycloak_user_id, s.date))
 
         for l in leave_list:
@@ -1543,6 +1603,7 @@ def _get_attendance_paginated(
                         "leaveStartDay": l.start_date.strftime("%A") if l.start_date else None,
                         "leaveEndDay": l.end_date.strftime("%A") if l.end_date else None,
                         "endedBy": None, "endedByRole": None,
+                        "attendanceFlags": [],
                     }
                     result.append(record)
                     covered.add((l.keycloak_user_id, current))
@@ -1555,6 +1616,17 @@ def _get_attendance_paginated(
             if include_name_search:
                 fields = ["userName", "userEmail"] + fields
             result = [r for r in result if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+    if attendance_status:
+        wanted = {x.strip().lower().replace(" ", "_") for x in attendance_status.split(",") if x.strip()}
+        if wanted:
+            def _matches(r):
+                tokens = {t.lower().replace(" ", "_") for t in (r.get("attendanceFlags") or [])}
+                ds = (r.get("derivedStatus") or "").lower().replace(" ", "_")
+                if ds:
+                    tokens.add(ds)
+                return bool(wanted & tokens)
+            result = [r for r in result if _matches(r)]
 
     allowed_sort = {"attendanceDate", "checkInTime", "checkOutTime", "workStatus", "totalHours", "userName"}
     sort_by = sort_by if sort_by in allowed_sort else "attendanceDate"
@@ -1590,6 +1662,7 @@ async def get_my_attendance(
     status: Optional[str] = Query(None, description="Filter by status"),
     is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
     search: Optional[str] = Query(None, description="Search shift code, project, office"),
+    attendance_status: Optional[str] = Query(None, description="Comma-separated: half_day, early_check_in, late_check_in, early_check_out, late_check_out"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1603,6 +1676,7 @@ async def get_my_attendance(
         per_diem=per_diem, conveyance=conveyance,
         entry_type=entry_type, status_filter=status, is_late=is_late,
         search=search, include_name_search=False,
+        attendance_status=attendance_status,
         sort_by=sort_by, sort_dir=sort_dir,
         page=page, page_size=page_size, export=export,
     )
@@ -1647,6 +1721,7 @@ async def get_team_attendance(
     status: Optional[str] = Query(None, description="Filter by status"),
     is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
     search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
+    attendance_status: Optional[str] = Query(None, description="Comma-separated: half_day, early_check_in, late_check_in, early_check_out, late_check_out"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1675,6 +1750,7 @@ async def get_team_attendance(
         per_diem=per_diem, conveyance=conveyance,
         entry_type=entry_type, status_filter=status, is_late=is_late,
         search=search, include_name_search=True,
+        attendance_status=attendance_status,
         sort_by=sort_by, sort_dir=sort_dir,
         page=page, page_size=page_size, export=export,
     )

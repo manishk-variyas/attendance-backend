@@ -33,9 +33,9 @@ class UserResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     """Request schema for the login endpoint."""
-    username: str
-    password: str
-    realm: Optional[str] = None  # Optional Keycloak realm; None → default realm
+    username: str = Field(..., min_length=1, max_length=125)
+    password: str = Field(..., min_length=1, max_length=125)
+    realm: Optional[str] = Field(None, max_length=50)  # Optional Keycloak realm; None → default realm
 
 
 class SessionResponse(BaseModel):

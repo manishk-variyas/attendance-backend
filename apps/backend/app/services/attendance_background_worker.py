@@ -111,8 +111,8 @@ def run_attendance_background_sweep():
                 tz = _safe_zone(sd.timezone or "Asia/Kolkata")
                 start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
 
-                # Check if current time > shift_start + 2 hours
-                if now_utc > start_dt + timedelta(hours=2):
+                # Check if current time > shift_start + 30 minutes
+                if now_utc > start_dt + timedelta(minutes=30):
                     # Check if user has an attendance record for this shift date
                     att_exists = db.query(Attendance).filter(
                         and_(

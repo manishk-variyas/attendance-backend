@@ -10,6 +10,9 @@ class SystemSetting(Base):
     company_name = Column(String(255), nullable=False, server_default=text("''"))
     logo_content_type = Column(String(100), nullable=True)
     background_content_type = Column(String(100), nullable=True)
+    background_overlay_color = Column(String(7), nullable=True)
+    trademark = Column(String(255), nullable=True, server_default=text("'Variyas Labs Private Limited'"))
+    website_url = Column(String(255), nullable=True, server_default=text("'https://variyaslabs.com'"))
     created_by = Column(String(255), nullable=True)
     updated_by = Column(String(255), nullable=True)
     default_shift_start_time = Column(Time, nullable=True)
@@ -28,6 +31,9 @@ class SystemSetting(Base):
             "company_name": self.company_name,
             "logo_url": "",
             "background_url": "",
+            "background_overlay_color": self.background_overlay_color,
+            "trademark": self.trademark,
+            "website_url": self.website_url,
             "default_shift_start_time": self.default_shift_start_time.isoformat() if self.default_shift_start_time else None,
             "default_shift_end_time": self.default_shift_end_time.isoformat() if self.default_shift_end_time else None,
             "default_timezone": self.default_timezone,

@@ -5,6 +5,7 @@ from typing import List, Optional
 import io
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
 from datetime import datetime, timezone
 
 from app.core.database import get_db
@@ -14,7 +15,7 @@ from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, Emp
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
 from app.models.office_location import OfficeLocation
 from app.features.redmine.service import redmine_service
-from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user, get_user_realm_roles
+from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user, get_user_realm_roles, delete_keycloak_user
 from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
 from app.utils.storage import storage_service
@@ -904,6 +905,71 @@ async def disonboard_employee(
         "still_onboarded": len(remaining_projects) > 0,
         "remaining_projects": len(remaining_projects),
     }
+
+
+@router.delete("/{employee_id}", status_code=status.HTTP_200_OK)
+async def nuke_employee(
+    employee_id: str,
+    force: bool = Query(False, description="Delete even if the employee is still assigned to projects"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    """Permanently delete an employee everywhere: Keycloak, Redmine (mirror) and backend data."""
+    emp = db.execute(
+        text("SELECT id, keycloak_user_id, redmine_user_id, user_email FROM employee_master WHERE id = :id"),
+        {"id": employee_id},
+    ).mappings().first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    keycloak_user_id = emp["keycloak_user_id"]
+    redmine_user_id = emp["redmine_user_id"]
+
+    if redmine_user_id and not force:
+        member_count = db.execute(
+            text("SELECT COUNT(*) FROM redmine.members WHERE user_id = :uid"),
+            {"uid": redmine_user_id},
+        ).scalar() or 0
+        if member_count:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Employee still assigned to {member_count} project(s). Use force=true to override.",
+            )
+
+    summary = {"keycloak": False, "redmine": False, "database": False}
+
+    if keycloak_user_id:
+        try:
+            summary["keycloak"] = await delete_keycloak_user(keycloak_user_id)
+        except Exception as e:
+            logger.warning(f"Keycloak delete failed for {keycloak_user_id}: {e}")
+
+    if redmine_user_id:
+        db.execute(text("DELETE FROM redmine.member_roles WHERE member_id IN (SELECT id FROM redmine.members WHERE user_id = :uid)"), {"uid": redmine_user_id})
+        db.execute(text("DELETE FROM redmine.members WHERE user_id = :uid"), {"uid": redmine_user_id})
+        db.execute(text("DELETE FROM redmine.email_addresses WHERE user_id = :uid"), {"uid": redmine_user_id})
+        db.execute(text("DELETE FROM redmine.user_preferences WHERE user_id = :uid"), {"uid": redmine_user_id})
+        db.execute(text("DELETE FROM redmine.tokens WHERE user_id = :uid"), {"uid": redmine_user_id})
+        db.execute(text("DELETE FROM redmine.users WHERE id = :uid"), {"uid": redmine_user_id})
+        summary["redmine"] = True
+
+    if keycloak_user_id:
+        db.execute(text("DELETE FROM employee_leave_balance_monthly WHERE leave_balance_id IN (SELECT id FROM employee_leave_balances WHERE keycloak_user_id = :k)"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM employee_leave_balances WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM attendance WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM shifts WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM leaves WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM shift_attendance WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM wfh_requests WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM sessions WHERE user_sub = :k"), {"k": keycloak_user_id})
+
+    db.execute(text("DELETE FROM employee_master WHERE id = :id"), {"id": employee_id})
+    db.commit()
+    summary["database"] = True
+
+    logger.info(f"Employee {emp['user_email']} nuked by {current_user.get('username')}")
+    return {"message": "Employee deleted", "summary": summary}
 
 
 @router.get("/by-email/{email}", response_model=EmployeeResponse)
