@@ -66,6 +66,7 @@ class EmployeeResponse(BaseModel):
     reports_to: Optional[int] = None
     reports_to_name: Optional[str] = None
     joining_date: Optional[str] = None
+    profilePictureUrl: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

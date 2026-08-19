@@ -133,7 +133,9 @@ async def list_all_projects(
 
 
 @router.post("/projects", response_model=dict)
+@limiter.limit("10/minute")
 async def create_project(
+    request: Request,
     data: ProjectCreate,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -142,23 +144,42 @@ async def create_project(
     if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
-    # Rate limit: max 5 projects per admin per day
+    # Rate limit: max 10 projects per admin per day
     sql = RedmineSQLService(db)
     email = current_user.get("email")
     user = sql.get_user_by_email(email)
     if user:
         daily = sql.count_daily_projects(user["id"])
-        if daily >= 5:
+        if daily >= 10:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="You can create up to 5 projects per day. Please try again tomorrow.",
+                detail="You can create up to 10 projects per day. Please try again tomorrow.",
             )
 
     try:
-        project = await redmine_service.create_or_update_project(data)
-        return {"status": "success", "project": project}
+        project = await redmine_service.create_project(data)
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Project creation failed for {data.customerName}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+    audit_logger.info(
+        f"Project created: {data.customerName} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "create_project",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project_name": data.customerName,
+                "project_id": project.get("id") if project else None,
+                "owner_email": data.email,
+            },
+        },
+    )
+    return {"status": "success", "project": project}
 
 @router.get("/projects/{email}", response_model=List[ProjectResponse])
 async def get_user_projects_by_email_alias(

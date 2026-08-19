@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_active
@@ -260,11 +261,10 @@ async def check_in(
     all_shifts_today.sort(key=lambda s: 0 if s.date == target_date else 1)
 
     if all_shifts_today:
+        shift_codes = {s.shift_code for s in all_shifts_today if s.shift_code}
         shift_defs = {
-            s.shift_code: db.query(ShiftDefinition).filter(
-                ShiftDefinition.shift_code == s.shift_code
-            ).first()
-            for s in all_shifts_today
+            sd.shift_code: sd
+            for sd in db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
         }
 
         now_tz = now.astimezone(timezone.utc)
@@ -365,7 +365,19 @@ async def check_in(
         remarks=remarks,
     )
     db.add(attendance)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.query(Attendance).filter(
+            and_(
+                Attendance.keycloak_user_id == keycloak_user_id,
+                Attendance.attendance_date == target_date,
+            )
+        ).first()
+        if existing:
+            return JSONResponse(content=_to_response(db, existing), status_code=200)
+        raise
     db.refresh(attendance)
 
     if shift_code and s:
@@ -1353,7 +1365,7 @@ def _build_attendance_excel(records: list) -> BytesIO:
     ws = wb.active
     ws.title = "Attendance"
     ws.append(["Date", "Day", "Employee", "Designation", "Project", "Shift Code", "Shift Name",
-               "Work Status", "Status", "Check In", "Check Out", "Total Hours", "Late",
+               "Work Type", "Shift Status", "Check In", "Check Out", "Total Hours", "Late",
                "Office", "Manual Entry", "Remarks"])
     for r in records:
         ws.append([

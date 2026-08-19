@@ -33,8 +33,35 @@ class ProjectBase(BaseModel):
     projectType: str
     status: str
 
-class ProjectCreate(ProjectBase):
+_ALLOWED_STATUS = {"active", "closed", "archived"}
+
+
+class ProjectCreate(BaseModel):
+    customerName: str = Field(..., min_length=1, max_length=100)
+    city: str = Field(default="", max_length=100)
+    customerOfficeLocation: str = Field(default="", max_length=200)
+    projectType: str = Field(default="", max_length=100)
+    status: str = Field(default="active", description="active, closed, or archived")
     email: EmailStr
+
+    @field_validator("customerName", "city", "customerOfficeLocation", "projectType")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("customerName")
+    @classmethod
+    def _non_empty_name(cls, v: str) -> str:
+        if not v:
+            raise ValueError("customerName must not be empty")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def _valid_status(cls, v: str) -> str:
+        if v not in _ALLOWED_STATUS:
+            raise ValueError(f"status must be one of: {', '.join(sorted(_ALLOWED_STATUS))}")
+        return v
 
 class ProjectResponse(ProjectBase):
     id: int

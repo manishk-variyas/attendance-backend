@@ -67,7 +67,7 @@ async def get_my_profile(
         "reports_to_name": emp.reports_to_name,
         "is_active": emp.is_active,
         "title": emp.title,
-        "profilePictureUrl": f"/api/employees/me/profile-picture" if emp.profile_picture_url else None,
+        "profilePictureUrl": f"/api/employees/{emp.id}/profile-picture" if emp.profile_picture_url else None,
         "joined_at": emp.joining_date.isoformat() if emp.joining_date else emp.created_at.date().isoformat() if emp.created_at else None,
     }
 
@@ -155,7 +155,7 @@ async def update_my_profile(
         "reports_to_name": emp.reports_to_name,
         "is_active": emp.is_active,
         "title": emp.title,
-        "profilePictureUrl": f"/api/employees/me/profile-picture" if emp.profile_picture_url else None,
+        "profilePictureUrl": f"/api/employees/{emp.id}/profile-picture" if emp.profile_picture_url else None,
         "joined_at": emp.joining_date.isoformat() if emp.joining_date else emp.created_at.date().isoformat() if emp.created_at else None,
     }
 
@@ -173,7 +173,29 @@ async def get_profile_picture(
 
     content, content_type = await storage_service.get_file(emp.profile_picture_url, ASSETS_BUCKET)
     response = StreamingResponse(io.BytesIO(content), media_type=content_type)
-    response.headers["Cache-Control"] = "private, max-age=300"
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@router.get("/{employee_id}/profile-picture")
+async def get_employee_profile_picture(
+    employee_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.id == employee_id).first()
+    if not emp or not emp.profile_picture_url:
+        raise HTTPException(status_code=404, detail="No profile picture found")
+
+    is_self = emp.user_email == current_user.get("email")
+    if not is_self and not any(r in roles for r in ["Admin", "Project Manager", "Project Coordinator"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    content, content_type = await storage_service.get_file(emp.profile_picture_url, ASSETS_BUCKET)
+    response = StreamingResponse(io.BytesIO(content), media_type=content_type)
+    response.headers["Cache-Control"] = "private, no-store"
     return response
 
 
@@ -212,7 +234,7 @@ async def upload_profile_picture(
     emp.profile_picture_url = object_name
     db.commit()
 
-    return {"message": "Profile picture uploaded", "profilePictureUrl": "/api/employees/me/profile-picture"}
+    return {"message": "Profile picture uploaded", "profilePictureUrl": f"/api/employees/{emp.id}/profile-picture"}
 
 
 def _employee_to_dict(e: EmployeeMaster) -> dict:
@@ -241,7 +263,7 @@ def _employee_to_dict(e: EmployeeMaster) -> dict:
         "location_id": str(e.location_id) if e.location_id else None,
         "reports_to": e.reports_to,
         "reports_to_name": e.reports_to_name,
-        "profile_picture_url": e.profile_picture_url,
+        "profilePictureUrl": f"/api/employees/{e.id}/profile-picture" if e.profile_picture_url else None,
         "created_at": e.created_at,
         "updated_at": e.updated_at,
     }

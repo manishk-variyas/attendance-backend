@@ -50,4 +50,4 @@ RUN crontab ./scripts/log-cleanup.cron
 EXPOSE 8000
 
 # Start cron daemon in background, then run Gunicorn with Uvicorn workers
-CMD ["sh", "-c", "cron && uv run gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000 app.main:app"]
+CMD ["sh", "-c", "cron && uv run gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000 --timeout 60 --max-requests 1000 --max-requests-jitter 100 app.main:app"]

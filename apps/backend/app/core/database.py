@@ -18,8 +18,15 @@ from app.core.models import Base
 
 
 # Create the database engine with connection pooling
-# pool_pre_ping=True checks connections are alive before using them
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+# pool_pre_ping=True checks connections are alive before using them.
+# pool_size/max_overflow sized for 4 gunicorn workers (10+10 = 20/worker = 80
+# peak) leaving headroom under Postgres max_connections=100.
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=10,
+)
 
 # Create a session factory - each session is a new database transaction
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

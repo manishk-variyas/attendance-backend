@@ -1,5 +1,6 @@
 import httpx
 from typing import List, Optional
+from fastapi import HTTPException
 from app.core.config import settings
 from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse
 import secrets
@@ -186,54 +187,93 @@ class RedmineService:
                     ))
             return projects
 
-    async def create_or_update_project(self, data: ProjectCreate):
-        # 1. Find user
+    def _safe_identifier(self, customer_name: str) -> str:
+        """Build a Redmine-safe identifier from the customer name.
+
+        Redmine identifiers must be lowercase, and may only contain letters,
+        digits, dashes, and underscores. Non-alphanumeric characters are
+        collapsed into a single dash. Falls back to 'project' if nothing
+        remains after sanitization.
+        """
+        import re
+        slug = re.sub(r"[^a-z0-9]+", "-", customer_name.lower()).strip("-")
+        return (slug or "project")[:100]
+
+    async def create_project(self, data: ProjectCreate):
+        # 1. Find the project owner (must already exist in Redmine)
         user = await self.get_user_by_email(data.email)
         if not user:
-            raise Exception(f"User with email {data.email} not found in Redmine")
+            raise HTTPException(status_code=404, detail=f"User with email {data.email} not found in Redmine")
 
-        # 2. Find custom fields to get IDs
+        # 2. Resolve custom field IDs by name (skip any that don't exist)
         cfs = await self.get_custom_fields()
         cf_map = {cf["name"]: cf["id"] for cf in cfs}
+        custom_fields = []
+        for name, value in (
+            ("City", data.city),
+            ("Customer Office Location", data.customerOfficeLocation),
+            ("Project Type", data.projectType),
+        ):
+            if value and name in cf_map:
+                custom_fields.append({"id": cf_map[name], "value": value})
 
-        # 3. Create project payload
+        # 3. Resolve the 'Manager' role by name (fallback: first role)
+        roles = await self.get_roles()
+        manager_role_id = next(
+            (r["id"] for r in roles if r.get("name", "").lower() == "manager"),
+            roles[0]["id"] if roles else None,
+        )
+
+        # 4. Map status string → Redmine project status code
+        status_code = {"active": 1, "closed": 5, "archived": 9}.get(data.status, 1)
+
+        # 5. Create the project (fail if identifier already taken)
+        identifier = self._safe_identifier(data.customerName)
         payload = {
             "project": {
                 "name": data.customerName,
-                "identifier": data.customerName.lower().replace(" ", "-"),
-                "custom_fields": [
-                    {"id": cf_map["City"], "value": data.city},
-                    {"id": cf_map["Customer Office Location"], "value": data.customerOfficeLocation},
-                    {"id": cf_map["Project Type"], "value": data.projectType}
-                ]
+                "identifier": identifier,
+                "status": status_code,
+                "is_public": False,
+                "custom_fields": custom_fields,
             }
         }
 
         async with httpx.AsyncClient() as client:
-            # Check if project exists
-            check_resp = await client.get(f"{self.url}/projects/{payload['project']['identifier']}.json", headers=self.headers)
+            # Pre-flight duplicate check on identifier
+            check_resp = await client.get(
+                f"{self.url}/projects/{identifier}.json", headers=self.headers
+            )
             if check_resp.status_code == 200:
-                # Update
-                p_id = check_resp.json()["project"]["id"]
-                resp = await client.put(f"{self.url}/projects/{p_id}.json", json=payload, headers=self.headers)
-            else:
-                # Create
-                resp = await client.post(f"{self.url}/projects.json", json=payload, headers=self.headers)
-            
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Project identifier '{identifier}' already exists.",
+                )
+
+            resp = await client.post(f"{self.url}/projects.json", json=payload, headers=self.headers)
+            if resp.status_code == 422:
+                raise HTTPException(status_code=409, detail="Project already exists (duplicate identifier).")
             resp.raise_for_status()
-            
-            # 4. Ensure user is a member
-            p_data = resp.json().get("project") if resp.status_code == 201 else check_resp.json().get("project")
-            p_id = p_data["id"]
-            
-            membership_payload = {
-                "membership": {
-                    "user_id": user["id"],
-                    "role_ids": [3] # Default to 'Manager' or similar ID
+
+            p_data = resp.json().get("project", {})
+            p_id = p_data.get("id")
+
+            # 6. Add the owner as a member
+            if p_id and manager_role_id:
+                membership_payload = {
+                    "membership": {"user_id": user["id"], "role_ids": [manager_role_id]}
                 }
-            }
-            await client.post(f"{self.url}/projects/{p_id}/memberships.json", json=membership_payload, headers=self.headers)
-            
+                member_resp = await client.post(
+                    f"{self.url}/projects/{p_id}/memberships.json",
+                    json=membership_payload,
+                    headers=self.headers,
+                )
+                if member_resp.status_code not in (200, 201, 422):
+                    logger.warning(
+                        f"Failed to add member {data.email} to project {p_id}: "
+                        f"{member_resp.status_code} - {member_resp.text}"
+                    )
+
             return p_data
 
     async def get_all_users_with_projects(self) -> List[UserWithProjects]:
