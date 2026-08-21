@@ -14,6 +14,7 @@ from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.attendance import Attendance
 from app.models.system_setting import SystemSetting
+from app.core.cache import clear_shift_definition_cache
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
 from sqlalchemy import select
 from sqlalchemy import update as sql_update, delete as sql_delete
@@ -929,6 +930,7 @@ class ShiftService:
             timezone=data.get("timezone", "Asia/Kolkata"),
             country=data.get("country", ""),
         )
+        clear_shift_definition_cache(data["shiftCode"])
         return self._serialize_def(sd)
 
     async def get_shift_definition_by_code(self, db: Session, shift_code: str) -> Optional[dict]:
@@ -975,12 +977,14 @@ class ShiftService:
                 sql_update(ShiftDefinition).where(ShiftDefinition.shift_id == shift_id).values(**update_data)
             )
             svc.db.commit()
+            clear_shift_definition_cache()
         return await self.get_shift_definition(db, shift_id)
 
     async def delete_shift_definition(self, db: Session, shift_id: str) -> bool:
         svc = self._def_svc(db)
         result = svc.db.execute(sql_delete(ShiftDefinition).where(ShiftDefinition.shift_id == shift_id))
         svc.db.commit()
+        clear_shift_definition_cache()
         return result.rowcount > 0
 
     async def search_shifts(self, db: Session, query: str, limit: int = 5) -> List[dict]:

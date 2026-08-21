@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
 from datetime import date, timedelta, datetime
-from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectUpdate, ProjectResponse, AdminProjectListResponse, AdminProjectItem, AdminProjectDetail, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
@@ -180,6 +180,140 @@ async def create_project(
         },
     )
     return {"status": "success", "project": project}
+
+
+@router.put("/projects/{project_id_or_identifier}", response_model=dict)
+@limiter.limit("20/minute")
+async def update_project(
+    project_id_or_identifier: str,
+    request: Request,
+    data: ProjectUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    # Admin only
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    try:
+        project = await redmine_service.update_project(project_id_or_identifier, data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Project update failed for {project_id_or_identifier}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    audit_logger.info(
+        f"Project updated: {project_id_or_identifier} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "update_project",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project": project_id_or_identifier,
+            },
+        },
+    )
+    return {"status": "success", "project": project}
+
+
+@router.delete("/projects/{project_id_or_identifier}")
+@limiter.limit("10/minute")
+async def delete_project(
+    project_id_or_identifier: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    # Admin only
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    try:
+        deleted = await redmine_service.delete_project(project_id_or_identifier)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Project deletion failed for {project_id_or_identifier}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id_or_identifier}' not found in Redmine")
+
+    audit_logger.info(
+        f"Project deleted: {project_id_or_identifier} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "delete_project",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project": project_id_or_identifier,
+            },
+        },
+    )
+    return {"status": "success", "message": "Project deleted successfully", "id": project_id_or_identifier}
+
+
+@router.get("/admin/projects", response_model=AdminProjectListResponse)
+@limiter.limit("30/minute")
+async def list_admin_projects(
+    request: Request,
+    q: Optional[str] = Query(None, max_length=100, description="Search name, identifier, description, custom fields"),
+    status_filter: Optional[str] = Query(None, alias="status", description="active, closed, archived, or all"),
+    project_type: Optional[str] = Query(None, max_length=100, description="Filter by project type"),
+    city: Optional[str] = Query(None, max_length=100, description="Filter by city"),
+    page: int = Query(1, ge=1, description="Page number (default: 1)"),
+    page_size: int = Query(20, ge=1, le=100, description="Page size (default: 20, max: 100)"),
+    sort_by: str = Query("created_on", description="created_on, updated_on, name, id, status"),
+    sort_order: str = Query("desc", description="asc or desc"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Admin-only endpoint to list projects with full data, filters, backend-safe searching, and pagination.
+    """
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+
+    sql = RedmineSQLService(db)
+    return sql.get_admin_projects_paginated(
+        search=q,
+        status=status_filter,
+        project_type=project_type,
+        city=city,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+
+@router.get("/admin/projects/{project_id}", response_model=AdminProjectDetail)
+@limiter.limit("30/minute")
+async def get_admin_project_detail(
+    request: Request,
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Admin-only endpoint to fetch full project details by id."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+
+    sql = RedmineSQLService(db)
+    detail = sql.get_project_details(project_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return detail
+
 
 @router.get("/projects/{email}", response_model=List[ProjectResponse])
 async def get_user_projects_by_email_alias(

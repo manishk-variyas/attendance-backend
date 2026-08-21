@@ -38,10 +38,14 @@ _ALLOWED_STATUS = {"active", "closed", "archived"}
 
 class ProjectCreate(BaseModel):
     customerName: str = Field(..., min_length=1, max_length=100)
+    identifier: Optional[str] = Field(default=None, max_length=100)
+    description: Optional[str] = Field(default="", max_length=1000)
     city: str = Field(default="", max_length=100)
     customerOfficeLocation: str = Field(default="", max_length=200)
     projectType: str = Field(default="", max_length=100)
     status: str = Field(default="active", description="active, closed, or archived")
+    parent_id: Optional[int] = Field(default=None, gt=0, description="Parent project ID for sub-project creation")
+    inherit_members: bool = Field(default=False, description="Inherit members from parent project")
     email: EmailStr
 
     @field_validator("customerName", "city", "customerOfficeLocation", "projectType")
@@ -63,10 +67,82 @@ class ProjectCreate(BaseModel):
             raise ValueError(f"status must be one of: {', '.join(sorted(_ALLOWED_STATUS))}")
         return v
 
+    @field_validator("identifier")
+    @classmethod
+    def _valid_identifier(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip().lower()
+            if not v:
+                return None
+            if not re.match(r"^[a-z][a-z0-9\-_]{0,99}$", v):
+                raise ValueError("identifier must start with a lowercase letter and contain only lowercase letters, numbers, hyphens, and underscores (max 100 characters)")
+        return v
+
+
+class ProjectUpdate(BaseModel):
+    customerName: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=1000)
+    city: Optional[str] = Field(None, max_length=100)
+    customerOfficeLocation: Optional[str] = Field(None, max_length=200)
+    projectType: Optional[str] = Field(None, max_length=100)
+    status: Optional[str] = Field(None, description="active, closed, or archived")
+    email: Optional[EmailStr] = None
+
+    @field_validator("customerName", "city", "customerOfficeLocation", "projectType")
+    @classmethod
+    def _strip(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return v.strip()
+        return v
+
+    @field_validator("customerName")
+    @classmethod
+    def _non_empty_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v:
+            raise ValueError("customerName must not be empty")
+        return v
+
+    @field_validator("status")
+    @classmethod
+    def _valid_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _ALLOWED_STATUS:
+            raise ValueError(f"status must be one of: {', '.join(sorted(_ALLOWED_STATUS))}")
+        return v
+
 class ProjectResponse(ProjectBase):
     id: int
     name: str
     identifier: str
+
+class AdminProjectItem(BaseModel):
+    id: int
+    name: str
+    customerName: str
+    identifier: str
+    description: Optional[str] = ""
+    status: str
+    statusCode: int
+    is_public: bool
+    created_on: Optional[str] = None
+    updated_on: Optional[str] = None
+    city: str
+    customerOfficeLocation: str
+    projectType: str
+    memberCount: int
+
+class AdminProjectListResponse(BaseModel):
+    records: List[AdminProjectItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class AdminProjectDetail(AdminProjectItem):
+    homepage: str = ""
+    inherit_members: bool = False
+    parent_id: Optional[int] = None
+    parent_name: Optional[str] = None
 
 class UserProjectResponse(BaseModel):
     email: str

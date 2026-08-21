@@ -76,6 +76,7 @@ async def require_admin_or_pm(current_user: dict = Depends(get_current_user)) ->
 
 
 async def require_active(
+    request: Request,
     db: DBSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> None:
@@ -84,6 +85,9 @@ async def require_active(
 
     Must be used after get_current_user. Looks up employee_master by email
     from the session and checks is_active is True. Returns 403 if deactivated.
+
+    Also caches the loaded EmployeeMaster on request.state.employee so hot
+    endpoints (e.g. check-in) can reuse it instead of re-querying.
 
     Usage:
         @router.get("/some-route")
@@ -99,5 +103,6 @@ async def require_active(
 
     svc = BaseService[EmployeeMaster](db)
     emp = svc.fetch_one(EmployeeMaster, user_email=email)
+    request.state.employee = emp
     if emp and not emp.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated. Contact admin.")

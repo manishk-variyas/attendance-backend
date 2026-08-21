@@ -346,7 +346,8 @@ class RedmineSQLService:
             COALESCE(
                 (SELECT json_agg(json_build_object(
                     'id', a.id, 'filename', a.filename,
-                    'content_type', a.content_type, 'filesize', a.filesize
+                    'content_type', a.content_type, 'filesize', a.filesize,
+                    'created_on', a.created_on
                 )) FROM redmine.attachments a
                 WHERE a.container_id = i.id AND a.container_type = 'Issue'),
                 '[]'::json
@@ -548,9 +549,11 @@ class RedmineSQLService:
     def count_daily_projects(self, user_id: int) -> int:
         row = self.db.execute(
             text("""
-                SELECT count(*) FROM redmine.projects
-                WHERE author_id = :user_id
-                  AND created_on::date = CURRENT_DATE
+                SELECT count(*)
+                FROM redmine.projects p
+                JOIN redmine.members m ON m.project_id = p.id
+                WHERE m.user_id = :user_id
+                  AND p.created_on::date = CURRENT_DATE
             """),
             {"user_id": user_id},
         ).fetchone()
@@ -678,3 +681,233 @@ class RedmineSQLService:
             "author_id": row[2],
             "assigned_to_id": row[3],
         }
+
+    def get_admin_projects_paginated(
+        self,
+        search: str | None = None,
+        status: str | None = None,
+        project_type: str | None = None,
+        city: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+        sort_by: str = "created_on",
+        sort_order: str = "desc",
+    ) -> dict:
+        """
+        Get all projects with full data for admin view with backend-safe searching,
+        filtering, sorting, and pagination.
+        """
+        page = max(1, page)
+        page_size = min(max(1, page_size), 100)
+        offset = (page - 1) * page_size
+
+        SORT_COLUMNS = {
+            "id": "p.id",
+            "name": "p.name",
+            "created_on": "p.created_on",
+            "updated_on": "p.updated_on",
+            "status": "p.status",
+        }
+        sort_col = SORT_COLUMNS.get(sort_by.lower(), "p.created_on")
+        direction = "ASC" if sort_order.lower() == "asc" else "DESC"
+
+        where_clauses = ["1=1"]
+        params = {}
+
+        if status and status.lower() != "all":
+            status_map = {"active": 1, "closed": 5, "archived": 9}
+            st_code = status_map.get(status.lower())
+            if st_code is not None:
+                where_clauses.append("p.status = :status_code")
+                params["status_code"] = st_code
+
+        if search:
+            clean_search = search.strip()[:100]
+            if clean_search:
+                escaped_search = clean_search.replace("%", "\\%").replace("_", "\\_")
+                where_clauses.append("""
+                    (p.name ILIKE :search_term ESCAPE '\\' OR
+                     p.identifier ILIKE :search_term ESCAPE '\\' OR
+                     p.description ILIKE :search_term ESCAPE '\\' OR
+                     EXISTS (
+                        SELECT 1 FROM redmine.custom_values cv_search
+                        JOIN redmine.custom_fields cf_search ON cf_search.id = cv_search.custom_field_id
+                        WHERE cv_search.customized_id = p.id
+                          AND cv_search.customized_type = 'Project'
+                          AND cv_search.value ILIKE :search_term ESCAPE '\\'
+                     ))
+                """)
+                params["search_term"] = f"%{escaped_search}%"
+
+        if city:
+            clean_city = city.strip()[:100]
+            where_clauses.append("""
+                EXISTS (
+                    SELECT 1 FROM redmine.custom_values cv_city
+                    JOIN redmine.custom_fields cf_city ON cf_city.id = cv_city.custom_field_id
+                    WHERE cv_city.customized_id = p.id
+                      AND cv_city.customized_type = 'Project'
+                      AND cf_city.name = 'City'
+                      AND cv_city.value ILIKE :city_term
+                )
+            """)
+            params["city_term"] = f"%{clean_city}%"
+
+        if project_type:
+            clean_pt = project_type.strip()[:100]
+            where_clauses.append("""
+                EXISTS (
+                    SELECT 1 FROM redmine.custom_values cv_pt
+                    JOIN redmine.custom_fields cf_pt ON cf_pt.id = cv_pt.custom_field_id
+                    WHERE cv_pt.customized_id = p.id
+                      AND cv_pt.customized_type = 'Project'
+                      AND cf_pt.name = 'Project Type'
+                      AND cv_pt.value ILIKE :pt_term
+                )
+            """)
+            params["pt_term"] = f"%{clean_pt}%"
+
+        where_sql = " AND ".join(where_clauses)
+
+        count_query = f"SELECT COUNT(*) FROM redmine.projects p WHERE {where_sql}"
+        total = self.db.execute(text(count_query), params).scalar() or 0
+
+        if total == 0:
+            return {
+                "records": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": 0,
+            }
+
+        ids_query = f"""
+            SELECT p.id
+            FROM redmine.projects p
+            WHERE {where_sql}
+            ORDER BY {sort_col} {direction}
+            LIMIT :limit OFFSET :offset
+        """
+        params_page = {**params, "limit": page_size, "offset": offset}
+        proj_ids = [row[0] for row in self.db.execute(text(ids_query), params_page).fetchall()]
+
+        if not proj_ids:
+            return {
+                "records": [],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": (total + page_size - 1) // page_size,
+            }
+
+        details_query = f"""
+            SELECT p.id, p.name, p.identifier, p.description, p.status, p.is_public,
+                   p.created_on, p.updated_on,
+                   cf.name as cf_name, cv.value as cf_value,
+                   (SELECT COUNT(*) FROM redmine.members m WHERE m.project_id = p.id) as member_count
+            FROM redmine.projects p
+            LEFT JOIN redmine.custom_values cv ON cv.customized_id = p.id AND cv.customized_type = 'Project'
+            LEFT JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+            WHERE p.id = ANY(:proj_ids)
+            ORDER BY {sort_col} {direction}
+        """
+
+        rows = self.db.execute(text(details_query), {"proj_ids": proj_ids}).fetchall()
+
+        _STATUS_MAP = {1: "active", 5: "closed", 9: "archived"}
+
+        projects_dict = {}
+        for r in rows:
+            pid = r[0]
+            if pid not in projects_dict:
+                st_code = r[4]
+                projects_dict[pid] = {
+                    "id": r[0],
+                    "name": r[1],
+                    "customerName": r[1],
+                    "identifier": r[2],
+                    "description": r[3] or "",
+                    "status": _STATUS_MAP.get(st_code, "active" if st_code == 1 else "closed"),
+                    "statusCode": st_code,
+                    "is_public": bool(r[5]),
+                    "created_on": r[6].isoformat() if r[6] else None,
+                    "updated_on": r[7].isoformat() if r[7] else None,
+                    "city": "",
+                    "customerOfficeLocation": "",
+                    "projectType": "",
+                    "memberCount": r[10] or 0,
+                }
+            cf_name = r[8]
+            cf_value = r[9] or ""
+            if cf_name == "City":
+                projects_dict[pid]["city"] = cf_value
+            elif cf_name == "Customer Office Location":
+                projects_dict[pid]["customerOfficeLocation"] = cf_value
+            elif cf_name == "Project Type":
+                projects_dict[pid]["projectType"] = cf_value
+
+        ordered_records = [projects_dict[pid] for pid in proj_ids if pid in projects_dict]
+
+        total_pages = (total + page_size - 1) // page_size
+        return {
+            "records": ordered_records,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+
+    def get_project_details(self, project_id: int) -> dict | None:
+        """Full admin-level project detail by id (parent info + custom fields)."""
+        rows = self.db.execute(
+            text("""
+                SELECT p.id, p.name, p.identifier, p.description, p.status, p.is_public,
+                       p.homepage, p.inherit_members, p.parent_id,
+                       parent.name as parent_name,
+                       p.created_on, p.updated_on,
+                       cf.name as cf_name, cv.value as cf_value,
+                       (SELECT COUNT(*) FROM redmine.members m WHERE m.project_id = p.id) as member_count
+                FROM redmine.projects p
+                LEFT JOIN redmine.projects parent ON parent.id = p.parent_id
+                LEFT JOIN redmine.custom_values cv ON cv.customized_id = p.id AND cv.customized_type = 'Project'
+                LEFT JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
+                WHERE p.id = :project_id
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        _STATUS_MAP = {1: "active", 5: "closed", 9: "archived", 10: "scheduled_for_deletion"}
+        r0 = rows[0]
+        detail = {
+            "id": r0[0],
+            "name": r0[1],
+            "customerName": r0[1],
+            "identifier": r0[2],
+            "description": r0[3] or "",
+            "status": _STATUS_MAP.get(r0[4], "active"),
+            "statusCode": r0[4],
+            "is_public": bool(r0[5]),
+            "homepage": r0[6] or "",
+            "inherit_members": bool(r0[7]),
+            "parent_id": r0[8],
+            "parent_name": r0[9],
+            "created_on": r0[10].isoformat() if r0[10] else None,
+            "updated_on": r0[11].isoformat() if r0[11] else None,
+            "city": "",
+            "customerOfficeLocation": "",
+            "projectType": "",
+            "memberCount": r0[14] or 0,
+        }
+        for r in rows:
+            cf_name = r[12]
+            cf_value = r[13] or ""
+            if cf_name == "City":
+                detail["city"] = cf_value
+            elif cf_name == "Customer Office Location":
+                detail["customerOfficeLocation"] = cf_value
+            elif cf_name == "Project Type":
+                detail["projectType"] = cf_value
+        return detail

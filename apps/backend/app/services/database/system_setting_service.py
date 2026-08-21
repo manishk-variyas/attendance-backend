@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from app.services.database.base_service import BaseService
 from app.models.system_setting import SystemSetting
+from app.core.cache import clear_company_settings_cache
 from datetime import datetime, date
 
 
@@ -59,5 +60,8 @@ class SystemSettingService(BaseService[SystemSetting]):
             for k, v in data.items():
                 setattr(existing, k, v)
             self.db.commit()
+            clear_company_settings_cache()
             return existing
-        return self.create(SystemSetting, id="company", **data)
+        created = self.create(SystemSetting, id="company", **data)
+        clear_company_settings_cache()
+        return created

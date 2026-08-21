@@ -29,6 +29,7 @@ from app.features.leaves.services.balance_utils import credit_comp_off
 from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
+from app.core.cache import get_company_settings, get_shift_definition
 from app.services.email_service import email_service
 from app.utils.audit import audit_logger
 from app.middleware.logging import _get_client_ip
@@ -134,7 +135,7 @@ def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
     """Return the shift whose active window contains check_in_time.
     Uses shift_master.timezone for timezone-aware window computation.
     Only searches shifts within ±1 day of the check-in date."""
-    sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == shift_code).first()
+    sd = get_shift_definition(db, shift_code)
     if not sd:
         return None
     tz = _safe_zone(sd.timezone or "Asia/Kolkata")
@@ -170,7 +171,7 @@ def _to_response(db: Session, a: Attendance) -> dict:
     else:
         data["officeName"] = None
     if a.shift_code:
-        shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == a.shift_code).first()
+        shift_def = get_shift_definition(db, a.shift_code)
         data["shiftName"] = shift_def.shift_name if shift_def else None
     else:
         data["shiftName"] = None
@@ -180,7 +181,8 @@ def _to_response(db: Session, a: Attendance) -> dict:
 
 
 @router.post("/check-in", response_model=AttendanceResponse, status_code=status.HTTP_201_CREATED)
-async def check_in(
+def check_in(
+    request: Request,
     payload: CheckInRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -311,7 +313,7 @@ async def check_in(
 
     if shift_code and shift_start_time and now.tzinfo:
         grace_min = 0
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        company = get_company_settings(db)
         if company and company.grace_minutes:
             grace_min = company.grace_minutes
         shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=_safe_zone(shift_tz))
@@ -323,9 +325,7 @@ async def check_in(
         if now > shift_start_dt + timedelta(minutes=grace_min):
             is_late = True
 
-    emp = db.query(EmployeeMaster).filter(
-        EmployeeMaster.keycloak_user_id == keycloak_user_id
-    ).first()
+    emp = getattr(request.state, "employee", None)
     location_id = emp.location_id if emp else None
     if shift_code and s:
         shift_loc = s.location_id
@@ -401,7 +401,7 @@ async def check_in(
 
 
 @router.post("/check-out", response_model=AttendanceResponse)
-async def check_out(
+def check_out(
     payload: CheckOutRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -477,13 +477,13 @@ async def check_out(
     shift_end_time = None
     end_tz = "Asia/Kolkata"
     if attendance.shift_code:
-        shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == attendance.shift_code).first()
+        shift_def = get_shift_definition(db, attendance.shift_code)
         if shift_def:
             shift_start_time = shift_def.start_time
             shift_end_time = shift_def.end_time
             end_tz = shift_def.timezone or "Asia/Kolkata"
     if not shift_end_time:
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        company = get_company_settings(db)
         if company and company.default_shift_end_time:
             shift_end_time = company.default_shift_end_time
             end_tz = company.default_timezone or "Asia/Kolkata"
@@ -681,7 +681,7 @@ async def get_pending_attendance(
 
 
 @router.get("/today", response_model=TodayAttendanceResponse)
-async def get_today_attendance(
+def get_today_attendance(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),

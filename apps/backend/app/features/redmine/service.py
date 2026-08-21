@@ -2,7 +2,7 @@ import httpx
 from typing import List, Optional
 from fastapi import HTTPException
 from app.core.config import settings
-from .schemas import ProjectCreate, ProjectResponse, UserWithProjects, IssueResponse
+from .schemas import ProjectCreate, ProjectUpdate, ProjectResponse, UserWithProjects, IssueResponse
 import secrets
 import logging
 
@@ -187,17 +187,37 @@ class RedmineService:
                     ))
             return projects
 
-    def _safe_identifier(self, customer_name: str) -> str:
-        """Build a Redmine-safe identifier from the customer name.
+    def _safe_identifier(self, customer_name: str, custom_identifier: Optional[str] = None) -> str:
+        """Build a Redmine-safe identifier from customer name or custom identifier.
 
-        Redmine identifiers must be lowercase, and may only contain letters,
-        digits, dashes, and underscores. Non-alphanumeric characters are
-        collapsed into a single dash. Falls back to 'project' if nothing
-        remains after sanitization.
+        Redmine identifiers must be 1..100 chars, start with a letter, and contain
+        only lowercase letters, digits, dashes, and underscores.
         """
         import re
-        slug = re.sub(r"[^a-z0-9]+", "-", customer_name.lower()).strip("-")
-        return (slug or "project")[:100]
+        raw = custom_identifier if custom_identifier and custom_identifier.strip() else customer_name
+        slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+        if not slug:
+            slug = "project"
+        if not slug[0].isalpha():
+            slug = f"p-{slug}"
+        return slug[:100]
+
+    async def _change_project_status(self, client, project_id: int | str, status: str) -> None:
+        """Redmine does not accept `status` on create/update payloads; it uses
+        dedicated actions instead: close, reopen, archive, unarchive."""
+        action = {"closed": "close", "archived": "archive"}.get(status.lower())
+        if action:
+            resp = await client.put(
+                f"{self.url}/projects/{project_id}/{action}.json", headers=self.headers
+            )
+            resp.raise_for_status()
+            return
+        # "active": unarchive first (safe on all states), then reopen any closed project
+        for action in ("unarchive", "reopen"):
+            resp = await client.put(
+                f"{self.url}/projects/{project_id}/{action}.json", headers=self.headers
+            )
+            resp.raise_for_status()
 
     async def create_project(self, data: ProjectCreate):
         # 1. Find the project owner (must already exist in Redmine)
@@ -220,45 +240,82 @@ class RedmineService:
         # 3. Resolve the 'Manager' role by name (fallback: first role)
         roles = await self.get_roles()
         manager_role_id = next(
-            (r["id"] for r in roles if r.get("name", "").lower() == "manager"),
+            (r["id"] for r in roles if r.get("name", "").lower() in ("manager", "project manager")),
             roles[0]["id"] if roles else None,
         )
 
-        # 4. Map status string → Redmine project status code
-        status_code = {"active": 1, "closed": 5, "archived": 9}.get(data.status, 1)
+        # 4. Safe unique identifier resolution
+        base_identifier = self._safe_identifier(data.customerName, data.identifier)
+        identifier = base_identifier
 
-        # 5. Create the project (fail if identifier already taken)
-        identifier = self._safe_identifier(data.customerName)
-        payload = {
-            "project": {
+        async with httpx.AsyncClient() as client:
+            # Pre-flight check: if a parent project was specified, ensure it exists
+            if data.parent_id is not None:
+                parent_resp = await client.get(
+                    f"{self.url}/projects/{data.parent_id}.json", headers=self.headers
+                )
+                if parent_resp.status_code == 404:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Parent project '{data.parent_id}' not found in Redmine.",
+                    )
+
+            if not data.identifier:
+                suffix = 1
+                while suffix <= 10:
+                    check_resp = await client.get(
+                        f"{self.url}/projects/{identifier}.json", headers=self.headers
+                    )
+                    if check_resp.status_code == 404:
+                        break
+                    identifier = f"{base_identifier[:90]}-{suffix}"
+                    suffix += 1
+            else:
+                check_resp = await client.get(
+                    f"{self.url}/projects/{identifier}.json", headers=self.headers
+                )
+                if check_resp.status_code == 200:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Project identifier '{identifier}' already exists.",
+                    )
+
+            project_payload = {
                 "name": data.customerName,
                 "identifier": identifier,
-                "status": status_code,
+                "description": data.description or "",
                 "is_public": False,
                 "custom_fields": custom_fields,
             }
-        }
-
-        async with httpx.AsyncClient() as client:
-            # Pre-flight duplicate check on identifier
-            check_resp = await client.get(
-                f"{self.url}/projects/{identifier}.json", headers=self.headers
-            )
-            if check_resp.status_code == 200:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Project identifier '{identifier}' already exists.",
-                )
+            if data.parent_id is not None:
+                project_payload["parent_id"] = data.parent_id
+                project_payload["inherit_members"] = data.inherit_members
+            payload = {"project": project_payload}
 
             resp = await client.post(f"{self.url}/projects.json", json=payload, headers=self.headers)
             if resp.status_code == 422:
-                raise HTTPException(status_code=409, detail="Project already exists (duplicate identifier).")
+                try:
+                    err_json = resp.json()
+                    errors = err_json.get("errors", [])
+                except Exception:
+                    errors = []
+                errors_str = " ".join(str(e) for e in errors)
+                if "identifier" in errors_str.lower():
+                    raise HTTPException(status_code=409, detail=f"Project creation failed: {errors_str}")
+                raise HTTPException(status_code=400, detail=f"Project creation failed: {errors_str or resp.text}")
             resp.raise_for_status()
 
             p_data = resp.json().get("project", {})
             p_id = p_data.get("id")
 
-            # 6. Add the owner as a member
+            # 6. Apply non-active status via dedicated Redmine action (status is ignored on create payload)
+            if p_id and data.status and data.status.lower() != "active":
+                await self._change_project_status(client, p_id, data.status)
+                get_resp = await client.get(f"{self.url}/projects/{p_id}.json", headers=self.headers)
+                if get_resp.status_code == 200:
+                    p_data = get_resp.json().get("project", {})
+
+            # 7. Add the owner as a member
             if p_id and manager_role_id:
                 membership_payload = {
                     "membership": {"user_id": user["id"], "role_ids": [manager_role_id]}
@@ -535,6 +592,89 @@ class RedmineService:
         async with httpx.AsyncClient() as client:
             resp = await client.delete(
                 f"{self.url}/attachments/{attachment_id}.json",
+                headers=self.headers,
+            )
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            return True
+
+    async def update_project(self, project_id: int | str, data: ProjectUpdate):
+        update_data = data.model_dump(exclude_unset=True)
+        project_payload = {}
+
+        if "customerName" in update_data and update_data["customerName"]:
+            project_payload["name"] = update_data["customerName"]
+        if "description" in update_data and update_data["description"] is not None:
+            project_payload["description"] = update_data["description"]
+
+        cfs = await self.get_custom_fields()
+        cf_map = {cf["name"]: cf["id"] for cf in cfs}
+        custom_fields = []
+        for cf_key, cf_name in (
+            ("city", "City"),
+            ("customerOfficeLocation", "Customer Office Location"),
+            ("projectType", "Project Type"),
+        ):
+            if cf_key in update_data and update_data[cf_key] is not None and cf_name in cf_map:
+                custom_fields.append({"id": cf_map[cf_name], "value": update_data[cf_key]})
+
+        if custom_fields:
+            project_payload["custom_fields"] = custom_fields
+
+        async with httpx.AsyncClient() as client:
+            if project_payload:
+                resp = await client.put(
+                    f"{self.url}/projects/{project_id}.json",
+                    json={"project": project_payload},
+                    headers=self.headers,
+                )
+                if resp.status_code == 404:
+                    raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found in Redmine.")
+                elif resp.status_code == 422:
+                    error_msg = "Project update failed."
+                    try:
+                        err_json = resp.json()
+                        if "errors" in err_json:
+                            error_msg = f"Project update failed: {', '.join(err_json['errors'])}"
+                    except Exception:
+                        pass
+                    raise HTTPException(status_code=400, detail=error_msg)
+                resp.raise_for_status()
+
+            if "status" in update_data and update_data["status"]:
+                await self._change_project_status(client, project_id, update_data["status"])
+
+            if "email" in update_data and update_data["email"]:
+                owner_email = update_data["email"]
+                user = await self.get_user_by_email(owner_email)
+                if not user:
+                    raise HTTPException(status_code=404, detail=f"User with email {owner_email} not found in Redmine")
+
+                roles = await self.get_roles()
+                manager_role_id = next(
+                    (r["id"] for r in roles if r.get("name", "").lower() in ("manager", "project manager")),
+                    roles[0]["id"] if roles else None,
+                )
+                if manager_role_id:
+                    membership_payload = {
+                        "membership": {"user_id": user["id"], "role_ids": [manager_role_id]}
+                    }
+                    await client.post(
+                        f"{self.url}/projects/{project_id}/memberships.json",
+                        json=membership_payload,
+                        headers=self.headers,
+                    )
+
+            get_resp = await client.get(f"{self.url}/projects/{project_id}.json", headers=self.headers)
+            if get_resp.status_code == 200:
+                return get_resp.json().get("project", {})
+            return {"id": project_id, **project_payload}
+
+    async def delete_project(self, project_id: int | str) -> bool:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{self.url}/projects/{project_id}.json",
                 headers=self.headers,
             )
             if resp.status_code == 404:
