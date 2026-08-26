@@ -2,6 +2,7 @@ import uuid
 from datetime import date
 from sqlalchemy import Column, String, Date, DateTime, Numeric, Boolean, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 from app.core.models import Base
 
 
@@ -27,6 +28,8 @@ class ShiftAttendance(Base):
     total_hours = Column(Numeric(5, 2), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    shift = relationship("Shift", back_populates="attendance_punch")
 
     def to_dict(self) -> dict:
         return {

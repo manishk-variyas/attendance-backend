@@ -1,13 +1,16 @@
 import asyncio
+import glob
 import json
 import os
 import time
+import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import openpyxl
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.core.limiter import limiter
@@ -22,6 +25,20 @@ AUDIT_LOG_PATH = os.path.join(LOG_DIR, "audit.log")
 
 STREAM_TIMEOUT = 900
 
+DEFAULT_LOG_TZ = "Asia/Kolkata"
+
+
+def _parse_datetime(value: str, tz: ZoneInfo) -> datetime:
+    """Parse an ISO datetime to a timezone-aware UTC datetime.
+
+    Naive inputs are assumed to be in `tz` (e.g. '2026-08-24T18:00:00' = 6 PM IST).
+    """
+    clean = value.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(clean)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(timezone.utc)
+
 
 def _parse_log_line(line: str) -> Optional[dict]:
     line = line.strip()
@@ -34,16 +51,49 @@ def _parse_log_line(line: str) -> Optional[dict]:
         return None
 
 
+def _rotated_log_paths() -> list:
+    """Return rotated audit log files (excluding the active one), oldest first."""
+    active = os.path.abspath(AUDIT_LOG_PATH)
+    paths = []
+    for p in glob.glob(os.path.join(LOG_DIR, "audit.log*")):
+        if os.path.abspath(p) == active:
+            continue
+        if os.path.isfile(p):
+            paths.append(p)
+    paths.sort(key=os.path.getmtime)
+    return paths
+
+
+def _read_lines(path: str):
+    """Yield lines from a log file, transparently handling loguru .zip rotation archives."""
+    if path.endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                yield from zf.read(name).decode("utf-8").splitlines()
+    else:
+        with open(path, "r", encoding="utf-8") as fh:
+            yield from fh
+
+
+def _iter_log_lines():
+    """Yield audit log lines in chronological order (rotated archives oldest-first, then active file)."""
+    for p in _rotated_log_paths():
+        yield from _read_lines(p)
+    if os.path.exists(AUDIT_LOG_PATH):
+        yield from _read_lines(AUDIT_LOG_PATH)
+
+
 @router.get("")
 @limiter.limit("5/minute")
 async def get_audit_logs(
     request: Request,
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
-    since: Optional[str] = Query(None),
-    until: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="Start datetime (ISO, e.g. 2026-08-24T18:00:00)"),
+    until: Optional[str] = Query(None, description="End datetime (ISO, e.g. 2026-08-24T19:00:00)"),
+    tz: Optional[str] = Query(None, description="Timezone for naive since/until (default Asia/Kolkata)"),
     action: Optional[str] = Query(None),
-    search: Optional[str] = Query(None, description="Search by username"),
+    search: Optional[str] = Query(None, description="Search username, message, or client IP"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     page: int = Query(1, description="Page number"),
     page_size: int = Query(50, description="Results per page"),
@@ -52,54 +102,58 @@ async def get_audit_logs(
     page_size = max(1, min(100, page_size))
     search_term = (search or "").strip().lower()[:100]
 
+    try:
+        log_tz = ZoneInfo(tz or DEFAULT_LOG_TZ)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid timezone.")
+
     entries = []
     since_dt = None
     if since:
         try:
-            clean = since.replace("Z", "+00:00")
-            since_dt = datetime.fromisoformat(clean)
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
+            since_dt = _parse_datetime(since, log_tz)
         except (ValueError, TypeError):
-            pass
+            raise HTTPException(status_code=400, detail="Invalid 'since' format. Use ISO datetime, e.g. 2026-08-24T18:00:00")
     until_dt = None
     if until:
         try:
-            clean = until.replace("Z", "+00:00")
-            until_dt = datetime.fromisoformat(clean)
-            if until_dt.tzinfo is None:
-                until_dt = until_dt.replace(tzinfo=timezone.utc)
+            until_dt = _parse_datetime(until, log_tz)
         except (ValueError, TypeError):
-            pass
+            raise HTTPException(status_code=400, detail="Invalid 'until' format. Use ISO datetime, e.g. 2026-08-24T19:00:00")
 
-    if os.path.exists(AUDIT_LOG_PATH):
-        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                entry = _parse_log_line(line)
-                if not entry:
+    for line in _iter_log_lines():
+        entry = _parse_log_line(line)
+        if not entry:
+            continue
+        metadata = entry.get("metadata") or {}
+        if metadata.get("action") == "backchannel_logout":
+            continue
+        if action and metadata.get("action", "").lower() != action.lower():
+            continue
+        if search_term:
+            hay = " ".join(filter(None, [
+                metadata.get("username"),
+                entry.get("message"),
+                metadata.get("client_ip"),
+            ])).lower()
+            if search_term not in hay:
+                continue
+        if since_dt or until_dt:
+            try:
+                ts = entry.get("time", "")
+                if not ts:
                     continue
-                metadata = entry.get("metadata") or {}
-                if metadata.get("action") == "backchannel_logout":
+                entry_time = datetime.fromisoformat(ts)
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+                entry_time = entry_time.astimezone(timezone.utc)
+                if since_dt and entry_time < since_dt:
                     continue
-                if action and metadata.get("action", "").lower() != action.lower():
+                if until_dt and entry_time > until_dt:
                     continue
-                if search_term:
-                    username = (metadata.get("username") or "").lower()
-                    if search_term not in username:
-                        continue
-                if since_dt or until_dt:
-                    try:
-                        ts = entry.get("time", "")
-                        if not ts:
-                            continue
-                        entry_time = datetime.fromisoformat(ts)
-                        if since_dt and entry_time < since_dt:
-                            continue
-                        if until_dt and entry_time > until_dt:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-                entries.append(entry)
+            except (ValueError, TypeError):
+                continue
+        entries.append(entry)
 
     entries.reverse()
 
@@ -116,7 +170,7 @@ async def get_audit_logs(
                 entry.get("level", ""),
                 metadata.get("action", ""),
                 metadata.get("username", ""),
-                entry.get("status", ""),
+                metadata.get("status", ""),
                 entry.get("message", ""),
                 metadata.get("client_ip", ""),
                 entry.get("correlation_id", ""),
@@ -233,14 +287,12 @@ async def get_audit_actions(
     _: None = Depends(require_admin),
 ):
     actions = set()
-    if os.path.exists(AUDIT_LOG_PATH):
-        with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                entry = _parse_log_line(line)
-                if not entry:
-                    continue
-                metadata = entry.get("metadata") or {}
-                action = metadata.get("action")
-                if action:
-                    actions.add(action)
+    for line in _iter_log_lines():
+        entry = _parse_log_line(line)
+        if not entry:
+            continue
+        metadata = entry.get("metadata") or {}
+        action = metadata.get("action")
+        if action:
+            actions.add(action)
     return {"actions": sorted(actions)}

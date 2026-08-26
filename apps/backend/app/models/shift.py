@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, Integer, Boolean, Date, Time, DateTime, Enum as SAEnum, text
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 from app.core.models import Base
 
 
@@ -32,6 +33,8 @@ class Shift(Base):
     checkin_reminder_sent = Column(Boolean, nullable=False, server_default=text("false"))
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    attendance_punch = relationship("ShiftAttendance", back_populates="shift", uselist=False)
 
     def to_dict(self) -> dict:
         return {

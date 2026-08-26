@@ -104,6 +104,11 @@ class EmailService:
         body = _template("missed_checkin_reminder", employee_name=employee_name, shift_date=shift_date, shift_start_time=shift_start_time)
         return self.send([to], subject, body)
 
+    def send_onboarding_welcome(self, to: str, employee_name: str, designation: str, employee_id: str, email: str, joining_date: str, reports_to_name: str, company_name: str, portal_url: str = "https://attendance.variyaslabs.com/") -> bool:
+        subject = f"Welcome to {company_name} — Your Account is Ready, {employee_name.split()[0]}!"
+        body = _template("onboarding_welcome", employee_name=employee_name, designation=designation, employee_id=employee_id, email=email, joining_date=joining_date, reports_to_name=reports_to_name, company_name=company_name, portal_url=portal_url)
+        return self.send([to], subject, body)
+
 
 _EMAIL_TEMPLATES = {
     "missed_checkin_reminder": """
@@ -228,6 +233,23 @@ _EMAIL_TEMPLATES = {
         </table>
         <p>Please contact your manager if you have any questions.</p>
         <p class="cta">View on the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a>.</p>
+    """,
+    "onboarding_welcome": """
+        <div class="badge badge-success">Welcome Aboard</div>
+        <p>Dear {employee_name},</p>
+        <p>Welcome to <strong>{company_name}</strong>! We're delighted to have you join us as <strong>{designation}</strong>.</p>
+        <p>Your employee account has been successfully onboarded and is now active.</p>
+        <table class="details">
+            <tr><td>Employee ID</td><td>{employee_id}</td></tr>
+            <tr><td>Email</td><td>{email}</td></tr>
+            <tr><td>Designation</td><td>{designation}</td></tr>
+            <tr><td>Joining Date</td><td>{joining_date}</td></tr>
+            <tr><td>Reporting To</td><td>{reports_to_name}</td></tr>
+        </table>
+        <p><strong>Next steps:</strong> Log in to the Attendance Portal to complete your profile, view your shifts, and explore leave & WFH features.</p>
+        <p class="cta"><a href="{portal_url}">Go to Attendance Portal →</a></p>
+        <p>If you need assistance, contact HR or your reporting manager. We're excited to have you on board!</p>
+        <p>Warm regards,<br><strong>Team {company_name}</strong></p>
     """,
 }
 

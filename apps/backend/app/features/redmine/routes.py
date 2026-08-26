@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
 from datetime import date, timedelta, datetime
-from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectUpdate, ProjectResponse, AdminProjectListResponse, AdminProjectItem, AdminProjectDetail, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectUpdate, ProjectResponse, AdminProjectListResponse, AdminProjectItem, AdminProjectDetail, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, MemberAdd, MemberUpdate, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
@@ -51,6 +51,24 @@ def _validate_uploaded_file(f: UploadFile):
             status_code=400,
             detail=f"File type '{ext}' is not allowed. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
+
+
+def _can_manage_members(current_user: dict, db: Session, project_id: int) -> bool:
+    """Admin can manage any project's members; PM/PC only projects they hold PM/PC role in."""
+    roles = current_user.get("roles", [])
+    if "Admin" in roles:
+        return True
+    if "Project Manager" not in roles and "Project Coordinator" not in roles:
+        return False
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        return False
+    for m in sql.get_memberships_for_users([rm_user["id"]]):
+        if m["project_id"] == project_id and m["role"] in ("Project Manager", "Project Coordinator"):
+            return True
+    return False
+
 
 router = APIRouter()
 
@@ -751,6 +769,181 @@ async def get_project_members(
                 m["name"] = emp_name
 
     return members
+
+
+@router.get("/projects/{project_id}/members")
+async def list_project_members(
+    project_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("name", description="name, email, designation"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    search: Optional[str] = Query(None, max_length=100, description="Search name, email, designation"),
+    role_id: Optional[str] = Query(None, max_length=200, description="Comma-separated role ids"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _can_manage_members(current_user, db, project_id):
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    sql = RedmineSQLService(db)
+    members = sql.get_project_memberships(project_id)
+    for m in members:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == m["user_id"]).first()
+        if emp:
+            if emp.user_email:
+                m["email"] = emp.user_email
+            emp_name = f"{emp.first_name or ''} {emp.middle_name or ''} {emp.last_name or ''}".strip().replace("  ", " ")
+            if emp_name:
+                m["name"] = emp_name
+            m["designation"] = emp.designation
+        else:
+            m["designation"] = None
+
+    # Search filter (name, email, designation)
+    if search:
+        term = search.strip().lower()[:100]
+        if term:
+            members = [
+                m for m in members
+                if term in " ".join(filter(None, [m.get("name"), m.get("email"), m.get("designation")])).lower()
+            ]
+
+    # Role filter (any-of)
+    if role_id:
+        try:
+            rids = [int(x.strip()) for x in role_id.split(",") if x.strip()][:50]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid role_id. Use comma-separated role ids.")
+        if rids:
+            members = [
+                m for m in members
+                if any(r.get("id") in rids for r in m.get("roles", []))
+            ]
+
+    # Sort (whitelisted)
+    sort_attr = sort_by if sort_by in ("name", "email", "designation") else "name"
+    members.sort(key=lambda m: (m.get(sort_attr) or "").lower(), reverse=(sort_dir == "desc"))
+
+    # Paginate
+    total = len(members)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+    offset = (page - 1) * page_size
+    records = members[offset:offset + page_size]
+
+    return {
+        "records": records,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
+@router.post("/projects/{project_id}/members")
+@limiter.limit("10/minute")
+async def add_project_member(
+    request: Request,
+    project_id: int,
+    payload: MemberAdd,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _can_manage_members(current_user, db, project_id):
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    ok = await redmine_service.add_membership(project_id, payload.user_id, payload.role_ids)
+    if not ok:
+        raise HTTPException(status_code=409, detail="User is already a member of this project or invalid input.")
+
+    audit_logger.info(
+        f"Member added to project {project_id} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "add_member",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project_id": project_id,
+                "user_id": payload.user_id,
+            },
+        },
+    )
+    return {"status": "success", "message": "Member added"}
+
+
+@router.put("/projects/{project_id}/members/{user_id}")
+@limiter.limit("10/minute")
+async def update_project_member(
+    request: Request,
+    project_id: int,
+    user_id: int,
+    payload: MemberUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _can_manage_members(current_user, db, project_id):
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    sql = RedmineSQLService(db)
+    member = next((m for m in sql.get_project_memberships(project_id) if m["user_id"] == user_id), None)
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found in this project.")
+
+    ok = await redmine_service.update_membership(member["membership_id"], payload.role_ids)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Failed to update member roles.")
+
+    audit_logger.info(
+        f"Member roles updated for user {user_id} in project {project_id} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "update_member",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project_id": project_id,
+                "user_id": user_id,
+            },
+        },
+    )
+    return {"status": "success", "message": "Member updated"}
+
+
+@router.delete("/projects/{project_id}/members/{user_id}")
+@limiter.limit("10/minute")
+async def remove_project_member(
+    request: Request,
+    project_id: int,
+    user_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _can_manage_members(current_user, db, project_id):
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    removed = await redmine_service.remove_user_from_project(user_id, project_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Member not found in this project.")
+
+    audit_logger.info(
+        f"Member {user_id} removed from project {project_id} by {current_user.get('username')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "remove_member",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "project_id": project_id,
+                "user_id": user_id,
+            },
+        },
+    )
+    return {"status": "success", "message": "Member removed"}
+
 
 # ── BACKUP: old HTTP-based handler ──────────────────────────────────
 # @router.get("/project-members/{project_id}", response_model=List[ProjectMember])

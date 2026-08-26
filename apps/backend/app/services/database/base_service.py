@@ -1,7 +1,7 @@
 import logging
-from typing import TypeVar, Generic, Type, Any, List, Optional, Dict
+from typing import TypeVar, Generic, Type, Any, List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import select, update as sql_update, delete as sql_delete, text
+from sqlalchemy import select, update as sql_update, delete as sql_delete
 from sqlalchemy.exc import SQLAlchemyError
 
 # Set up a generic logger for database operations
@@ -96,31 +96,3 @@ class BaseService(Generic[T]):
             self.db.rollback()
             logger.error(f"Database error during delete for model {model.__name__}: {e}")
             raise RuntimeError("An internal error occurred while deleting data.")
-
-    def execute_raw(self, sql_query: str, params: Dict[str, Any] = None) -> Any:
-        """
-        Executes a raw SQL query safely using parameterized inputs.
-        
-        WARNING: NEVER use Python string formatting (e.g., f-strings or .format()) 
-        to inject variables into `sql_query`. This will lead to SQL injection.
-        Always pass variables via the `params` dictionary.
-        
-        Example:
-            # VULNERABLE (DO NOT DO THIS):
-            service.execute_raw(f"SELECT * FROM users WHERE name = '{name}'")
-            
-            # SECURE (DO THIS):
-            service.execute_raw("SELECT * FROM users WHERE name = :name", {"name": "John"})
-        """
-        try:
-            stmt = text(sql_query)
-            result = self.db.execute(stmt, params or {})
-            self.db.commit()
-            
-            # For SELECT queries, you can call result.fetchall()
-            # For INSERT/UPDATE/DELETE, result.rowcount gives affected rows
-            return result
-        except SQLAlchemyError as e:
-            self.db.rollback()
-            logger.error(f"Database error during raw query execution: {e}")
-            raise RuntimeError("An internal error occurred while executing raw query.")

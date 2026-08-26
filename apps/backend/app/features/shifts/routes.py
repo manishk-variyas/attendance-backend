@@ -24,6 +24,7 @@ from app.models.holiday import Holiday
 from app.models.shift_definition import ShiftDefinition
 from app.models.attendance import Attendance
 from app.utils.audit import audit_logger
+from app.utils.excel import build_shifts_excel
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,25 @@ async def authorize_shift_access(current_user: dict, target_email: str = None, t
 
 
 
+def _times_overlap(s1, e1, s2, e2) -> bool:
+    """Return True if two time windows overlap. Handles overnight shifts
+    where end_time <= start_time (window crosses midnight)."""
+    def _range(start, end):
+        if start is None or end is None:
+            return None
+        a = start.hour * 60 + start.minute
+        b = end.hour * 60 + end.minute
+        if b <= a:
+            b += 1440
+        return (a, b)
+
+    r1 = _range(s1, e1)
+    r2 = _range(s2, e2)
+    if r1 is None or r2 is None:
+        return False
+    return max(r1[0], r2[0]) < min(r1[1], r2[1])
+
+
 async def check_and_resolve_tr_availability(db: Session, userId: int, userEmail: str, date_str: str, end_date_str: str = None):
     try:
         shift_date = date.fromisoformat(date_str)
@@ -95,9 +115,10 @@ async def check_and_resolve_tr_availability(db: Session, userId: int, userEmail:
         import logging
         logging.getLogger(__name__).error(f"Error checking leave status for {userEmail}: {e}")
 
-    from app.services.database.shift_service import ShiftService as PGShiftService
-    svc = PGShiftService(db)
-    svc.delete_by_user_and_date(userId, date_str)
+    # Disabled: deleting existing shifts here prevented multiple shifts per day.
+    # from app.services.database.shift_service import ShiftService as PGShiftService
+    # svc = PGShiftService(db)
+    # svc.delete_by_user_and_date(userId, date_str)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -156,6 +177,12 @@ async def create_shift(
     created = []
     from app.services.database.shift_service import ShiftService as PGShiftService
     svc = PGShiftService(db)
+    try:
+        new_start = time.fromisoformat(payload.shiftStartTime[:5])
+        new_end = time.fromisoformat(payload.shiftEndTime[:5])
+    except ValueError:
+        new_start = None
+        new_end = None
     current_date = start
     skipped_weekends = 0
     skipped_holidays = 0
@@ -173,6 +200,40 @@ async def create_shift(
                 current_date += timedelta(days=1)
                 continue
         date_str = current_date.isoformat()
+
+        # Reject duplicate assignment: same user + date + shift code
+        duplicate = db.query(Shift).filter(
+            Shift.user_email == payload.userEmail,
+            Shift.date == current_date,
+            Shift.shift_code == payload.shift,
+        ).first()
+        if duplicate:
+            raise HTTPException(
+                status_code=409,
+                detail=f"User already has shift '{payload.shift}' on {date_str}.",
+            )
+
+        # Reject time overlap with any existing shift on the same date
+        if new_start is not None and new_end is not None:
+            existing_shifts = db.query(Shift).filter(
+                Shift.user_email == payload.userEmail,
+                Shift.date == current_date,
+            ).all()
+            for es in existing_shifts:
+                if (
+                    es.shift_start_time
+                    and es.shift_end_time
+                    and _times_overlap(new_start, new_end, es.shift_start_time, es.shift_end_time)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Shift overlaps existing shift '{es.shift_code}' "
+                            f"({es.shift_start_time.strftime('%H:%M')} - {es.shift_end_time.strftime('%H:%M')}) "
+                            f"on {date_str}."
+                        ),
+                    )
+
         await check_and_resolve_tr_availability(db, payload.userId, payload.userEmail, date_str, date_str)
         shift_data = {**base, "date": date_str, "endDate": date_str}
         result = await shift_service.create_shift(db, shift_data, current_user)
@@ -273,7 +334,8 @@ async def create_bulk_shifts(
             current_date += timedelta(days=1)
             continue
 
-        svc.delete_by_user_and_date(payload.userId, date_str)
+        # Disabled: prevents multiple shifts per day.
+        # svc.delete_by_user_and_date(payload.userId, date_str)
         shift_data = {**base, "date": date_str, "endDate": date_str}
         result = await shift_service.create_shift(db, shift_data, current_user)
         created.append(result)
@@ -504,6 +566,60 @@ async def get_shifts_by_range(
     return {"timeline": result}
 
 
+@router.get("/roster")
+async def get_roster(
+    start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
+    end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
+    user_id: Optional[int] = Query(None, description="User ID to view schedule for (PM/Admin only)"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    current_email = current_user.get("email")
+    if not current_email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+
+    allowed_roles = ["Technical Resource", "Project Manager", "Admin", "Project Coordinator"]
+    if not any(role in roles for role in allowed_roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorized to access this feature.",
+        )
+
+    try:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if sd > ed:
+        raise HTTPException(status_code=400, detail="start_date must be on or before end_date.")
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    current_rm_user = sql.get_user_by_email(current_email)
+    if not current_rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    current_rm_id = current_rm_user["id"]
+
+    target_user_id = user_id or current_rm_id
+
+    if target_user_id != current_rm_id:
+        if "Admin" in roles:
+            pass
+        elif "Project Manager" in roles or "Project Coordinator" in roles:
+            pm_project_ids = {p.id for p in sql.get_projects_for_user(current_rm_id)}
+            tr_project_ids = {p.id for p in sql.get_projects_for_user(target_user_id)}
+            if not pm_project_ids.intersection(tr_project_ids):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only view shifts for users in your projects.",
+                )
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to view other users' shifts.")
+
+    return await shift_service.get_roster(db, start_date, end_date, target_user_id)
+
+
 @router.get("/date/{date_str}")
 async def get_shifts_by_date(
     date_str: str,
@@ -589,38 +705,6 @@ async def get_shift_history(
     return {"total": len(records), "records": records}
 
 
-def _build_shifts_excel(records: list) -> BytesIO:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Shifts"
-    ws.append(["Date", "Day", "Employee", "Designation", "Project", "Shift Code", "Shift Name",
-               "Work Status", "Status", "Shift Start", "Shift End", "Check In", "Check Out",
-               "Total Hours", "Late (hrs)", "Work Address"])
-    for r in records:
-        ws.append([
-            r.get("date") or "",
-            r.get("dayName") or "",
-            r.get("userName") or "",
-            r.get("userDesignation") or "",
-            r.get("projectName") or "",
-            r.get("shift") or "",
-            r.get("shiftName") or "",
-            r.get("workStatus") or "",
-            r.get("status") or "",
-            r.get("shiftStartTime") or "",
-            r.get("shiftEndTime") or "",
-            r.get("checkInTime") or "",
-            r.get("checkOutTime") or "",
-            r.get("totalHours") if r.get("totalHours") is not None else "",
-            r.get("lateByHours") if r.get("lateByHours") is not None else "",
-            r.get("workAddress") or "",
-        ])
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
-
-
 @router.get("/my-history")
 async def get_my_shift_history(
     request: Request,
@@ -651,7 +735,7 @@ async def get_my_shift_history(
         page=page, page_size=page_size, export=export,
     )
     if export:
-        output = _build_shifts_excel(result["records"])
+        output = build_shifts_excel(result["records"])
         audit_logger.info(
             f"Shift history exported by {current_user.get('username')}",
             extra={
@@ -718,7 +802,7 @@ async def get_team_shift_history(
         page=page, page_size=page_size, export=export,
     )
     if export:
-        output = _build_shifts_excel(result["records"])
+        output = build_shifts_excel(result["records"])
         audit_logger.info(
             f"Team shift history exported by {current_user.get('username')}",
             extra={
@@ -741,6 +825,78 @@ async def get_team_shift_history(
     return result
 
 
+
+
+@router.get("/my-shifts-v1")
+async def get_my_shifts_v1(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: completed, in_progress, on_leave, missed, yet_to_start"),
+    search: Optional[str] = Query(None, description="Search shift code, project, work address"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+    return await shift_service.get_shifts_v1(
+        db, emails=[email],
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status,
+        search=search, include_name_search=False,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size,
+    )
+
+
+@router.get("/team-shifts-v1")
+async def get_team_shifts_v1(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: completed, in_progress, on_leave, missed, yet_to_start"),
+    search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    from app.features.redmine.sql_service import RedmineSQLService
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
+    member_emails = [e.user_email for e in emps if e.user_email]
+    if not member_emails:
+        return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+    return await shift_service.get_shifts_v1(
+        db, emails=member_emails,
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status,
+        search=search, include_name_search=True,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size,
+    )
 
 
 @router.put("/{shift_id}")

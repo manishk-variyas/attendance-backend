@@ -5,7 +5,7 @@ from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_admin_or_pm
 from app.features.leaves.schemas.leaves import EmployeeLeaveBalanceBulkCreate
 from app.features.leaves.services.leave_service import LeaveBusinessService
-from app.services.database.dependencies import get_leave_business_service
+from app.features.leaves.dependencies import get_leave_business_service
 from app.middleware.logging import _get_client_ip
 from app.utils.audit import audit_logger
 

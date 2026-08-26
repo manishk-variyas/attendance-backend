@@ -1,150 +1,144 @@
 """
-Logging configuration for the backend application.
+Logging configuration for the backend application (loguru-based).
 
 This module sets up structured JSON logging with multiple outputs:
-- Console output (stdout) for Docker/Kubernetes logging
-- Rotating log files (access.log, audit.log, error.log)
+- Console (stdout) for Docker/Kubernetes logging
+- Rotating log files (access.log, audit.log, error.log, sweeper.log)
 
 Features:
 - All logs are formatted as JSON for easy parsing by log aggregation tools
 - Correlation IDs are included in every log entry (tracks requests across the system)
-- Different loggers for different purposes (access, audit, error)
-- Automatic log rotation (10MB per file, keeps 5 backups)
+- Different sinks for different purposes (access, audit, error, sweeper)
+- Automatic rotation + retention + compression (no cron cleanup needed)
+- All existing stdlib `logging.getLogger(...)` calls are routed through loguru
+  via an intercept handler, so nothing else in the codebase needs to change.
 
-Loggers:
-- app.access: HTTP request logs (method, path, status, duration)
-- app.audit: Security events (login, logout, etc.)
-- app.error: Error logs
-- root: General application logs
+Loggers/sinks:
+- app.access:  HTTP request logs  -> access.log
+- app.audit:   security events      -> audit.log
+- app.error:   error logs           -> error.log
+- app.sweeper: background cron runs -> sweeper.log
+- everything else                   -> console (+ error.log on ERROR)
 """
 import json
 import logging
-import logging.handlers
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
-from typing import Any
+
+from loguru import logger
 
 
 # Log directory - can be overridden with LOG_DIR environment variable
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Rotation settings: 10MB per file, keep 5 backup files
-MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-BACKUP_COUNT = 5
+ROTATION = "10 MB"
+RETENTION = "14 days"
+COMPRESSION = "zip"
 
 
-class JSONFormatter(logging.Formatter):
-    """
-    Custom formatter that outputs log records as JSON.
-    
-    Each log entry is a JSON object with:
-    - time: ISO timestamp
-    - level: log level (INFO, ERROR, etc.)
-    - source: logger name
-    - correlation_id: request tracking ID
-    - message: the log message
-    - metadata: any extra fields (optional)
-    - exception: exception info (if present)
-    """
-    def format(self, record: logging.LogRecord) -> str:
-        log_entry = {
-            "time": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "level": record.levelname,
-            "source": record.name,
-            "correlation_id": getattr(record, "correlation_id", "-"),
-            "message": record.getMessage(),
-        }
+def _record_to_json(record) -> str:
+    """Serialize a loguru record into the app's canonical JSON shape."""
+    extra = record["extra"]
 
-        if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = self.formatException(record.exc_info)
+    t = record["time"]
+    if getattr(t, "tzinfo", None) is None:
+        t = t.replace(tzinfo=timezone.utc)
+    t = t.astimezone(timezone.utc)
 
-        extra = getattr(record, "extra_data", None)
-        if extra:
-            log_entry["metadata"] = extra
+    entry = {
+        "time": t.isoformat(),
+        "level": record["level"].name,
+        "source": extra.get("source", record["name"]),
+        "correlation_id": extra.get("correlation_id", "-"),
+        "message": record["message"],
+    }
 
-        return json.dumps(log_entry, default=str)
+    if record["exception"]:
+        entry["exception"] = "".join(traceback.format_exception(*record["exception"]))
+
+    extra_data = extra.get("extra_data")
+    if extra_data:
+        entry["metadata"] = extra_data
+
+    return json.dumps(entry, default=str)
 
 
-class CorrelationFilter(logging.Filter):
-    """
-    Logging filter that ensures correlation_id is always present.
-    
-    If a log record doesn't have a correlation_id attribute,
-    this adds one with a default value of "-".
-    """
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not hasattr(record, "correlation_id"):
-            record.correlation_id = "-"
-        return True
+def _patch(record):
+    record["extra"]["_serialized"] = _record_to_json(record)
 
 
-def _build_handler(filename: str, level: int = logging.DEBUG) -> logging.handlers.RotatingFileHandler:
-    """Create a rotating file handler for the given log file."""
-    handler = logging.handlers.RotatingFileHandler(
-        os.path.join(LOG_DIR, filename),
-        maxBytes=MAX_BYTES,
-        backupCount=BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setLevel(level)
-    handler.setFormatter(JSONFormatter())
-    handler.addFilter(CorrelationFilter())
-    return handler
+logger = logger.patch(_patch)
 
 
-def _build_console_handler(level: int = logging.INFO) -> logging.StreamHandler:
-    """Create a console handler that outputs to stdout."""
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(level)
-    handler.setFormatter(JSONFormatter())
-    handler.addFilter(CorrelationFilter())
-    return handler
+class InterceptHandler(logging.Handler):
+    """Forward stdlib logging records through loguru."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        frame, depth = logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).bind(
+            correlation_id=getattr(record, "correlation_id", "-"),
+            extra_data=getattr(record, "extra_data", None),
+            source=record.name,
+        ).log(level, record.getMessage())
 
 
 def setup_logging() -> None:
-    """
-    Configure all loggers for the application.
-    
-    This sets up:
-    - app.access: Logs HTTP requests (method, path, status, duration)
-    - app.audit: Logs security events (login, logout, etc.)
-    - app.error: Logs errors
-    - root: General application logs
-    
-    Each logger writes to both console (for Docker) and rotating log files.
-    """
-    # Access logger - logs HTTP requests
-    access_logger = logging.getLogger("app.access")
-    access_logger.setLevel(logging.INFO)
-    access_logger.addHandler(_build_handler("access.log", logging.INFO))
-    access_logger.addHandler(_build_console_handler(logging.INFO))
-    access_logger.propagate = False
+    """Configure loguru sinks and route all stdlib logging through them."""
+    # Route every stdlib logger (app.access, app.audit, app.error, app.sweeper,
+    # module loggers, root) through loguru via the intercept handler.
+    logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
-    # Audit logger - logs security events
-    audit_logger = logging.getLogger("app.audit")
-    audit_logger.setLevel(logging.INFO)
-    audit_logger.addHandler(_build_handler("audit.log", logging.INFO))
-    audit_logger.addHandler(_build_console_handler(logging.INFO))
-    audit_logger.propagate = False
+    logger.remove()
 
-    # Error logger - logs errors
-    error_logger = logging.getLogger("app.error")
-    error_logger.setLevel(logging.ERROR)
-    error_logger.addHandler(_build_handler("error.log", logging.ERROR))
-    error_logger.addHandler(_build_console_handler(logging.ERROR))
-    error_logger.propagate = False
-
-    # Sweeper logger - logs background cron job runs (auto-checkout, reminders)
-    sweeper_logger = logging.getLogger("app.sweeper")
-    sweeper_logger.setLevel(logging.INFO)
-    sweeper_logger.addHandler(_build_handler("sweeper.log", logging.INFO))
-    sweeper_logger.addHandler(_build_console_handler(logging.INFO))
-    sweeper_logger.propagate = False
-
-    # Root logger - general application logs
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(_build_console_handler(logging.INFO))
-    root.addHandler(_build_handler("error.log", logging.ERROR))
+    logger.add(
+        sys.stdout,
+        format="{extra[_serialized]}",
+        level="INFO",
+    )
+    logger.add(
+        os.path.join(LOG_DIR, "access.log"),
+        format="{extra[_serialized]}",
+        level="INFO",
+        filter=lambda r: r["extra"].get("source") == "app.access",
+        rotation=ROTATION,
+        retention=RETENTION,
+        compression=COMPRESSION,
+    )
+    logger.add(
+        os.path.join(LOG_DIR, "audit.log"),
+        format="{extra[_serialized]}",
+        level="INFO",
+        filter=lambda r: r["extra"].get("source") == "app.audit",
+        rotation=ROTATION,
+        retention="30 days",
+        compression=COMPRESSION,
+    )
+    logger.add(
+        os.path.join(LOG_DIR, "error.log"),
+        format="{extra[_serialized]}",
+        level="ERROR",
+        rotation=ROTATION,
+        retention="30 days",
+        compression=COMPRESSION,
+    )
+    logger.add(
+        os.path.join(LOG_DIR, "sweeper.log"),
+        format="{extra[_serialized]}",
+        level="INFO",
+        filter=lambda r: r["extra"].get("source") == "app.sweeper",
+        rotation=ROTATION,
+        retention=RETENTION,
+        compression=COMPRESSION,
+    )

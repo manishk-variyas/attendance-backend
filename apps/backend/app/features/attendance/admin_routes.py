@@ -17,19 +17,11 @@ from app.models.leave import Leave
 from app.services.database.base_service import BaseService
 from zoneinfo import ZoneInfo
 
-from app.features.redmine.constants import REDMINE_TO_IANA_TZ
+from app.utils.shift_time import safe_zone
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/attendance", tags=["admin-attendance"])
-
-
-def _safe_zone(tz_str: str) -> ZoneInfo:
-    iana = REDMINE_TO_IANA_TZ.get(tz_str, tz_str)
-    try:
-        return ZoneInfo(iana)
-    except Exception:
-        return ZoneInfo("Asia/Kolkata")
 
 
 def _enrich_with_maps(data: dict, a: Attendance, loc_map: dict, sd_map: dict) -> dict:
@@ -44,9 +36,9 @@ def _enrich_with_maps(data: dict, a: Attendance, loc_map: dict, sd_map: dict) ->
             data["shiftName"] = sd.shift_name
             tz = sd.timezone or "Asia/Kolkata"
             if sd.start_time:
-                data["shiftStartTime"] = datetime.combine(a.attendance_date, sd.start_time, tzinfo=_safe_zone(tz)).isoformat()
+                data["shiftStartTime"] = datetime.combine(a.attendance_date, sd.start_time, tzinfo=safe_zone(tz)).isoformat()
             if sd.end_time:
-                data["shiftEndTime"] = datetime.combine(a.attendance_date, sd.end_time, tzinfo=_safe_zone(tz)).isoformat()
+                data["shiftEndTime"] = datetime.combine(a.attendance_date, sd.end_time, tzinfo=safe_zone(tz)).isoformat()
     else:
         data["shiftName"] = None
     data["perDiemEligible"] = a.per_diem_eligible
@@ -147,7 +139,7 @@ def _build_virtual_record(db: Session, shift, emp) -> dict:
     if shift.shift_code:
         sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == shift.shift_code).first()
         if sd and sd.start_time:
-            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            tz = safe_zone(sd.timezone or "Asia/Kolkata")
             shift_start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
             has_started = now_ist >= shift_start_dt
 

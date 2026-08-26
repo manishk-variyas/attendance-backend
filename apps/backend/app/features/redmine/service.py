@@ -468,6 +468,26 @@ class RedmineService:
             )
         return resp.status_code in (201, 200)
 
+    async def add_membership(self, project_id: int, user_id: int, role_ids: list) -> bool:
+        """Add a user to a project with the given roles (multi-role)."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.url}/projects/{project_id}/memberships.json",
+                json={"membership": {"user_id": user_id, "role_ids": role_ids}},
+                headers=self.headers,
+            )
+        return resp.status_code in (200, 201)
+
+    async def update_membership(self, membership_id: int, role_ids: list) -> bool:
+        """Replace a membership's roles."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{self.url}/memberships/{membership_id}.json",
+                json={"membership": {"role_ids": role_ids}},
+                headers=self.headers,
+            )
+        return resp.status_code in (200, 204)
+
     async def get_roles(self) -> list:
         """Fetch all Redmine roles."""
         async with httpx.AsyncClient() as client:

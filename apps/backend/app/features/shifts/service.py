@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
+
+from app.utils.shift_time import safe_zone, shift_end_datetime
 
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
@@ -13,6 +15,7 @@ from app.models.holiday import Holiday
 from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.attendance import Attendance
+from app.models.shift_attendance import ShiftAttendance
 from app.models.system_setting import SystemSetting
 from app.core.cache import clear_shift_definition_cache
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
@@ -22,10 +25,61 @@ from sqlalchemy import update as sql_update, delete as sql_delete
 logger = logging.getLogger(__name__)
 
 
-def _shift_end_datetime(shift_date, start_time, end_time, tz):
-    if start_time and end_time and end_time <= start_time:
-        shift_date += timedelta(days=1)
-    return datetime.combine(shift_date, end_time, tzinfo=tz)
+def _roster_shift_status(shift: Shift, punch, leave, sd, tz: ZoneInfo) -> str:
+    """Derive per-shift status from the shift_attendance punch (source of truth for multi-shift)."""
+    if leave is not None or shift.work_location_status == "LEAVE":
+        return "on_leave"
+    if punch and punch.check_out_time:
+        return "completed"
+    if punch:
+        return "in_progress"
+    if sd and sd.end_time:
+        end_dt = shift_end_datetime(shift.date, sd.start_time, sd.end_time, tz)
+        if datetime.now(tz) > end_dt:
+            return "missed"
+    return "yet_to_start"
+
+
+def _build_shift_record(s: Shift, punch, sd, leave, grace_min: int) -> dict:
+    """Build one rich per-shift record from the shift + its punch (shift_attendance
+    or a legacy `attendance` row fallback). `punch` may be None (not checked in)."""
+    tz = safe_zone(sd.timezone if sd else None)
+    start_time = s.shift_start_time or (sd.start_time if sd else None)
+    end_time = s.shift_end_time or (sd.end_time if sd else None)
+
+    late_by = None
+    if punch and punch.is_late and punch.check_in_time and sd and sd.start_time:
+        start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
+        cutoff = start_dt + timedelta(minutes=grace_min)
+        if punch.check_in_time > cutoff:
+            late_by = round((punch.check_in_time - cutoff).total_seconds() / 3600, 1)
+
+    return {
+        "id": str(s.id),
+        "shift": s.shift_code,
+        "shiftName": sd.shift_name if sd else None,
+        "date": s.date.isoformat() if s.date else None,
+        "dayName": s.date.strftime("%A") if s.date else None,
+        "shiftStartTime": start_time.isoformat() if start_time else None,
+        "shiftEndTime": end_time.isoformat() if end_time else None,
+        "timezone": sd.timezone if sd else None,
+        "projectId": s.project_id,
+        "projectName": s.project_name,
+        "workStatus": s.work_location_status,
+        "workAddress": s.work_address,
+        "status": _roster_shift_status(s, punch, leave, sd, tz),
+        "checkInTime": punch.check_in_time.isoformat() if punch and punch.check_in_time else None,
+        "checkOutTime": punch.check_out_time.isoformat() if punch and punch.check_out_time else None,
+        "checkInLat": float(punch.check_in_lat) if punch and punch.check_in_lat else None,
+        "checkInLng": float(punch.check_in_lng) if punch and punch.check_in_lng else None,
+        "checkInLocationName": punch.check_in_location_name if punch else None,
+        "checkOutLat": float(punch.check_out_lat) if punch and punch.check_out_lat else None,
+        "checkOutLng": float(punch.check_out_lng) if punch and punch.check_out_lng else None,
+        "checkOutLocationName": punch.check_out_location_name if punch else None,
+        "isLate": punch.is_late if punch else False,
+        "lateByHours": late_by,
+        "totalHours": float(punch.total_hours) if punch and punch.total_hours else None,
+    }
 
 
 def _lookup_attendance(att_map: dict, keycloak_user_id: str, shift_date: date, shift_code: str = None):
@@ -308,7 +362,7 @@ class ShiftService:
                     tz = ZoneInfo("Asia/Kolkata")
                 start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
                 if datetime.now(tz) > start_dt:
-                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
                     derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
                 else:
                     derived_status = "Yet to start"
@@ -406,6 +460,273 @@ class ShiftService:
         result.sort(key=lambda x: x["date"], reverse=False)
         return result
 
+    async def get_roster(self, db: Session, start_date: str, end_date: str, user_id: int = None) -> dict:
+        """Single-user roster grouped by date, with one entry per shift (multi-shift aware).
+
+        Check-in/out, late and hours are read from `shift_attendance` (per-shift
+        punches), NOT the single-row-per-day `attendance` table, so multiple
+        shifts on the same day are represented correctly.
+        """
+        svc = self._svc(db)
+        shifts = svc.fetch_by_date_range(start_date, end_date, user_id)
+
+        sd_date = date.fromisoformat(start_date)
+        ed_date = date.fromisoformat(end_date)
+
+        shift_ids = [s.id for s in shifts]
+        shift_codes = {s.shift_code for s in shifts if s.shift_code}
+        user_ids = {s.keycloak_user_id for s in shifts if s.keycloak_user_id}
+
+        punch_map: dict = {}
+        if shift_ids:
+            punches = db.query(ShiftAttendance).filter(
+                ShiftAttendance.shift_id.in_(shift_ids)
+            ).all()
+            punch_map = {p.shift_id: p for p in punches}
+
+        sd_map: dict = {}
+        if shift_codes:
+            sds = db.query(ShiftDefinition).filter(
+                ShiftDefinition.shift_code.in_(shift_codes)
+            ).all()
+            sd_map = {d.shift_code: d for d in sds}
+
+        emp = None
+        if user_ids:
+            emp = db.query(EmployeeMaster).filter(
+                EmployeeMaster.keycloak_user_id == next(iter(user_ids))
+            ).first()
+
+        leaves = []
+        if user_ids:
+            leaves = db.query(Leave).filter(
+                Leave.keycloak_user_id.in_(user_ids),
+                Leave.approval_status == "approved",
+                Leave.start_date <= ed_date,
+                Leave.end_date >= sd_date,
+            ).all()
+
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        grace_min = company.grace_minutes if company and company.grace_minutes else 0
+        name_map = _leave_type_name_map(db)
+
+        by_date: dict = {}
+        for s in shifts:
+            d_str = s.date.isoformat()
+            punch = punch_map.get(s.id)
+            sd = sd_map.get(s.shift_code)
+            leave = next(
+                (
+                    lv for lv in leaves
+                    if lv.keycloak_user_id == s.keycloak_user_id
+                    and lv.start_date <= s.date
+                    and lv.end_date >= s.date
+                ),
+                None,
+            )
+            record = _build_shift_record(s, punch, sd, leave, grace_min)
+            entry = by_date.setdefault(d_str, {"date": d_str, "shifts": [], "leave": None})
+            entry["shifts"].append(record)
+
+        for lv in leaves:
+            current = lv.start_date
+            while current <= lv.end_date:
+                d_str = current.isoformat()
+                entry = by_date.setdefault(d_str, {"date": d_str, "shifts": [], "leave": None})
+                if not entry["leave"]:
+                    entry["leave"] = {
+                        "id": str(lv.id),
+                        "leaveType": lv.leave_type,
+                        "leaveTypeName": _leave_type_display_name(lv.leave_type, name_map),
+                        "startDate": lv.start_date.isoformat(),
+                        "endDate": lv.end_date.isoformat(),
+                    }
+                current += timedelta(days=1)
+
+        timeline = [by_date[k] for k in sorted(by_date)]
+        return {"timeline": timeline, "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None, "userEmail": emp.user_email if emp else None}
+
+    async def get_shifts_v1(
+        self, db: Session, emails: List[str],
+        from_date: str = None, to_date: str = None,
+        work_status: str = None, project_id: int = None,
+        status: str = None, is_late: bool = None,
+        search: str = None, include_name_search: bool = False,
+        sort_by: str = "date", sort_dir: str = "asc",
+        page: int = 1, page_size: int = 50, export: bool = False,
+    ) -> dict:
+        """Relationship-based, per-shift shift/attendance history (multi-shift aware).
+
+        Reads each shift's punch via `Shift.attendance_punch` (shift_attendance FK
+        relationship), falling back to the legacy `attendance` table for old
+        single-shift data. No virtual record synthesis.
+        """
+        query = (
+            db.query(Shift)
+            .options(selectinload(Shift.attendance_punch))
+            .filter(Shift.user_email.in_(emails))
+        )
+        if from_date:
+            query = query.filter(Shift.date >= date.fromisoformat(from_date))
+        if to_date:
+            query = query.filter(Shift.date <= date.fromisoformat(to_date))
+        if work_status:
+            query = query.filter(Shift.work_location_status == work_status)
+        if project_id:
+            query = query.filter(Shift.project_id == project_id)
+        shifts = query.order_by(Shift.date.desc()).all()
+
+        if not shifts:
+            return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        grace_min = company.grace_minutes if company and company.grace_minutes else 0
+
+        user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
+        shift_codes = list({s.shift_code for s in shifts if s.shift_code})
+        min_date = min(s.date for s in shifts)
+        max_date = max(s.date for s in shifts)
+
+        # Legacy fallback: old /check-in wrote `attendance`, not shift_attendance
+        legacy_map: dict = {}
+        if user_ids:
+            legacy_rows = db.query(Attendance).filter(
+                Attendance.keycloak_user_id.in_(user_ids),
+                Attendance.attendance_date.between(min_date - timedelta(days=1), max_date + timedelta(days=1)),
+            ).all()
+            legacy_map = {(a.keycloak_user_id, a.attendance_date, a.shift_code): a for a in legacy_rows}
+
+        sd_map: dict = {}
+        if shift_codes:
+            sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
+            sd_map = {d.shift_code: d for d in sds}
+
+        leaves = db.query(Leave).filter(
+            Leave.keycloak_user_id.in_(user_ids),
+            Leave.approval_status == "approved",
+            Leave.start_date <= max_date,
+            Leave.end_date >= min_date,
+        ).all()
+
+        name_map = _leave_type_name_map(db)
+
+        kemp_map: dict = {}
+        if user_ids:
+            kemps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(user_ids)).all()
+            kemp_map = {e.keycloak_user_id: e for e in kemps}
+
+        result = []
+        for s in shifts:
+            punch = s.attendance_punch
+            if punch is None:
+                punch = legacy_map.get((s.keycloak_user_id, s.date, s.shift_code))
+            sd = sd_map.get(s.shift_code)
+            emp = kemp_map.get(s.keycloak_user_id)
+            leave = next(
+                (
+                    lv for lv in leaves
+                    if lv.keycloak_user_id == s.keycloak_user_id
+                    and lv.start_date <= s.date
+                    and lv.end_date >= s.date
+                ),
+                None,
+            )
+
+            rec = _build_shift_record(s, punch, sd, leave, grace_min)
+            rec["userEmail"] = s.user_email
+            rec["userName"] = (
+                f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
+                if emp else s.user_email
+            )
+            rec["userDesignation"] = emp.designation if emp else None
+            rec["leaveType"] = leave.leave_type if leave else None
+            rec["leaveTypeId"] = str(leave.leave_type_id) if leave and leave.leave_type_id else None
+            rec["leaveTypeName"] = _leave_type_display_name(leave.leave_type, name_map) if leave else None
+            rec["leaveId"] = str(leave.id) if leave else None
+            rec["leaveStatus"] = "on_leave" if leave else None
+            rec["perDiemEligible"] = s.per_diem_eligible
+            rec["conveyanceEligible"] = s.conveyance_eligible
+            rec["endDate"] = s.end_date.isoformat() if s.end_date else None
+            rec["pincode"] = s.pincode
+            result.append(rec)
+
+        # Leave-only records (approved leave days with no scheduled shift)
+        shifted_dates = {(s.user_email, s.date) for s in shifts}
+        if not work_status:
+            for lv in leaves:
+                if not lv.keycloak_user_id:
+                    continue
+                lemp = kemp_map.get(lv.keycloak_user_id)
+                lv_email = lemp.user_email if lemp else None
+                current = lv.start_date
+                while current <= lv.end_date:
+                    if (lv_email, current) not in shifted_dates:
+                        result.append({
+                            "id": None,
+                            "leaveId": str(lv.id),
+                            "userEmail": lv_email,
+                            "userName": f"{lemp.first_name} {lemp.middle_name or ''} {lemp.last_name}".strip().replace("  ", " ") if lemp else lv_email,
+                            "userDesignation": lemp.designation if lemp else None,
+                            "projectId": None, "projectName": None,
+                            "shift": None, "shiftName": None,
+                            "workStatus": None, "status": "on_leave",
+                            "workAddress": None, "pincode": None,
+                            "leaveType": lv.leave_type,
+                            "leaveTypeId": str(lv.leave_type_id) if lv.leave_type_id else None,
+                            "leaveTypeName": _leave_type_display_name(lv.leave_type, name_map),
+                            "leaveStatus": "on_leave",
+                            "perDiemEligible": False, "conveyanceEligible": False,
+                            "date": current.isoformat(),
+                            "dayName": current.strftime("%A"),
+                            "endDate": current.isoformat(),
+                            "shiftStartTime": None, "shiftEndTime": None,
+                            "timezone": None,
+                            "checkInTime": None, "checkOutTime": None,
+                            "checkInLat": None, "checkInLng": None,
+                            "checkOutLat": None, "checkOutLng": None,
+                            "checkInLocationName": None, "checkOutLocationName": None,
+                            "isLate": False, "lateByHours": None, "totalHours": None,
+                        })
+                    current += timedelta(days=1)
+
+        # is_late filter
+        if is_late is not None:
+            result = [r for r in result if r.get("isLate") == is_late]
+
+        # Search filter
+        if search:
+            term = search.strip().lower()[:100]
+            fields = ["userName", "userEmail", "shift", "shiftName", "projectName", "workAddress", "workStatus", "leaveType"]
+            if not include_name_search:
+                fields = [f for f in fields if f != "userName"]
+            result = [r for r in result if any(term in str(r.get(f) or "").lower() for f in fields)]
+
+        # Status filter (multi-select)
+        if status:
+            statuses = {x.strip().lower() for x in status.split(",") if x.strip()}
+            if statuses:
+                result = [r for r in result if str(r.get("status") or "").lower() in statuses]
+
+        # Sort
+        allowed_sort = {"date", "shiftStartTime", "shiftCode", "workStatus", "userName"}
+        sort_by = sort_by if sort_by in allowed_sort else "date"
+        sort_key = "shift" if sort_by == "shiftCode" else sort_by
+        result.sort(key=lambda r: (r.get(sort_key) or ""), reverse=(sort_dir == "desc"))
+
+        # Paginate
+        total = len(result)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        if export:
+            return {"records": result, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+        offset = (page - 1) * page_size
+        return {
+            "records": result[offset:offset + page_size],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+
     async def get_team_shifts(self, db: Session, emails: list, from_date: str = None, to_date: str = None) -> List[dict]:
         query = db.query(Shift).filter(Shift.user_email.in_(emails))
         if from_date:
@@ -472,7 +793,7 @@ class ShiftService:
                     tz = ZoneInfo("Asia/Kolkata")
                 start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
                 if datetime.now(tz) > start_dt:
-                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
                     derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
                 else:
                     derived_status = "Yet to start"
@@ -651,7 +972,7 @@ class ShiftService:
                     tz = ZoneInfo("Asia/Kolkata")
                 start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
                 if datetime.now(tz) > start_dt:
-                    end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
+                    end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if sd.end_time else None
                     derived_status = "Not checked in" if end_dt and datetime.now(tz) < end_dt else "Missed"
                 else:
                     derived_status = "Yet to start"
@@ -837,6 +1158,9 @@ class ShiftService:
             Attendance.attendance_date <= (shift.end_date or shift.date),
             Attendance.shift_code == shift.shift_code,
         ).delete(synchronize_session=False)
+        db.query(ShiftAttendance).filter(
+            ShiftAttendance.shift_id == shift_id
+        ).delete(synchronize_session=False)
         db.delete(shift)
         db.commit()
         return True
@@ -858,6 +1182,9 @@ class ShiftService:
             ).delete(synchronize_session=False)
 
             if shift.date == shift.end_date:
+                db.query(ShiftAttendance).filter(
+                    ShiftAttendance.shift_id == shift.id
+                ).delete(synchronize_session=False)
                 db.delete(shift)
                 continue
 

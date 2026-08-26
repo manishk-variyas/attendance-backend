@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Form, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from jose import jwt
 from jose.exceptions import JWTError
 from sqlalchemy.orm import Session
@@ -322,7 +322,7 @@ async def backchannel_logout(request: Request, logout_token: str = Form(...)):
         raise HTTPException(status_code=400, detail="Invalid logout token")
 
     # Return 204 No Content as per spec
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 @router.post("/forgot-password")

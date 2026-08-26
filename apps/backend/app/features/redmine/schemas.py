@@ -129,6 +129,9 @@ class AdminProjectItem(BaseModel):
     customerOfficeLocation: str
     projectType: str
     memberCount: int
+    parent_id: Optional[int] = None
+    parent_name: Optional[str] = None
+    subproject_count: int = 0
 
 class AdminProjectListResponse(BaseModel):
     records: List[AdminProjectItem]
@@ -195,6 +198,15 @@ class ProjectMember(BaseModel):
     name: str
     email: str
     roles: List[str]
+
+
+class MemberAdd(BaseModel):
+    user_id: int
+    role_ids: List[int] = Field(default_factory=list)
+
+
+class MemberUpdate(BaseModel):
+    role_ids: List[int] = Field(default_factory=list)
 
 class TimeZoneInfo(BaseModel):
     value: str

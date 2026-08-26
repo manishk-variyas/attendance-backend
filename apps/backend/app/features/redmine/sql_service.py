@@ -149,6 +149,35 @@ class RedmineSQLService:
             result[uid]["roles"].append(r[4])
         return list(result.values())
 
+    def get_project_memberships(self, project_id: int) -> list:
+        """Return members of a project with membership_id + role ids/names (one query)."""
+        rows = self.db.execute(
+            text("""
+                SELECT m.id, u.id, u.firstname, u.lastname, e.address, mr.role_id, r.name
+                FROM redmine.members m
+                JOIN redmine.users u ON u.id = m.user_id AND u.status = 1
+                JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                LEFT JOIN redmine.member_roles mr ON mr.member_id = m.id
+                LEFT JOIN redmine.roles r ON r.id = mr.role_id
+                WHERE m.project_id = :project_id
+            """),
+            {"project_id": project_id},
+        ).fetchall()
+        members = {}
+        for row in rows:
+            membership_id, uid, firstname, lastname, email, role_id, role_name = row
+            if uid not in members:
+                members[uid] = {
+                    "membership_id": membership_id,
+                    "user_id": uid,
+                    "name": f"{firstname} {lastname}".strip(),
+                    "email": email or "",
+                    "roles": [],
+                }
+            if role_id is not None:
+                members[uid]["roles"].append({"id": role_id, "name": role_name})
+        return list(members.values())
+
     def get_team_member_ids(self, pm_user_id: int) -> set:
         """Get all user IDs who share at least one project with the PM."""
         rows = self.db.execute(
@@ -160,6 +189,52 @@ class RedmineSQLService:
                 WHERE pm_m.user_id = :pm_id AND tr_m.user_id != :pm_id2
             """),
             {"pm_id": pm_user_id, "pm_id2": pm_user_id},
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_memberships_for_users(self, rm_user_ids: list) -> list:
+        """Return [{user_id, project_id, project, role}] for the given Redmine user ids (one query)."""
+        if not rm_user_ids:
+            return []
+        rows = self.db.execute(
+            text("""
+                SELECT m.user_id, p.id as project_id, p.name as project, r.name as role
+                FROM redmine.members m
+                JOIN redmine.member_roles mr ON mr.member_id = m.id
+                JOIN redmine.roles r ON r.id = mr.role_id
+                JOIN redmine.projects p ON p.id = m.project_id
+                WHERE m.user_id = ANY(:ids)
+            """),
+            {"ids": list(rm_user_ids)},
+        ).fetchall()
+        return [{"user_id": r[0], "project_id": r[1], "project": r[2], "role": r[3]} for r in rows]
+
+    def get_project_managers(self, project_ids: list) -> list:
+        """Return [{project, manager}] — PM/PC member names per project (one query)."""
+        if not project_ids:
+            return []
+        rows = self.db.execute(
+            text("""
+                SELECT p.name as project, u.firstname || ' ' || u.lastname as manager
+                FROM redmine.members m
+                JOIN redmine.member_roles mr ON mr.member_id = m.id
+                JOIN redmine.roles r ON r.id = mr.role_id
+                JOIN redmine.projects p ON p.id = m.project_id
+                JOIN redmine.users u ON u.id = m.user_id
+                WHERE p.id = ANY(:ids)
+                  AND r.name IN ('Project Manager', 'Project Coordinator')
+            """),
+            {"ids": list(project_ids)},
+        ).fetchall()
+        return [{"project": r[0], "manager": r[1]} for r in rows]
+
+    def get_project_member_ids(self, project_ids: list) -> set:
+        """Return the distinct Redmine user ids who are members of any of the given projects."""
+        if not project_ids:
+            return set()
+        rows = self.db.execute(
+            text("SELECT DISTINCT user_id FROM redmine.members WHERE project_id = ANY(:ids)"),
+            {"ids": list(project_ids)},
         ).fetchall()
         return {r[0] for r in rows}
 
@@ -802,10 +877,13 @@ class RedmineSQLService:
 
         details_query = f"""
             SELECT p.id, p.name, p.identifier, p.description, p.status, p.is_public,
-                   p.created_on, p.updated_on,
+                   p.created_on, p.updated_on, p.parent_id,
+                   parent.name as parent_name,
                    cf.name as cf_name, cv.value as cf_value,
-                   (SELECT COUNT(*) FROM redmine.members m WHERE m.project_id = p.id) as member_count
+                   (SELECT COUNT(*) FROM redmine.members m WHERE m.project_id = p.id) as member_count,
+                   (SELECT COUNT(*) FROM redmine.projects c WHERE c.parent_id = p.id) as subproject_count
             FROM redmine.projects p
+            LEFT JOIN redmine.projects parent ON parent.id = p.parent_id
             LEFT JOIN redmine.custom_values cv ON cv.customized_id = p.id AND cv.customized_type = 'Project'
             LEFT JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
             WHERE p.id = ANY(:proj_ids)
@@ -832,13 +910,16 @@ class RedmineSQLService:
                     "is_public": bool(r[5]),
                     "created_on": r[6].isoformat() if r[6] else None,
                     "updated_on": r[7].isoformat() if r[7] else None,
+                    "parent_id": r[8],
+                    "parent_name": r[9],
                     "city": "",
                     "customerOfficeLocation": "",
                     "projectType": "",
-                    "memberCount": r[10] or 0,
+                    "memberCount": r[12] or 0,
+                    "subproject_count": r[13] or 0,
                 }
-            cf_name = r[8]
-            cf_value = r[9] or ""
+            cf_name = r[10]
+            cf_value = r[11] or ""
             if cf_name == "City":
                 projects_dict[pid]["city"] = cf_value
             elif cf_name == "Customer Office Location":

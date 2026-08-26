@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, date, time, timezone, timedelta
+from datetime import datetime, time, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
@@ -13,21 +13,9 @@ from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
 from app.models.system_setting import SystemSetting
 from app.services.email_service import email_service
+from app.utils.shift_time import safe_zone_plain, shift_end_datetime
 
 logger = logging.getLogger("app.sweeper")
-
-
-def _safe_zone(tz_str: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(tz_str)
-    except Exception:
-        return ZoneInfo("Asia/Kolkata")
-
-
-def _shift_end_datetime(shift_date: date, start_time, end_time, tz: ZoneInfo) -> datetime:
-    if start_time and end_time and end_time <= start_time:
-        shift_date += timedelta(days=1)
-    return datetime.combine(shift_date, end_time, tzinfo=tz)
 
 
 def run_attendance_background_sweep():
@@ -65,9 +53,9 @@ def run_attendance_background_sweep():
                 if not sd or not sd.end_time:
                     continue
 
-                tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+                tz = safe_zone_plain(sd.timezone or "Asia/Kolkata")
                 effective_date = att.attendance_date
-                shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
+                shift_end = shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
 
                 # Configurable night cutoff (default 10:00 PM)
                 cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
@@ -108,7 +96,7 @@ def run_attendance_background_sweep():
                 if not sd or not sd.start_time:
                     continue
 
-                tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+                tz = safe_zone_plain(sd.timezone or "Asia/Kolkata")
                 start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
 
                 # Check if current time > shift_start + 30 minutes

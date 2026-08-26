@@ -27,7 +27,7 @@ from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.holiday import Holiday as HolidayModel
-from app.services.database.dependencies import get_leave_business_service
+from app.features.leaves.dependencies import get_leave_business_service
 from app.features.redmine.service import redmine_service
 from app.utils.audit import audit_logger
 import logging
@@ -113,40 +113,6 @@ async def list_leave_users(
             detail="Only Admin, PM, or PC can view team leave history."
         )
     return await leave_service.get_visible_leave_users(current_user)
-
-@router.get("/history")
-async def get_history(
-    team: Optional[bool] = Query(None, description="PM/PC: view all team members' leaves"),
-    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
-    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
-    current_user: dict = Depends(get_current_user),
-    leave_service: LeaveBusinessService = Depends(get_leave_business_service)
-):
-    user_id = current_user.get("sub")
-    email = current_user.get("email")
-    roles = current_user.get("roles", [])
-
-    if team:
-        if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
-            raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
-        from app.features.redmine.sql_service import RedmineSQLService
-        sql = RedmineSQLService(leave_service.leave_db.db)
-        rm_user = sql.get_user_by_email(email)
-        if not rm_user:
-            raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
-        member_rm_ids = sql.get_team_member_ids(rm_user["id"])
-        member_rm_ids.add(rm_user["id"])
-        emp_q = leave_service.leave_db.db.query(EmployeeMaster).filter(
-            EmployeeMaster.redmine_user_id.in_(member_rm_ids)
-        ).all()
-        member_emails = [e.user_email for e in emp_q if e.user_email]
-        if not member_emails:
-            return {"total": 0, "records": []}
-        records = await leave_service.get_team_leaves(member_emails, from_date, to_date)
-        return {"total": len(records), "records": records}
-
-    records = await leave_service.get_leave_history(user_id, from_date, to_date)
-    return {"total": len(records), "records": records}
 
 
 def _build_leaves_excel(records: list) -> BytesIO:

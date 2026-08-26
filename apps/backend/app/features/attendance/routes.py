@@ -1,19 +1,17 @@
 import logging
-from io import BytesIO
 from datetime import date, datetime, time, timezone, timedelta
 from typing import Optional, List
 from zoneinfo import ZoneInfo
 
-import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, text
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse, TodayShiftsResponse, ShiftCheckInRequest
+from app.features.attendance.schemas import CheckInRequest, CheckOutRequest, AttendanceResponse, CompleteAttendanceRequest, TodayAttendanceResponse, TodayShiftsResponse, ShiftCheckInRequest, ShiftCheckOutRequest
 from app.features.attendance.admin_routes import _to_response_with_email_batched, _build_virtual_record
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
@@ -25,78 +23,21 @@ from app.models.holiday import Holiday
 from app.models.leave import Leave
 from app.models.shift_attendance import ShiftAttendance
 from app.features.attendance.services.shift_attendance_service import shift_attendance_service
+from app.features.attendance.services.geo import determine_work_location, location_name
+from app.features.shifts.service import shift_service
 from app.features.leaves.services.balance_utils import credit_comp_off
-from app.features.redmine.constants import REDMINE_TO_IANA_TZ
 from app.features.redmine.sql_service import RedmineSQLService
 from app.models.system_setting import SystemSetting
 from app.core.cache import get_company_settings, get_shift_definition
 from app.services.email_service import email_service
 from app.utils.audit import audit_logger
+from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp
+from app.utils.excel import build_attendance_excel
 from app.middleware.logging import _get_client_ip
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
-
-GEOFENCE_SQL = text("""
-    SELECT ST_DWithin(
-        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
-        (SELECT geom FROM office_locations WHERE id = :office_id)::geography,
-        :radius
-    )
-""")
-
-DISTANCE_SQL = text("""
-    SELECT ROUND(ST_Distance(
-        ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,
-        (SELECT geom FROM office_locations WHERE id = :office_id)::geography
-    )::INT / 1000.0, 1) AS distance_km
-""")
-
-
-def _determine_work_location(db: Session, user_lat: float, user_lng: float, location_id) -> str:
-    if not location_id:
-        return "WFH"
-    office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
-    if not office:
-        return "WFH"
-    inside = db.execute(
-        GEOFENCE_SQL,
-        {"lng": user_lng, "lat": user_lat, "office_id": str(location_id), "radius": office.radius_meters},
-    ).scalar()
-    return "OFFICE" if inside else "WFH"
-
-
-def _safe_zone(tz_str: str) -> ZoneInfo:
-    iana = REDMINE_TO_IANA_TZ.get(tz_str, tz_str)
-    try:
-        return ZoneInfo(iana)
-    except Exception:
-        return ZoneInfo("Asia/Kolkata")
-
-
-def _location_name(db: Session, lat: float, lng: float, location_id) -> str:
-    if not location_id:
-        return f"{lat:.4f}, {lng:.4f}"
-    office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
-    if not office:
-        return f"{lat:.4f}, {lng:.4f}"
-    inside = db.execute(
-        GEOFENCE_SQL,
-        {"lng": lng, "lat": lat, "office_id": str(location_id), "radius": office.radius_meters},
-    ).scalar()
-    if inside:
-        return f"{office.name}, {office.address}" if office.address else office.name
-    try:
-        dist = db.execute(
-            DISTANCE_SQL,
-            {"lng": lng, "lat": lat, "office_id": str(location_id)},
-        ).scalar()
-        if dist is not None:
-            return f"{dist} km from {office.name}"
-    except Exception:
-        pass
-    return f"{lat:.4f}, {lng:.4f}"
 
 
 def _credit_comp_off_if_holiday(db: Session, attendance: Attendance) -> None:
@@ -117,19 +58,6 @@ def _credit_comp_off_if_holiday(db: Session, attendance: Attendance) -> None:
     logger.info(f"Comp-off credited: {keycloak_id} for {holiday.holiday_name} on {attendance.attendance_date}")
 
 
-def _resolve_timestamp(client_timestamp: Optional[datetime]) -> tuple[datetime, bool]:
-    if not client_timestamp:
-        return datetime.now(timezone.utc), False
-    now = datetime.now(timezone.utc)
-    if client_timestamp.tzinfo is None:
-        client_timestamp = client_timestamp.replace(tzinfo=timezone.utc)
-    if client_timestamp > now + timedelta(hours=1):
-        return now, False
-    if now - client_timestamp > timedelta(hours=24):
-        return now, False
-    return client_timestamp, True
-
-
 def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
                          check_in_time: datetime) -> Optional[Shift]:
     """Return the shift whose active window contains check_in_time.
@@ -138,7 +66,7 @@ def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
     sd = get_shift_definition(db, shift_code)
     if not sd:
         return None
-    tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+    tz = safe_zone(sd.timezone or "Asia/Kolkata")
     att_date = check_in_time.astimezone(tz).date()
     candidates = db.query(Shift).filter(
         Shift.keycloak_user_id == keycloak_user_id,
@@ -148,19 +76,13 @@ def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
     ).all()
     for c in candidates:
         win_start = datetime.combine(c.date, sd.start_time, tzinfo=tz)
-        win_end = _shift_end_datetime(c.date, sd.start_time, sd.end_time, tz)
+        win_end = shift_end_datetime(c.date, sd.start_time, sd.end_time, tz)
         if win_start <= check_in_time <= win_end:
             return c
     if candidates:
         candidates.sort(key=lambda x: abs((x.date - att_date).days))
         return candidates[0]
     return None
-
-
-def _shift_end_datetime(shift_date: date, start_time, end_time, tz: ZoneInfo) -> datetime:
-    if start_time and end_time and end_time <= start_time:
-        shift_date = shift_date + timedelta(days=1)
-    return datetime.combine(shift_date, end_time, tzinfo=tz)
 
 
 def _to_response(db: Session, a: Attendance) -> dict:
@@ -233,7 +155,7 @@ def check_in(
     if on_leave:
         raise HTTPException(status_code=400, detail="You are on leave today. Cannot check in.")
 
-    check_in_time, is_synced = _resolve_timestamp(payload.clientTimestamp)
+    check_in_time, is_synced = resolve_timestamp(payload.clientTimestamp)
     server_received_at = datetime.now(timezone.utc)
     now = check_in_time
 
@@ -279,10 +201,10 @@ def check_in(
             sd = shift_defs.get(s.shift_code)
             if not sd:
                 continue
-            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            tz = safe_zone(sd.timezone or "Asia/Kolkata")
             # Use the shift's own calendar date — same timezone-aware fix as _pick_shift
             start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
-            end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
+            end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
 
             if earliest_dt is None or start_dt < earliest_dt:
                 earliest_dt = start_dt
@@ -316,7 +238,7 @@ def check_in(
         company = get_company_settings(db)
         if company and company.grace_minutes:
             grace_min = company.grace_minutes
-        shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=_safe_zone(shift_tz))
+        shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=safe_zone(shift_tz))
         if now < shift_start_dt - timedelta(hours=1):
             raise HTTPException(
                 status_code=400,
@@ -338,12 +260,12 @@ def check_in(
         work_location_status = "WFH"
         check_in_location_name = "Home"
     else:
-        work_location_status = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
+        work_location_status = determine_work_location(db, payload.latitude, payload.longitude, location_id)
         if work_location_status == "OFFICE" and location_id:
             office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
             check_in_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
         else:
-            check_in_location_name = _location_name(db, payload.latitude, payload.longitude, location_id)
+            check_in_location_name = location_name(db, payload.latitude, payload.longitude, location_id)
 
     remarks = None
     if target_date != today:
@@ -440,7 +362,7 @@ def check_out(
     if attendance.check_out_time:
         return JSONResponse(content=_to_response(db, attendance), status_code=200)
 
-    check_out_time, is_synced = _resolve_timestamp(payload.clientTimestamp)
+    check_out_time, is_synced = resolve_timestamp(payload.clientTimestamp)
     attendance.check_out_time = check_out_time
     if is_synced or target_date != today:
         attendance.is_synced = True
@@ -451,12 +373,12 @@ def check_out(
     attendance.check_out_lat = payload.latitude
     attendance.check_out_lng = payload.longitude
 
-    check_out_ws = _determine_work_location(db, payload.latitude, payload.longitude, attendance.location_id)
+    check_out_ws = determine_work_location(db, payload.latitude, payload.longitude, attendance.location_id)
     if check_out_ws == "OFFICE" and attendance.location_id:
         office = db.query(OfficeLocation).filter(OfficeLocation.id == attendance.location_id).first()
         attendance.check_out_location_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
     else:
-        attendance.check_out_location_name = _location_name(db, payload.latitude, payload.longitude, attendance.location_id)
+        attendance.check_out_location_name = location_name(db, payload.latitude, payload.longitude, attendance.location_id)
 
     if payload.remarks:
         attendance.remarks = payload.remarks
@@ -488,7 +410,7 @@ def check_out(
             shift_end_time = company.default_shift_end_time
             end_tz = company.default_timezone or "Asia/Kolkata"
     if shift_end_time and attendance.check_out_time.tzinfo:
-        shift_end_dt = _shift_end_datetime(eff_date, shift_start_time, shift_end_time, _safe_zone(end_tz))
+        shift_end_dt = shift_end_datetime(eff_date, shift_start_time, shift_end_time, safe_zone(end_tz))
         if attendance.check_out_time < shift_end_dt:
             attendance.remarks = ", ".join(filter(None, [attendance.remarks, "Early leave"]))
 
@@ -564,12 +486,12 @@ async def complete_attendance(
         ws = "WFH"
         loc_name = "Home"
     else:
-        ws = _determine_work_location(db, payload.latitude, payload.longitude, location_id)
+        ws = determine_work_location(db, payload.latitude, payload.longitude, location_id)
         if ws == "OFFICE" and location_id:
             office = db.query(OfficeLocation).filter(OfficeLocation.id == location_id).first()
             loc_name = f"{office.name}, {office.address}" if office and office.address else (office.name if office else "")
         else:
-            loc_name = _location_name(db, payload.latitude, payload.longitude, location_id)
+            loc_name = location_name(db, payload.latitude, payload.longitude, location_id)
 
     if existing:
         existing.check_out_time = payload.checkOutTime
@@ -647,11 +569,11 @@ async def get_pending_attendance(
         if unattended.shift_code:
             shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == unattended.shift_code).first()
             if shift_def:
-                tz = _safe_zone(shift_def.timezone or "Asia/Kolkata")
+                tz = safe_zone(shift_def.timezone or "Asia/Kolkata")
                 if shift_def.start_time:
                     result["shiftStartTime"] = datetime.combine(unattended.attendance_date, shift_def.start_time, tzinfo=tz).isoformat()
                 if shift_def.end_time:
-                    result["shiftEndTime"] = _shift_end_datetime(unattended.attendance_date, shift_def.start_time, shift_def.end_time, tz).isoformat()
+                    result["shiftEndTime"] = shift_end_datetime(unattended.attendance_date, shift_def.start_time, shift_def.end_time, tz).isoformat()
         return result
 
     past_shift = db.query(Shift).filter(
@@ -710,8 +632,8 @@ def get_today_attendance(
                 auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
                 cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
 
-                tz = _safe_zone(sd.timezone or "Asia/Kolkata")
-                shift_end = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
+                tz = safe_zone(sd.timezone or "Asia/Kolkata")
+                shift_end = shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
                 # Configurable night cutoff: allow working late into evening.
                 # If shift_end is past cutoff (e.g. night shift ending next morning), cutoff is shift_end.
                 cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
@@ -880,9 +802,9 @@ async def get_today_shifts(
     entries = []
     for s in shifts_today:
         sd = sd_map.get(s.shift_code)
-        tz = _safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
+        tz = safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
         start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz) if (sd and sd.start_time) else None
-        end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if (sd and sd.end_time) else None
+        end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if (sd and sd.end_time) else None
 
         punch = punch_map.get(s.id)
 
@@ -976,6 +898,25 @@ async def shift_check_in(
     return _shift_attendance_to_dict(punch)
 
 
+@router.post("/shifts/check-out")
+async def shift_check_out(
+    payload: ShiftCheckOutRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    punch = shift_attendance_service.check_out(
+        db,
+        current_user["sub"],
+        payload.shiftId,
+        payload.latitude,
+        payload.longitude,
+        payload.clientTimestamp,
+        payload.remarks,
+    )
+    return _shift_attendance_to_dict(punch)
+
+
 def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> Optional[tuple]:
     shift_defs = {
         s.shift_code: db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == s.shift_code).first()
@@ -990,12 +931,12 @@ def _pick_shift(db: Session, shifts: list, target_date: date, now: datetime) -> 
         sd = shift_defs.get(s.shift_code)
         if not sd:
             continue
-        tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+        tz = safe_zone(sd.timezone or "Asia/Kolkata")
         # Use the shift's own calendar date (e.g. July 22 IST) so overnight
         # shifts that cross the UTC date boundary produce correct start/end
         # datetimes rather than being pinned to a UTC "today" they don't belong to.
         start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
-        end_dt = _shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
+        end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz)
 
         if earliest_dt is None or start_dt < earliest_dt:
             earliest_dt = start_dt
@@ -1019,7 +960,7 @@ def _shift_has_ended(db: Session, att: Attendance, shift_date: date = None) -> b
     if not sd or not sd.end_time:
         return False
     effective_date = shift_date or att.attendance_date
-    end_dt = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, _safe_zone(sd.timezone or "Asia/Kolkata"))
+    end_dt = shift_end_datetime(effective_date, sd.start_time, sd.end_time, safe_zone(sd.timezone or "Asia/Kolkata"))
     return datetime.now(timezone.utc) > end_dt
 
 
@@ -1038,11 +979,11 @@ def _build_status_response(db: Session, att: Attendance, today: date, status: st
             )
             effective_date = srec.date if srec else att.attendance_date
 
-            tz = _safe_zone(sd.timezone or "Asia/Kolkata")
+            tz = safe_zone(sd.timezone or "Asia/Kolkata")
             if sd.start_time:
                 shift_start_dt = datetime.combine(effective_date, sd.start_time, tzinfo=tz)
             if sd.end_time:
-                shift_end_dt = _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
+                shift_end_dt = shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
             shift_info = {
                 "shift_code": att.shift_code,
                 "shift_name": sd.shift_name,
@@ -1055,10 +996,10 @@ def _build_status_response(db: Session, att: Attendance, today: date, status: st
                 shift_info["project_id"] = srec.project_id
                 shift_info["project_name"] = srec.project_name
 
-    rem_tz = _safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
+    rem_tz = safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
     rem_end = None
     if sd and sd.end_time:
-        rem_end = _shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, rem_tz)
+        rem_end = shift_end_datetime(att.attendance_date, sd.start_time, sd.end_time, rem_tz)
     remaining = 0.0
     if att.check_out_time:
         remaining = 0.0
@@ -1088,7 +1029,7 @@ def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: 
             "date": effective_date.isoformat(),
             "work_location_status": shift.work_location_status,
             "start_time": datetime.combine(effective_date, sd.start_time, tzinfo=tz).isoformat() if sd.start_time else None,
-            "end_time": _shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
+            "end_time": shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz).isoformat() if sd.end_time else None,
             "project_id": shift.project_id,
             "project_name": shift.project_name,
         }
@@ -1098,55 +1039,6 @@ def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: 
         "attendance": None,
         "remainingHours": 0.0 if status == "missed" else None,
     }
-
-
-@router.get("/history")
-async def get_attendance_history(
-    from_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
-    to_date: str = Query(..., description="End date (YYYY-MM-DD)"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_active),
-):
-    keycloak_user_id = current_user["sub"]
-    try:
-        f = date.fromisoformat(from_date)
-        t = date.fromisoformat(to_date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-
-    records = db.query(Attendance).filter(
-        and_(
-            Attendance.keycloak_user_id == keycloak_user_id,
-            Attendance.attendance_date >= f,
-            Attendance.attendance_date <= t,
-        )
-    ).order_by(Attendance.attendance_date.desc()).all()
-
-    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
-    user_name = f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else None
-
-    records_data = []
-    for r in records:
-        rec = _to_response(db, r)
-        rec["userEmail"] = current_user.get("email")
-        rec["userName"] = user_name
-        if r.shift_code:
-            sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == r.shift_code).first()
-            if sd:
-                tz = _safe_zone(sd.timezone or "Asia/Kolkata")
-                if sd.start_time:
-                    rec["shiftStartTime"] = datetime.combine(r.attendance_date, sd.start_time, tzinfo=tz).isoformat()
-                if sd.end_time:
-                    rec["shiftEndTime"] = _shift_end_datetime(r.attendance_date, sd.start_time, sd.end_time, tz).isoformat()
-            shift = db.query(Shift).filter(
-                Shift.keycloak_user_id == r.keycloak_user_id,
-                Shift.date == r.attendance_date,
-            ).first()
-            rec["shiftProject"] = shift.project_name if shift else None
-        records_data.append(rec)
-
-    return records_data
 
 
 @router.get("/project/{project_id}")
@@ -1360,38 +1252,6 @@ async def get_my_projects_attendance(
     }
 
 
-def _build_attendance_excel(records: list) -> BytesIO:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Attendance"
-    ws.append(["Date", "Day", "Employee", "Designation", "Project", "Shift Code", "Shift Name",
-               "Work Type", "Shift Status", "Check In", "Check Out", "Total Hours", "Late",
-               "Office", "Manual Entry", "Remarks"])
-    for r in records:
-        ws.append([
-            r.get("attendanceDate") or "",
-            r.get("dayName") or "",
-            r.get("userName") or "",
-            r.get("userDesignation") or "",
-            r.get("shiftProject") or "",
-            r.get("shiftCode") or "",
-            r.get("shiftName") or "",
-            r.get("workLocationStatus") or "",
-            r.get("derivedStatus") or r.get("status") or "",
-            r.get("checkInTime") or "",
-            r.get("checkOutTime") or "",
-            r.get("totalHours") if r.get("totalHours") is not None else "",
-            "Yes" if r.get("isLate") else "No",
-            r.get("officeName") or "",
-            "Yes" if r.get("isManualEntry") else "No",
-            r.get("remarks") or "",
-        ])
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
-
-
 def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: int) -> list:
     flags = []
     ci = attendance.check_in_time
@@ -1412,7 +1272,7 @@ def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: 
     if shift and shift.shift_end_time:
         shift_end = shift.shift_end_time
 
-    tz = _safe_zone(tz_str)
+    tz = safe_zone(tz_str)
     d = attendance.attendance_date
     if ci.tzinfo is None:
         ci = ci.replace(tzinfo=tz)
@@ -1693,7 +1553,7 @@ async def get_my_attendance(
         page=page, page_size=page_size, export=export,
     )
     if export:
-        output = _build_attendance_excel(result["records"])
+        output = build_attendance_excel(result["records"])
         audit_logger.info(
             f"Attendance history exported by {current_user.get('username')}",
             extra={
@@ -1767,7 +1627,7 @@ async def get_team_attendance(
         page=page, page_size=page_size, export=export,
     )
     if export:
-        output = _build_attendance_excel(result["records"])
+        output = build_attendance_excel(result["records"])
         audit_logger.info(
             f"Team attendance history exported by {current_user.get('username')}",
             extra={
@@ -1788,3 +1648,78 @@ async def get_team_attendance(
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     return result
+
+
+@router.get("/my-attendance-v1")
+async def get_my_attendance_v1(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: completed, in_progress, on_leave, missed, yet_to_start"),
+    is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
+    search: Optional[str] = Query(None, description="Search shift code, project, work address"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    email = current_user.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="User email not found.")
+    return await shift_service.get_shifts_v1(
+        db, emails=[email],
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status, is_late=is_late,
+        search=search, include_name_search=False,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size,
+    )
+
+
+@router.get("/team-attendance-v1")
+async def get_team_attendance_v1(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("date", description="date, shiftStartTime, shiftCode, workStatus, userName"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    work_status: Optional[str] = Query(None, description="OFFICE, WFH, REMOTE_ONSITE, REMOTE_OFFSITE"),
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    status: Optional[str] = Query(None, description="Comma-separated: completed, in_progress, on_leave, missed, yet_to_start"),
+    is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
+    search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    roles = current_user.get("roles", [])
+    email = current_user.get("email")
+    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(email)
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="Current user not found in Redmine.")
+    member_rm_ids = sql.get_team_member_ids(rm_user["id"])
+    member_rm_ids.add(rm_user["id"])
+    emps = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id.in_(member_rm_ids)).all()
+    member_emails = [e.user_email for e in emps if e.user_email]
+    if not member_emails:
+        return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+
+    return await shift_service.get_shifts_v1(
+        db, emails=member_emails,
+        from_date=from_date, to_date=to_date,
+        work_status=work_status, project_id=project_id,
+        status=status, is_late=is_late,
+        search=search, include_name_search=True,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size,
+    )

@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import io
@@ -18,7 +18,12 @@ from app.features.redmine.service import redmine_service
 from app.features.auth.services.keycloak import update_keycloak_user, remove_realm_role_from_user, add_realm_role_to_user, get_user_realm_roles, delete_keycloak_user
 from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
+from app.features.employees.service import employee_to_dict, get_employees_paginated, get_employee_projects
+from app.services.email_service import email_service
 from app.utils.storage import storage_service
+from app.utils.audit import audit_logger
+from app.utils.excel import build_employees_excel
+from app.middleware.logging import _get_client_ip
 from app.models.system_setting import SystemSetting
 from datetime import date
 
@@ -237,38 +242,6 @@ async def upload_profile_picture(
     return {"message": "Profile picture uploaded", "profilePictureUrl": f"/api/employees/{emp.id}/profile-picture"}
 
 
-def _employee_to_dict(e: EmployeeMaster) -> dict:
-    return {
-        "id": str(e.id),
-        "keycloak_user_id": e.keycloak_user_id,
-        "redmine_user_id": e.redmine_user_id,
-        "first_name": e.first_name,
-        "middle_name": e.middle_name,
-        "last_name": e.last_name,
-        "user_email": e.user_email,
-        "designation": e.designation,
-        "employee_id": e.employee_id,
-        "work_location_status": e.work_location_status,
-        "work_address": e.work_address,
-        "current_address": e.current_address,
-        "permanent_address": e.permanent_address,
-        "contact_number": e.contact_number,
-        "alt_contact_number": e.alt_contact_number,
-        "country": e.country,
-        "title": e.title,
-        "status": e.status,
-        "is_active": e.is_active,
-        "onboarded_at": e.onboarded_at,
-        "joining_date": e.joining_date.isoformat() if e.joining_date else None,
-        "location_id": str(e.location_id) if e.location_id else None,
-        "reports_to": e.reports_to,
-        "reports_to_name": e.reports_to_name,
-        "profilePictureUrl": f"/api/employees/{e.id}/profile-picture" if e.profile_picture_url else None,
-        "created_at": e.created_at,
-        "updated_at": e.updated_at,
-    }
-
-
 @router.get("")
 async def list_employees(
     status: Optional[str] = Query(None, description="Filter by status"),
@@ -321,7 +294,7 @@ async def list_employees(
     return {
         "total": total,
         "employees": [{
-            **_employee_to_dict(e),
+            **employee_to_dict(e),
             "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
             "keycloak_role": None,
             "redmine_roles": [
@@ -330,6 +303,71 @@ async def list_employees(
             ],
         } for e in employees],
     }
+
+
+@router.get("/v1")
+async def list_employees_v1(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    sort_by: str = Query("first_name", description="first_name, last_name, user_email, designation, employee_id, status, created_at, updated_at"),
+    sort_dir: str = Query("asc", description="asc or desc"),
+    search: Optional[str] = Query(None, description="Search name, email, employee_id, designation, reports_to_name"),
+    status: Optional[str] = Query(None, description="Filter by status (active, disabled, pending)"),
+    onboarded: Optional[bool] = Query(None, description="Filter onboarded (true), not-onboarded (false), or all (omit)"),
+    designation: Optional[str] = Query(None, description="Filter by designation"),
+    country: Optional[str] = Query(None, description="Filter by country"),
+    work_location_status: Optional[str] = Query(None, description="Filter by work location status"),
+    is_active: Optional[bool] = Query(None, description="Filter active (true/false)"),
+    reports_to: Optional[int] = Query(None, description="Filter by reporting manager redmine user id"),
+    project_id: Optional[str] = Query(None, max_length=200, description="Comma-separated Redmine project ids"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    result = get_employees_paginated(
+        db,
+        current_user,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        search=search,
+        status=status,
+        onboarded=onboarded,
+        designation=designation,
+        country=country,
+        work_location_status=work_location_status,
+        is_active=is_active,
+        reports_to=reports_to,
+        project_id=project_id,
+        export=export,
+    )
+
+    if export:
+        output = build_employees_excel(result["records"])
+        audit_logger.info(
+            f"Employee list exported by {current_user.get('username')}",
+            extra={
+                "correlation_id": request.state.correlation_id,
+                "extra_data": {
+                    "action": "export_employees",
+                    "username": current_user.get("username"),
+                    "status": "success",
+                    "client_ip": _get_client_ip(request),
+                    "exported_rows": len(result["records"]),
+                },
+            },
+        )
+        filename = f"employees_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    return result
 
 
 @router.get("/my-team")
@@ -393,7 +431,7 @@ async def list_my_team(
     return {
         "total": len(employees),
         "employees": [{
-            **_employee_to_dict(e),
+            **employee_to_dict(e),
             "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
             "keycloak_role": None,
             "redmine_roles": [
@@ -450,6 +488,16 @@ async def suggest_employees(
     ]
 
 
+@router.get("/{employee_id}/projects")
+async def employee_projects(
+    employee_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_active),
+):
+    return get_employee_projects(db, current_user, employee_id)
+
+
 @router.get("/{employee_id}")
 async def get_employee(
     employee_id: str,
@@ -464,7 +512,7 @@ async def get_employee(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    result = _employee_to_dict(emp)
+    result = employee_to_dict(emp)
     result["projects"] = []
     result["keycloak_role"] = None
     result["redmine_roles"] = []
@@ -545,12 +593,13 @@ async def create_employee(
     if payload.joining_date:
         _validate_joining_date(payload.joining_date, db)
     emp = svc.create(EmployeeMaster, **payload.model_dump())
-    return _employee_to_dict(emp)
+    return employee_to_dict(emp)
 
 
 @router.post("/onboard")
 async def onboard_employee(
     payload: EmployeeOnboardRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
@@ -586,7 +635,25 @@ async def onboard_employee(
 
     db.commit()
     db.refresh(emp)
-    return _employee_to_dict(emp)
+    try:
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        company_name = company.company_name if company and company.company_name else "Variyas Labs"
+        employee_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
+        background_tasks.add_task(
+            email_service.send_onboarding_welcome,
+            emp.user_email,
+            employee_name,
+            emp.designation or "Team Member",
+            emp.employee_id or "—",
+            emp.user_email,
+            emp.joining_date.isoformat() if emp.joining_date else "—",
+            emp.reports_to_name or "—",
+            company_name,
+            "https://attendance.variyaslabs.com/",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to schedule onboarding welcome email for {emp.user_email}: {e}")
+    return employee_to_dict(emp)
 
 
 @router.patch("/{employee_id}/status")
@@ -632,7 +699,7 @@ async def update_employee_location(
 
     emp.location_id = payload.location_id
     db.commit()
-    return _employee_to_dict(emp)
+    return employee_to_dict(emp)
 
 
 @router.patch("/{employee_id}/activate")
@@ -834,7 +901,7 @@ async def update_employee(
 
     # ── Re-fetch and return ─────────────────────────────────────────────────
     db.refresh(emp)
-    response = _employee_to_dict(emp)
+    response = employee_to_dict(emp)
     response["message"] = "Employee updated successfully"
     if warnings:
         response["warnings"] = warnings
@@ -1004,4 +1071,4 @@ async def get_employee_by_email(
     emp = svc.fetch_one(EmployeeMaster, user_email=email)
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
-    return _employee_to_dict(emp)
+    return employee_to_dict(emp)

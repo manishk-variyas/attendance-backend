@@ -25,6 +25,14 @@ class ShiftCheckInRequest(BaseModel):
     clientTimestamp: Optional[datetime] = None
 
 
+class ShiftCheckOutRequest(BaseModel):
+    shiftId: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    clientTimestamp: Optional[datetime] = None
+    remarks: Optional[str] = Field(None, max_length=100)
+
+
 class AttendanceResponse(BaseModel):
     id: str
     keycloakUserId: str
