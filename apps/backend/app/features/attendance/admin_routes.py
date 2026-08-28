@@ -2,7 +2,9 @@ import logging
 from datetime import date, datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func
+
+ACTIVE_LEAVE_STATUSES = ["approved", "emergency", "cancellation_requested", "cancellation_rejected"]
 from typing import List, Optional
 
 from app.core.database import get_db
@@ -119,7 +121,7 @@ def _to_response(db: Session, a: Attendance) -> dict:
     leave = db.query(Leave).filter(
         and_(
             Leave.keycloak_user_id == a.keycloak_user_id,
-            Leave.approval_status == "approved",
+            func.lower(Leave.approval_status).in_(ACTIVE_LEAVE_STATUSES),
             Leave.start_date <= a.attendance_date,
             Leave.end_date >= a.attendance_date,
         )
@@ -389,10 +391,25 @@ async def admin_list_attendance(
         query = query.filter(Attendance.is_synced == is_synced)
 
     records = query.order_by(Attendance.attendance_date.desc()).all()
-    if not records:
+
+    f = date.fromisoformat(from_date) if from_date else None
+    t = date.fromisoformat(to_date) if to_date else None
+
+    # Fetch leaves in range
+    leave_query = db.query(Leave).filter(
+        func.lower(Leave.approval_status).in_(ACTIVE_LEAVE_STATUSES),
+    )
+    if f:
+        leave_query = leave_query.filter(Leave.end_date >= f)
+    if t:
+        leave_query = leave_query.filter(Leave.start_date <= t)
+    leave_list = leave_query.all()
+
+    if not records and not leave_list and not (f and t):
         return {"total": 0, "records": []}
 
-    user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id})
+    leave_user_ids = {l.keycloak_user_id for l in leave_list if l.keycloak_user_id}
+    user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id} | leave_user_ids)
     loc_ids = list({str(r.location_id) for r in records if r.location_id})
     shift_codes = list({r.shift_code for r in records if r.shift_code})
     modified_by_ids = list({r.modified_by for r in records if r.modified_by})
@@ -423,17 +440,12 @@ async def admin_list_attendance(
         shift_map = {(s.keycloak_user_id, s.date): s for s in shifts}
 
     leave_map = {}
-    if user_ids and dates_set:
-        leaves = db.query(Leave).filter(
-            Leave.keycloak_user_id.in_(user_ids),
-            Leave.approval_status == "approved",
-            Leave.start_date <= max(dates_set),
-            Leave.end_date >= min(dates_set),
-        ).all()
-        for l in leaves:
-            current = max(l.start_date, min(dates_set))
-            end = min(l.end_date, max(dates_set))
-            while current <= end:
+    for l in leave_list:
+        if l.keycloak_user_id:
+            ld = max(l.start_date, f) if f else l.start_date
+            rd = min(l.end_date, t) if t else l.end_date
+            current = ld
+            while current <= rd:
                 leave_map[(l.keycloak_user_id, current)] = l
                 current += timedelta(days=1)
 
@@ -445,78 +457,63 @@ async def admin_list_attendance(
     result = [_to_response_with_email_batched(r, emp_map, loc_map, sd_map, shift_map, leave_map, modified_by_map) for r in records]
     covered = {(r.keycloak_user_id, r.attendance_date) for r in records}
 
-    if from_date and to_date:
-        f = date.fromisoformat(from_date)
-        t = date.fromisoformat(to_date)
-
-        leave_covered = set()
-        leave_list = db.query(Leave).filter(
-            and_(
-                Leave.approval_status == "approved",
-                Leave.start_date <= t,
-                Leave.end_date >= f,
-            )
-        ).all()
-        for l in leave_list:
-            if l.keycloak_user_id:
-                ld = max(l.start_date, f)
-                rd = min(l.end_date, t)
-                current = ld
-                while current <= rd:
-                    leave_covered.add((l.keycloak_user_id, current))
-                    current += timedelta(days=1)
+    if f and t:
+        leave_covered = set(leave_map.keys())
 
         shift_query = db.query(Shift).filter(
             and_(
                 Shift.date >= f,
                 Shift.date <= t,
-                Shift.keycloak_user_id.notin_({uid for uid, _ in covered}) if covered else True,
             )
         )
         for s in shift_query.order_by(Shift.date.desc()).all():
             if (s.keycloak_user_id, s.date) in leave_covered:
                 continue
-            emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == s.keycloak_user_id).first()
+            if (s.keycloak_user_id, s.date) in covered:
+                continue
+            emp = emp_map.get(s.keycloak_user_id) or (
+                db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == s.keycloak_user_id).first()
+            )
             record = _build_virtual_record(db, s, emp)
             result.append(record)
             covered.add((s.keycloak_user_id, s.date))
 
-        for l in leave_list:
-            if not l.keycloak_user_id:
-                continue
-            ld = max(l.start_date, f)
-            rd = min(l.end_date, t)
-            current = ld
-            while current <= rd:
-                if (l.keycloak_user_id, current) not in covered:
-                    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == l.keycloak_user_id).first()
-                    record = {
-                        "id": None, "keycloakUserId": l.keycloak_user_id,
-                        "attendanceDate": current.isoformat(),
-                        "checkInTime": None, "checkInLat": None, "checkInLng": None, "checkInLocationName": None,
-                        "checkOutTime": None, "checkOutLat": None, "checkOutLng": None, "checkOutLocationName": None,
-                        "locationId": None, "officeName": None,
-                        "workLocationStatus": None, "shiftCode": None, "shiftName": None,
-                        "totalHours": None, "isLate": False, "status": "present",
-                        "isManualEntry": False, "isSynced": False, "remarks": None,
-                        "userEmail": emp.user_email if emp else "",
-                        "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else "",
-                        "userDesignation": emp.designation if emp else None,
-                        "derivedStatus": "on_leave",
-                        "isAtAssignedLocation": None,
-                        "dayName": current.strftime("%A"),
-                        "shiftProject": None,
-                        "onLeave": True,
-                        "leaveType": l.leave_type,
-                        "leaveStartDate": l.start_date.isoformat() if l.start_date else None,
-                        "leaveEndDate": l.end_date.isoformat() if l.end_date else None,
-                        "leaveStartDay": l.start_date.strftime("%A") if l.start_date else None,
-                        "leaveEndDay": l.end_date.strftime("%A") if l.end_date else None,
-                        "endedBy": None, "endedByRole": None,
-                    }
-                    result.append(record)
-                    covered.add((l.keycloak_user_id, current))
-                current += timedelta(days=1)
+    for l in leave_list:
+        if not l.keycloak_user_id:
+            continue
+        ld = max(l.start_date, f) if f else l.start_date
+        rd = min(l.end_date, t) if t else l.end_date
+        current = ld
+        while current <= rd:
+            if (l.keycloak_user_id, current) not in covered:
+                emp = emp_map.get(l.keycloak_user_id)
+                record = {
+                    "id": None, "keycloakUserId": l.keycloak_user_id,
+                    "attendanceDate": current.isoformat(),
+                    "checkInTime": None, "checkInLat": None, "checkInLng": None, "checkInLocationName": None,
+                    "checkOutTime": None, "checkOutLat": None, "checkOutLng": None, "checkOutLocationName": None,
+                    "locationId": None, "officeName": None,
+                    "workLocationStatus": None, "shiftCode": None, "shiftName": None,
+                    "totalHours": None, "isLate": False, "status": "on_leave",
+                    "isManualEntry": False, "isSynced": False, "remarks": None,
+                    "userEmail": emp.user_email if emp else l.user_email or "",
+                    "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else (l.user_email or ""),
+                    "userDesignation": emp.designation if emp else None,
+                    "derivedStatus": "on_leave",
+                    "isAtAssignedLocation": None,
+                    "dayName": current.strftime("%A"),
+                    "shiftProject": None,
+                    "onLeave": True,
+                    "leaveType": l.leave_type,
+                    "leaveStartDate": l.start_date.isoformat() if l.start_date else None,
+                    "leaveEndDate": l.end_date.isoformat() if l.end_date else None,
+                    "leaveStartDay": l.start_date.strftime("%A") if l.start_date else None,
+                    "leaveEndDay": l.end_date.strftime("%A") if l.end_date else None,
+                    "endedBy": None, "endedByRole": None,
+                }
+                result.append(record)
+                covered.add((l.keycloak_user_id, current))
+            current += timedelta(days=1)
 
     return {"total": len(result), "records": result}
 

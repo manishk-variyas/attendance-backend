@@ -107,22 +107,30 @@ class WfhService:
                start_date: date, end_date: date, resuming_date: date | None,
                reason: str | None, comment: str | None, contact_number: str | None,
                approver_id: int | None, project_id: int | None, project_name: str | None,
-               skip_weekends: bool, skip_holidays: bool) -> tuple[List[str], int, dict]:
+               skip_weekends: bool, skip_holidays: bool,
+               wfh_dates: list | None = None) -> tuple[List[str], int, dict]:
         request_ids = []
         created = 0
         skipped = {"weekends": 0, "holidays": 0}
 
-        current = start_date
-        while current <= end_date:
+        # Build the list of dates to process
+        if wfh_dates:
+            dates_to_process = list(wfh_dates)
+        else:
+            dates_to_process = []
+            current = start_date
+            while current <= end_date:
+                dates_to_process.append(current)
+                current += timedelta(days=1)
+
+        for current in dates_to_process:
             if skip_weekends and current.weekday() >= 5:
                 skipped["weekends"] += 1
-                current += timedelta(days=1)
                 continue
             if skip_holidays:
                 holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
                 if holiday:
                     skipped["holidays"] += 1
-                    current += timedelta(days=1)
                     continue
 
             existing = db.query(WfhRequest).filter(
@@ -132,7 +140,6 @@ class WfhService:
                 WfhRequest.status.in_(["pending", "approved"]),
             ).first()
             if existing:
-                current += timedelta(days=1)
                 continue
 
             wfh = WfhRequest(
@@ -152,13 +159,20 @@ class WfhService:
             db.flush()
             request_ids.append(str(wfh.id))
             created += 1
-            current += timedelta(days=1)
 
         db.commit()
         return request_ids, created, skipped
 
+    def _find_by_id(self, db: Session, request_id: str) -> Optional[WfhRequest]:
+        try:
+            from uuid import UUID
+            val = UUID(str(request_id))
+        except (ValueError, TypeError, AttributeError):
+            val = request_id
+        return db.query(WfhRequest).filter(WfhRequest.id == val).first()
+
     def approve(self, db: Session, request_id: str, reviewer_email: str) -> Optional[WfhRequest]:
-        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+        wfh = self._find_by_id(db, request_id)
         if not wfh or wfh.status != "pending":
             return None
         wfh.status = "approved"
@@ -171,7 +185,7 @@ class WfhService:
 
     def reject(self, db: Session, request_id: str, reviewer_email: str,
                reason: str | None) -> Optional[WfhRequest]:
-        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+        wfh = self._find_by_id(db, request_id)
         if not wfh or wfh.status != "pending":
             return None
         wfh.status = "rejected"
@@ -183,15 +197,22 @@ class WfhService:
         return wfh
 
     def delete(self, db: Session, request_id: str) -> bool:
-        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
-        if not wfh or wfh.status != "pending":
+        wfh = self._find_by_id(db, request_id)
+        if not wfh or wfh.status not in ("pending", "approved"):
             return False
+        if wfh.status == "approved":
+            shift = db.query(Shift).filter(
+                Shift.keycloak_user_id == wfh.keycloak_user_id,
+                Shift.date == wfh.start_date,
+            ).first()
+            if shift and shift.work_location_status == "WFH":
+                shift.work_location_status = "OFFICE"
         db.delete(wfh)
         db.commit()
         return True
 
     def update(self, db: Session, request_id: str, data: dict) -> Optional[WfhRequest]:
-        wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+        wfh = self._find_by_id(db, request_id)
         if not wfh or wfh.status != "pending":
             return None
 

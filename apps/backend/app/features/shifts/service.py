@@ -19,7 +19,7 @@ from app.models.shift_attendance import ShiftAttendance
 from app.models.system_setting import SystemSetting
 from app.core.cache import clear_shift_definition_cache
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy import update as sql_update, delete as sql_delete
 
 logger = logging.getLogger(__name__)
@@ -561,6 +561,11 @@ class ShiftService:
         relationship), falling back to the legacy `attendance` table for old
         single-shift data. No virtual record synthesis.
         """
+        kemps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.in_(emails)).all()
+        kemp_map = {e.keycloak_user_id: e for e in kemps if e.keycloak_user_id}
+        kemp_by_email = {e.user_email: e for e in kemps if e.user_email}
+        user_ids = list({e.keycloak_user_id for e in kemps if e.keycloak_user_id})
+
         query = (
             db.query(Shift)
             .options(selectinload(Shift.attendance_punch))
@@ -576,22 +581,41 @@ class ShiftService:
             query = query.filter(Shift.project_id == project_id)
         shifts = query.order_by(Shift.date.desc()).all()
 
-        if not shifts:
+        shift_user_ids = {s.keycloak_user_id for s in shifts if s.keycloak_user_id}
+        all_user_ids = list(set(user_ids) | shift_user_ids)
+
+        f_date = date.fromisoformat(from_date) if from_date else None
+        t_date = date.fromisoformat(to_date) if to_date else None
+
+        ACTIVE_LEAVE_STATUSES = ["approved", "emergency", "cancellation_requested", "cancellation_rejected"]
+
+        leaves = []
+        if all_user_ids:
+            leave_query = db.query(Leave).filter(
+                Leave.keycloak_user_id.in_(all_user_ids),
+                func.lower(Leave.approval_status).in_(ACTIVE_LEAVE_STATUSES),
+            )
+            if f_date:
+                leave_query = leave_query.filter(Leave.end_date >= f_date)
+            if t_date:
+                leave_query = leave_query.filter(Leave.start_date <= t_date)
+            leaves = leave_query.all()
+
+        if not shifts and not leaves:
             return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
 
         company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
         grace_min = company.grace_minutes if company and company.grace_minutes else 0
 
-        user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
         shift_codes = list({s.shift_code for s in shifts if s.shift_code})
-        min_date = min(s.date for s in shifts)
-        max_date = max(s.date for s in shifts)
 
         # Legacy fallback: old /check-in wrote `attendance`, not shift_attendance
         legacy_map: dict = {}
-        if user_ids:
+        if shifts and all_user_ids:
+            min_date = min(s.date for s in shifts)
+            max_date = max(s.date for s in shifts)
             legacy_rows = db.query(Attendance).filter(
-                Attendance.keycloak_user_id.in_(user_ids),
+                Attendance.keycloak_user_id.in_(all_user_ids),
                 Attendance.attendance_date.between(min_date - timedelta(days=1), max_date + timedelta(days=1)),
             ).all()
             legacy_map = {(a.keycloak_user_id, a.attendance_date, a.shift_code): a for a in legacy_rows}
@@ -601,19 +625,7 @@ class ShiftService:
             sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
             sd_map = {d.shift_code: d for d in sds}
 
-        leaves = db.query(Leave).filter(
-            Leave.keycloak_user_id.in_(user_ids),
-            Leave.approval_status == "approved",
-            Leave.start_date <= max_date,
-            Leave.end_date >= min_date,
-        ).all()
-
         name_map = _leave_type_name_map(db)
-
-        kemp_map: dict = {}
-        if user_ids:
-            kemps = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id.in_(user_ids)).all()
-            kemp_map = {e.keycloak_user_id: e for e in kemps}
 
         result = []
         for s in shifts:
@@ -621,7 +633,7 @@ class ShiftService:
             if punch is None:
                 punch = legacy_map.get((s.keycloak_user_id, s.date, s.shift_code))
             sd = sd_map.get(s.shift_code)
-            emp = kemp_map.get(s.keycloak_user_id)
+            emp = kemp_map.get(s.keycloak_user_id) or kemp_by_email.get(s.user_email)
             leave = next(
                 (
                     lv for lv in leaves
@@ -652,20 +664,22 @@ class ShiftService:
 
         # Leave-only records (approved leave days with no scheduled shift)
         shifted_dates = {(s.user_email, s.date) for s in shifts}
-        if not work_status:
+        if not work_status and not project_id:
             for lv in leaves:
                 if not lv.keycloak_user_id:
                     continue
                 lemp = kemp_map.get(lv.keycloak_user_id)
-                lv_email = lemp.user_email if lemp else None
-                current = lv.start_date
-                while current <= lv.end_date:
+                lv_email = lemp.user_email if lemp else lv.user_email
+                ld = max(lv.start_date, f_date) if f_date else lv.start_date
+                rd = min(lv.end_date, t_date) if t_date else lv.end_date
+                current = ld
+                while current <= rd:
                     if (lv_email, current) not in shifted_dates:
                         result.append({
                             "id": None,
                             "leaveId": str(lv.id),
                             "userEmail": lv_email,
-                            "userName": f"{lemp.first_name} {lemp.middle_name or ''} {lemp.last_name}".strip().replace("  ", " ") if lemp else lv_email,
+                            "userName": f"{lemp.first_name} {lemp.middle_name or ''} {lemp.last_name}".strip().replace("  ", " ") if lemp else (lv_email or ""),
                             "userDesignation": lemp.designation if lemp else None,
                             "projectId": None, "projectName": None,
                             "shift": None, "shiftName": None,
@@ -718,6 +732,14 @@ class ShiftService:
         total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
         if export:
             return {"records": result, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+        offset = (page - 1) * page_size
+        return {
+            "records": result[offset:offset + page_size],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
         offset = (page - 1) * page_size
         return {
             "records": result[offset:offset + page_size],

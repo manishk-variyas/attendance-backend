@@ -593,5 +593,7 @@ async def list_keycloak_roles(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
 ):
-    """Return all Keycloak realm roles. Admin only."""
-    return await get_realm_roles()
+    """Return attendance-app realm roles only (excludes Keycloak internal/super roles)."""
+    managed_roles = {"Admin", "Project Manager", "Project Coordinator", "Technical Resource"}
+    roles = await get_realm_roles()
+    return [r for r in roles if r["name"] in managed_roles]

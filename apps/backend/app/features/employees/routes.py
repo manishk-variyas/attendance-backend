@@ -1,4 +1,7 @@
+import hashlib
+import json
 import logging
+import secrets
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -6,12 +9,14 @@ import io
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import text
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.core.database import get_db
 from app.core.config import settings
 from app.features.auth.dependencies import get_current_user, require_admin, require_active
-from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, MyProfileUpdate, DisonboardRequest, UserProfileResponse
+from app.features.employees.schemas import EmployeeCreate, EmployeeResponse, EmployeeOnboardRequest, EmployeeStatusUpdate, EmployeeLocationUpdate, EmployeeActiveToggle, AssignProjectRequest, EmployeeUpdate, MyProfileUpdate, DisonboardRequest, UserProfileResponse, DeleteRequest, DeleteConfirmRequest
+from app.models.delete_verification import DeleteVerificationToken
+from app.services.email_service import email_service
 from app.models.employee_master import EmployeeMaster, EmployeeStatus
 from app.models.office_location import OfficeLocation
 from app.features.redmine.service import redmine_service
@@ -994,6 +999,159 @@ async def disonboard_employee(
         "still_onboarded": len(remaining_projects) > 0,
         "remaining_projects": len(remaining_projects),
     }
+
+
+def _hash_otp(otp: str) -> str:
+    return hashlib.sha256(otp.encode()).hexdigest()
+
+
+@router.post("/delete-request", status_code=status.HTTP_200_OK)
+async def request_delete_verification(
+    payload: DeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    admin_sub = current_user.get("sub")
+    admin_email = current_user.get("email")
+    if not admin_email:
+        raise HTTPException(status_code=400, detail="Admin email not found")
+
+    ids = list(dict.fromkeys(payload.ids))
+    if len(ids) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 employees per batch")
+
+    today = datetime.now(timezone.utc).date()
+    recent = db.query(DeleteVerificationToken).filter(
+        DeleteVerificationToken.admin_sub == admin_sub,
+        DeleteVerificationToken.created_at >= datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc),
+    ).count()
+    if recent >= 3:
+        raise HTTPException(status_code=429, detail="Too many delete requests. Try again tomorrow.")
+
+    errors = []
+    for eid in ids:
+        emp = db.execute(text("SELECT id, redmine_user_id FROM employee_master WHERE id = :id"), {"id": eid}).mappings().first()
+        if not emp:
+            errors.append({"id": eid, "reason": "Employee not found"})
+            continue
+        if emp["redmine_user_id"] and not payload.force:
+            cnt = db.execute(text("SELECT COUNT(*) FROM redmine.members WHERE user_id = :uid"), {"uid": emp["redmine_user_id"]}).scalar() or 0
+            if cnt:
+                errors.append({"id": eid, "reason": f"Still assigned to {cnt} project(s). Use force=true."})
+
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "Pre-validation failed", "failed": errors})
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    otp_hash = _hash_otp(otp)
+    token_id = secrets.token_hex(16)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    token = DeleteVerificationToken(
+        id=token_id,
+        admin_sub=admin_sub,
+        admin_email=admin_email,
+        otp_hash=otp_hash,
+        ids_json=json.dumps(ids),
+        force=payload.force,
+        expires_at=expires_at,
+    )
+    db.add(token)
+    db.commit()
+
+    email_service.send_delete_verification(admin_email, otp, len(ids), 10)
+
+    return {"request_id": token_id, "expires_at": expires_at.isoformat(), "count": len(ids), "message": f"Verification code sent to {admin_email}"}
+
+
+@router.post("/delete-confirm", status_code=status.HTTP_200_OK)
+async def confirm_delete(
+    payload: DeleteConfirmRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_admin),
+):
+    admin_sub = current_user.get("sub")
+    token = db.query(DeleteVerificationToken).filter(DeleteVerificationToken.id == payload.request_id).first()
+    if not token or token.admin_sub != admin_sub:
+        raise HTTPException(status_code=404, detail="Verification request not found")
+    if token.used:
+        raise HTTPException(status_code=400, detail="Verification code already used")
+    exp = token.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > exp:
+        raise HTTPException(status_code=400, detail="Verification code expired")
+    if token.attempts >= 3:
+        raise HTTPException(status_code=400, detail="Too many attempts")
+
+    if _hash_otp(payload.otp) != token.otp_hash:
+        token.attempts += 1
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+    try:
+        ids = json.loads(token.ids_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request data")
+
+    errors = []
+    for eid in ids:
+        emp = db.execute(text("SELECT id, redmine_user_id FROM employee_master WHERE id = :id"), {"id": eid}).mappings().first()
+        if not emp:
+            errors.append({"id": eid, "reason": "Employee not found"})
+            continue
+        if emp["redmine_user_id"] and not token.force:
+            cnt = db.execute(text("SELECT COUNT(*) FROM redmine.members WHERE user_id = :uid"), {"uid": emp["redmine_user_id"]}).scalar() or 0
+            if cnt:
+                errors.append({"id": eid, "reason": f"Still assigned to {cnt} project(s)."})
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "Validation failed at confirm time", "failed": errors})
+
+    results = []
+    try:
+        for eid in ids:
+            emp = db.execute(text("SELECT id, keycloak_user_id, redmine_user_id, user_email FROM employee_master WHERE id = :id"), {"id": eid}).mappings().first()
+            if not emp:
+                continue
+            kc = emp["keycloak_user_id"]
+            ru = emp["redmine_user_id"]
+            if kc:
+                try:
+                    await delete_keycloak_user(kc)
+                except Exception as e:
+                    logger.warning(f"Keycloak delete failed for {kc}: {e}")
+            if ru:
+                db.execute(text("DELETE FROM redmine.member_roles WHERE member_id IN (SELECT id FROM redmine.members WHERE user_id = :uid)"), {"uid": ru})
+                db.execute(text("DELETE FROM redmine.members WHERE user_id = :uid"), {"uid": ru})
+                db.execute(text("DELETE FROM redmine.email_addresses WHERE user_id = :uid"), {"uid": ru})
+                db.execute(text("DELETE FROM redmine.user_preferences WHERE user_id = :uid"), {"uid": ru})
+                db.execute(text("DELETE FROM redmine.tokens WHERE user_id = :uid"), {"uid": ru})
+                db.execute(text("DELETE FROM redmine.users WHERE id = :uid"), {"uid": ru})
+            if kc:
+                db.execute(text("DELETE FROM employee_leave_balance_monthly WHERE leave_balance_id IN (SELECT id FROM employee_leave_balances WHERE keycloak_user_id = :k)"), {"k": kc})
+                db.execute(text("DELETE FROM employee_leave_balances WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM attendance WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM shifts WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM leaves WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM shift_attendance WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM wfh_requests WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM sessions WHERE user_sub = :k"), {"k": kc})
+            db.execute(text("DELETE FROM employee_master WHERE id = :id"), {"id": eid})
+            results.append(eid)
+        token.used = True
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Batch delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Batch delete failed, no records were deleted")
+
+    logger.info(f"Atomic batch delete by {current_user.get('username')}: {results}")
+    return {"message": f"{len(results)} employee(s) deleted", "deleted_ids": results}
 
 
 @router.delete("/{employee_id}", status_code=status.HTTP_200_OK)

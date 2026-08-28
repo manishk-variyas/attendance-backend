@@ -193,6 +193,39 @@ class IssueListResponse(BaseModel):
     total_pages: int
 
 
+class RoleCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    permissions: Optional[List[str]] = Field(default=None, description="Optional Redmine permission keys")
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name must not be empty")
+        return v
+
+
+class RoleUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    permissions: Optional[List[str]] = Field(default=None, description="Optional Redmine permission keys")
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("name must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def _at_least_one(self):
+        if self.name is None and self.permissions is None:
+            raise ValueError("At least one of name or permissions must be provided")
+        return self
+
+
 class ProjectMember(BaseModel):
     user_id: int
     name: str
@@ -207,6 +240,16 @@ class MemberAdd(BaseModel):
 
 class MemberUpdate(BaseModel):
     role_ids: List[int] = Field(default_factory=list)
+
+
+class ProjectDeleteRequest(BaseModel):
+    ids: List[str] = Field(..., min_length=1, max_length=50, description="Redmine project ids or identifiers")
+    force: bool = False
+
+
+class ProjectDeleteConfirm(BaseModel):
+    request_id: str = Field(..., min_length=32, max_length=64)
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 class TimeZoneInfo(BaseModel):
     value: str

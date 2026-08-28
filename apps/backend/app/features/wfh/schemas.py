@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 
 class WfhRequestCreate(BaseModel):
@@ -14,6 +14,7 @@ class WfhRequestCreate(BaseModel):
     project_name: Optional[str] = None
     skip_weekends: bool = False
     skip_holidays: bool = True
+    wfh_dates: Optional[List[str]] = None  # individual dates override start_date/end_date range
 
 
 class WfhRequestUpdate(BaseModel):

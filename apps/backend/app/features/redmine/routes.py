@@ -1,15 +1,17 @@
 import json
 import os
 import logging
+import hashlib
 import httpx
+import secrets
 import openpyxl
 from io import BytesIO
 from fastapi import APIRouter, HTTPException, Depends, status, Query, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
-from datetime import date, timedelta, datetime
-from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectUpdate, ProjectResponse, AdminProjectListResponse, AdminProjectItem, AdminProjectDetail, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, MemberAdd, MemberUpdate, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem
+from datetime import date, timedelta, datetime, timezone
+from .schemas import IssueCreate, IssueUpdate, ProjectCreate, ProjectUpdate, ProjectResponse, AdminProjectListResponse, AdminProjectItem, AdminProjectDetail, UserWithProjects, IssueResponse, IssueListResponse, TimeZoneInfo, ProjectMember, MemberAdd, MemberUpdate, ProjectDeleteRequest, ProjectDeleteConfirm, SearchResponse, SearchResults, ProjectSearchItem, PersonSearchItem, ShiftSearchItem, RoleCreate, RoleUpdate
 from .service import redmine_service
 from .sql_service import RedmineSQLService
 from .constants import REDMINE_TIMEZONES
@@ -18,9 +20,12 @@ from app.core.limiter import limiter
 from app.utils.audit import audit_logger
 from app.middleware.logging import _get_client_ip
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.core.database import get_db
 from app.features.shifts.service import shift_service
 from app.models.employee_master import EmployeeMaster
+from app.models.delete_verification import DeleteVerificationToken
+from app.services.email_service import email_service
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +106,117 @@ async def list_redmine_roles(
             detail="Admin, Project Manager, or Project Coordinator access required",
         )
     return await redmine_service.get_roles()
+
+
+@router.post("/redmine/roles", status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+async def create_redmine_role(
+    request: Request,
+    payload: RoleCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    try:
+        role = await redmine_service.create_role(payload.name, payload.permissions)
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(status_code=400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Role created in Redmine but failed to commit backend transaction")
+    audit_logger.info(
+        f"Role created: {payload.name} by {current_user.get('username')}",
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "create_role", "username": current_user.get("username"), "role_name": payload.name, "client_ip": _get_client_ip(request)}},
+    )
+    return role
+
+
+@router.put("/redmine/roles/{role_id}")
+@limiter.limit("10/minute")
+async def update_redmine_role(
+    request: Request,
+    role_id: int,
+    payload: RoleUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    sql = RedmineSQLService(db)
+    existing = sql.get_role(role_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if existing["builtin"] != 0:
+        raise HTTPException(status_code=403, detail="Built-in roles cannot be edited")
+    try:
+        role = await redmine_service.update_role(role_id, payload.name, payload.permissions)
+    except httpx.HTTPStatusError as e:
+        db.rollback()
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(status_code=400, detail=detail)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Role updated in Redmine but failed to commit backend transaction")
+    audit_logger.info(
+        f"Role {role_id} updated by {current_user.get('username')}",
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "update_role", "username": current_user.get("username"), "role_id": role_id, "client_ip": _get_client_ip(request)}},
+    )
+    return role
+
+
+@router.delete("/redmine/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("10/minute")
+async def delete_redmine_role(
+    request: Request,
+    role_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    sql = RedmineSQLService(db)
+    existing = sql.get_role(role_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if existing["builtin"] != 0:
+        raise HTTPException(status_code=403, detail="Built-in roles cannot be deleted")
+    in_use = sql.is_role_in_use(role_id)
+    if in_use > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Role in use by {in_use} member(s). Remove users from this role first.",
+        )
+    try:
+        ok = await redmine_service.delete_role(role_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Role not found")
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Role deleted in Redmine but failed to commit backend transaction")
+    audit_logger.info(
+        f"Role {role_id} deleted by {current_user.get('username')}",
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "delete_role", "username": current_user.get("username"), "role_id": role_id, "client_ip": _get_client_ip(request)}},
+    )
+    return None
 
 
 # ------------------------------------------------------------------ #
@@ -272,6 +388,150 @@ async def delete_project(
         },
     )
     return {"status": "success", "message": "Project deleted successfully", "id": project_id_or_identifier}
+
+
+@router.post("/projects/delete-request")
+@limiter.limit("5/minute")
+async def request_project_delete(
+    request: Request,
+    payload: ProjectDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    admin_sub = current_user.get("sub")
+    admin_email = current_user.get("email")
+    if not admin_email:
+        raise HTTPException(status_code=400, detail="Admin email not found")
+
+    ids = list(dict.fromkeys(payload.ids))
+    if len(ids) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 projects per batch")
+
+    today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time(), tzinfo=timezone.utc)
+    recent = db.query(DeleteVerificationToken).filter(
+        DeleteVerificationToken.admin_sub == admin_sub,
+        DeleteVerificationToken.created_at >= today_start,
+    ).count()
+    if recent >= 10:  # TEMP raised from 3 for initial cleanup; reset later
+        raise HTTPException(status_code=429, detail="Too many delete requests. Try again tomorrow.")
+
+    errors = []
+    resolved = []
+    for ref in ids:
+        row = db.execute(
+            text("SELECT id, name FROM redmine.projects WHERE id::text = :v OR identifier = :v"),
+            {"v": str(ref)},
+        ).fetchone()
+        if not row:
+            errors.append({"id": ref, "reason": "Project not found"})
+        else:
+            resolved.append({"input": str(ref), "project_id": row[0], "name": row[1]})
+
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "Pre-validation failed", "failed": errors})
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    token_id = secrets.token_hex(16)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    token = DeleteVerificationToken(
+        id=token_id,
+        admin_sub=admin_sub,
+        admin_email=admin_email,
+        otp_hash=hashlib.sha256(otp.encode()).hexdigest(),
+        ids_json=json.dumps([r["project_id"] for r in resolved]),
+        force=payload.force,
+        expires_at=expires_at,
+    )
+    db.add(token)
+    db.commit()
+
+    email_service.send_delete_verification(admin_email, otp, len(resolved), 10)
+
+    return {
+        "request_id": token_id,
+        "expires_at": expires_at.isoformat(),
+        "count": len(resolved),
+        "projects": [{"project_id": r["project_id"], "name": r["name"]} for r in resolved],
+        "message": f"Verification code sent to {admin_email}",
+    }
+
+
+@router.post("/projects/delete-confirm")
+@limiter.limit("5/minute")
+async def confirm_project_delete(
+    request: Request,
+    payload: ProjectDeleteConfirm,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    admin_sub = current_user.get("sub")
+    token = db.query(DeleteVerificationToken).filter(DeleteVerificationToken.id == payload.request_id).first()
+    if not token or token.admin_sub != admin_sub:
+        raise HTTPException(status_code=404, detail="Verification request not found")
+    if token.used:
+        raise HTTPException(status_code=400, detail="Verification code already used")
+
+    exp = token.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > exp:
+        raise HTTPException(status_code=400, detail="Verification code expired")
+    if token.attempts >= 3:
+        raise HTTPException(status_code=400, detail="Too many attempts")
+
+    if hashlib.sha256(payload.otp.encode()).hexdigest() != token.otp_hash:
+        token.attempts += 1
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+    try:
+        ids = json.loads(token.ids_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request data")
+
+    deleted = []
+    failed = []
+    for pid in ids:
+        try:
+            ok = await redmine_service.delete_project(pid)
+            if ok:
+                deleted.append(pid)
+            else:
+                failed.append({"id": pid, "reason": "Project not found"})
+        except Exception as e:
+            failed.append({"id": pid, "reason": str(e)[:200]})
+
+    token.used = True
+    db.commit()
+
+    audit_logger.info(
+        f"Verified project deletion by {current_user.get('username')}: {len(deleted)} deleted, {len(failed)} failed",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "delete_projects_verified",
+                "username": current_user.get("username"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "deleted_ids": deleted,
+                "failed": failed,
+            },
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": f"{len(deleted)} project(s) deleted",
+        "deleted_ids": deleted,
+        "failed": failed,
+    }
 
 
 @router.get("/admin/projects", response_model=AdminProjectListResponse)

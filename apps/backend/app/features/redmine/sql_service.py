@@ -43,6 +43,22 @@ class RedmineSQLService:
     def __init__(self, db: Session):
         self.db = db
 
+    def get_role(self, role_id: int):
+        row = self.db.execute(
+            text("SELECT id, name, builtin FROM redmine.roles WHERE id = :id"),
+            {"id": role_id},
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "name": row[1], "builtin": row[2]}
+
+    def is_role_in_use(self, role_id: int) -> int:
+        row = self.db.execute(
+            text("SELECT COUNT(*) FROM redmine.member_roles WHERE role_id = :id"),
+            {"id": role_id},
+        ).fetchone()
+        return row[0] if row else 0
+
     def get_user_by_email(self, email: str):
         row = self.db.execute(
             text("""

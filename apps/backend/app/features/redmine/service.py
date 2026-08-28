@@ -495,6 +495,34 @@ class RedmineService:
             resp.raise_for_status()
             return resp.json().get("roles", [])
 
+    async def create_role(self, name: str, permissions: Optional[list] = None) -> dict:
+        payload = {"role": {"name": name}}
+        if permissions is not None:
+            payload["role"]["permissions"] = permissions
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{self.url}/roles.json", json=payload, headers=self.headers)
+            resp.raise_for_status()
+            return resp.json().get("role", resp.json())
+
+    async def update_role(self, role_id: int, name: Optional[str] = None, permissions: Optional[list] = None) -> dict:
+        payload: dict = {}
+        if name is not None:
+            payload["name"] = name
+        if permissions is not None:
+            payload["permissions"] = permissions
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(f"{self.url}/roles/{role_id}.json", json={"role": payload}, headers=self.headers)
+            resp.raise_for_status()
+            return resp.json().get("role", resp.json())
+
+    async def delete_role(self, role_id: int) -> bool:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(f"{self.url}/roles/{role_id}.json", headers=self.headers)
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            return True
+
     async def update_user(self, user_id: int, data: dict) -> bool:
         """Update a Redmine user's profile fields."""
         payload: dict = {"user": {}}

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
@@ -1299,6 +1299,9 @@ def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: 
     return flags
 
 
+ACTIVE_LEAVE_STATUSES = ["approved", "emergency", "cancellation_requested", "cancellation_rejected"]
+
+
 def _get_attendance_paginated(
     db: Session, keycloak_user_ids: List[str],
     from_date: Optional[str] = None, to_date: Optional[str] = None,
@@ -1311,11 +1314,14 @@ def _get_attendance_paginated(
     sort_by: str = "attendanceDate", sort_dir: str = "asc",
     page: int = 1, page_size: int = 50, export: bool = False,
 ) -> dict:
+    f = date.fromisoformat(from_date) if from_date else None
+    t = date.fromisoformat(to_date) if to_date else None
+
     query = db.query(Attendance).filter(Attendance.keycloak_user_id.in_(keycloak_user_ids))
-    if from_date:
-        query = query.filter(Attendance.attendance_date >= date.fromisoformat(from_date))
-    if to_date:
-        query = query.filter(Attendance.attendance_date <= date.fromisoformat(to_date))
+    if f:
+        query = query.filter(Attendance.attendance_date >= f)
+    if t:
+        query = query.filter(Attendance.attendance_date <= t)
     if work_status:
         query = query.filter(Attendance.work_location_status == work_status)
     if per_diem is not None:
@@ -1341,11 +1347,10 @@ def _get_attendance_paginated(
     if company and company.grace_minutes:
         grace_minutes = company.grace_minutes
 
-    user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id})
+    user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id} | set(keycloak_user_ids))
     loc_ids = list({str(r.location_id) for r in records if r.location_id})
     shift_codes = list({r.shift_code for r in records if r.shift_code})
     modified_by_ids = list({r.modified_by for r in records if r.modified_by})
-    dates_set = list({r.attendance_date for r in records})
 
     emp_map = {}
     if user_ids:
@@ -1363,26 +1368,37 @@ def _get_attendance_paginated(
         sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
         sd_map = {s.shift_code: s for s in sds}
 
-    shift_map = {}
-    if user_ids and dates_set:
-        shifts = db.query(Shift).filter(
-            Shift.keycloak_user_id.in_(user_ids),
-            Shift.date.in_(dates_set),
-        ).all()
-        shift_map = {(s.keycloak_user_id, s.date): s for s in shifts}
+    # Fetch shifts for the target users
+    shift_query = db.query(Shift).filter(Shift.keycloak_user_id.in_(keycloak_user_ids))
+    if f:
+        shift_query = shift_query.filter(Shift.date >= f)
+    if t:
+        shift_query = shift_query.filter(Shift.date <= t)
+    if project_id:
+        shift_query = shift_query.filter(Shift.project_id == project_id)
+    if work_status:
+        shift_query = shift_query.filter(Shift.work_location_status == work_status)
+    shift_list = shift_query.order_by(Shift.date.desc()).all()
+    shift_map = {(s.keycloak_user_id, s.date): s for s in shift_list}
+
+    # Fetch leaves for the target users
+    leave_query = db.query(Leave).filter(
+        Leave.keycloak_user_id.in_(keycloak_user_ids),
+        func.lower(Leave.approval_status).in_(ACTIVE_LEAVE_STATUSES),
+    )
+    if f:
+        leave_query = leave_query.filter(Leave.end_date >= f)
+    if t:
+        leave_query = leave_query.filter(Leave.start_date <= t)
+    leave_list = leave_query.all()
 
     leave_map = {}
-    if user_ids and dates_set:
-        leaves = db.query(Leave).filter(
-            Leave.keycloak_user_id.in_(user_ids),
-            Leave.approval_status == "approved",
-            Leave.start_date <= max(dates_set),
-            Leave.end_date >= min(dates_set),
-        ).all()
-        for l in leaves:
-            current = max(l.start_date, min(dates_set))
-            end = min(l.end_date, max(dates_set))
-            while current <= end:
+    for l in leave_list:
+        if l.keycloak_user_id:
+            ld = max(l.start_date, f) if f else l.start_date
+            rd = min(l.end_date, t) if t else l.end_date
+            current = ld
+            while current <= rd:
                 leave_map[(l.keycloak_user_id, current)] = l
                 current += timedelta(days=1)
 
@@ -1399,55 +1415,25 @@ def _get_attendance_paginated(
         result.append(rec)
     covered = {(r.keycloak_user_id, r.attendance_date) for r in records}
 
-    if from_date and to_date:
-        f = date.fromisoformat(from_date)
-        t = date.fromisoformat(to_date)
+    # Synthesize shift records for days not punched and not on leave
+    for s in shift_list:
+        if (s.keycloak_user_id, s.date) in leave_map:
+            continue
+        if (s.keycloak_user_id, s.date) in covered:
+            continue
+        emp = emp_map.get(s.keycloak_user_id)
+        vr = _build_virtual_record(db, s, emp)
+        vr["attendanceFlags"] = []
+        result.append(vr)
+        covered.add((s.keycloak_user_id, s.date))
 
-        leave_list = db.query(Leave).filter(
-            and_(
-                Leave.keycloak_user_id.in_(keycloak_user_ids),
-                Leave.approval_status == "approved",
-                Leave.start_date <= t,
-                Leave.end_date >= f,
-            )
-        ).all()
-        leave_covered = set()
-        for l in leave_list:
-            if l.keycloak_user_id:
-                ld = max(l.start_date, f)
-                rd = min(l.end_date, t)
-                current = ld
-                while current <= rd:
-                    leave_covered.add((l.keycloak_user_id, current))
-                    current += timedelta(days=1)
-
-        shift_query = db.query(Shift).filter(
-            and_(
-                Shift.keycloak_user_id.in_(keycloak_user_ids),
-                Shift.date >= f,
-                Shift.date <= t,
-            )
-        )
-        if project_id:
-            shift_query = shift_query.filter(Shift.project_id == project_id)
-        if work_status:
-            shift_query = shift_query.filter(Shift.work_location_status == work_status)
-        for s in shift_query.order_by(Shift.date.desc()).all():
-            if (s.keycloak_user_id, s.date) in leave_covered:
-                continue
-            if (s.keycloak_user_id, s.date) in covered:
-                continue
-            emp = emp_map.get(s.keycloak_user_id)
-            vr = _build_virtual_record(db, s, emp)
-            vr["attendanceFlags"] = []
-            result.append(vr)
-            covered.add((s.keycloak_user_id, s.date))
-
+    # Synthesize leave records (when not filtered by work location, project, or manual entry)
+    if not work_status and not project_id and not entry_type and (status_filter is None or status_filter in ("on_leave", "present")):
         for l in leave_list:
             if not l.keycloak_user_id:
                 continue
-            ld = max(l.start_date, f)
-            rd = min(l.end_date, t)
+            ld = max(l.start_date, f) if f else l.start_date
+            rd = min(l.end_date, t) if t else l.end_date
             current = ld
             while current <= rd:
                 if (l.keycloak_user_id, current) not in covered:
@@ -1459,10 +1445,10 @@ def _get_attendance_paginated(
                         "checkOutTime": None, "checkOutLat": None, "checkOutLng": None, "checkOutLocationName": None,
                         "locationId": None, "officeName": None,
                         "workLocationStatus": None, "shiftCode": None, "shiftName": None,
-                        "totalHours": None, "isLate": False, "status": "present",
+                        "totalHours": None, "isLate": False, "status": "on_leave",
                         "isManualEntry": False, "isSynced": False, "remarks": None,
-                        "userEmail": emp.user_email if emp else "",
-                        "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else "",
+                        "userEmail": emp.user_email if emp else l.user_email or "",
+                        "userName": f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ") if emp else (l.user_email or ""),
                         "userDesignation": emp.designation if emp else None,
                         "derivedStatus": "on_leave",
                         "isAtAssignedLocation": None,
@@ -1495,8 +1481,11 @@ def _get_attendance_paginated(
             def _matches(r):
                 tokens = {t.lower().replace(" ", "_") for t in (r.get("attendanceFlags") or [])}
                 ds = (r.get("derivedStatus") or "").lower().replace(" ", "_")
+                st = (r.get("status") or "").lower().replace(" ", "_")
                 if ds:
                     tokens.add(ds)
+                if st:
+                    tokens.add(st)
                 return bool(wanted & tokens)
             result = [r for r in result if _matches(r)]
 

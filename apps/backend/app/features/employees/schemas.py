@@ -140,3 +140,13 @@ class EmployeeUpdate(BaseModel):
 
 class DisonboardRequest(BaseModel):
     project_id: int
+
+
+class DeleteRequest(BaseModel):
+    ids: list[str] = Field(..., min_length=1, max_length=50)
+    force: bool = False
+
+
+class DeleteConfirmRequest(BaseModel):
+    request_id: str = Field(..., min_length=32, max_length=64)
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")

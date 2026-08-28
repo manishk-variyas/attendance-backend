@@ -11,6 +11,7 @@ from app.models.attendance import Attendance
 from app.models.shift_attendance import ShiftAttendance
 from app.models.session import Session
 from app.models.password_reset import PasswordResetToken
+from app.models.delete_verification import DeleteVerificationToken
 
 __all__ = [
     "Base",
@@ -24,4 +25,5 @@ __all__ = [
     "Attendance",
     "ShiftAttendance",
     "PasswordResetToken",
+    "DeleteVerificationToken",
 ]

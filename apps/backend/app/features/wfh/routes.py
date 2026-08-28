@@ -205,59 +205,114 @@ async def request_wfh(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    if start_date > end_date:
-        raise HTTPException(status_code=400, detail="end_date must be on or after start_date.")
+    # Parse individual dates if provided
+    wfh_dates = None
+    if payload.wfh_dates:
+        try:
+            wfh_dates = sorted({date.fromisoformat(d) for d in payload.wfh_dates})
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date in wfh_dates. Use YYYY-MM-DD format.")
+        if not wfh_dates:
+            raise HTTPException(status_code=400, detail="wfh_dates cannot be empty if provided.")
+        # start_date/end_date are derived from the individual dates
+        start_date = wfh_dates[0]
+        end_date = wfh_dates[-1]
+    else:
+        if start_date > end_date:
+            raise HTTPException(status_code=400, detail="end_date must be on or after start_date.")
+
+        max_days = 30
+        if (end_date - start_date).days >= max_days:
+            raise HTTPException(status_code=400, detail=f"Cannot request WFH for more than {max_days} days at a time.")
 
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    if end_date < today:
+    check_end = end_date if not wfh_dates else wfh_dates[-1]
+    if check_end < today:
         raise HTTPException(status_code=400, detail="Cannot request WFH for past dates.")
-
-    max_days = 30
-    if (end_date - start_date).days >= max_days:
-        raise HTTPException(status_code=400, detail=f"Cannot request WFH for more than {max_days} days at a time.")
 
     user_email = current_user.get("email")
     keycloak_user_id = current_user.get("sub")
 
-    current = start_date
-    has_shift = False
-    while current <= end_date:
-        if payload.skip_weekends and current.weekday() >= 5:
-            current += timedelta(days=1)
-            continue
-        if payload.skip_holidays:
-            holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
-            if holiday:
+    # Determine which dates to iterate over for validation
+    dates_to_check = wfh_dates if wfh_dates else None
+
+    if dates_to_check:
+        # Validate each individually-specified date
+        has_shift = False
+        for current in dates_to_check:
+            if payload.skip_weekends and current.weekday() >= 5:
+                continue
+            if payload.skip_holidays:
+                holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
+                if holiday:
+                    continue
+
+            shift = db.query(Shift).filter(
+                Shift.keycloak_user_id == keycloak_user_id,
+                Shift.date <= current,
+                Shift.end_date >= current,
+            ).first()
+            if not shift:
+                continue
+            has_shift = True
+
+            leave = db.query(Leave).filter(
+                Leave.user_email == user_email,
+                Leave.approval_status == "approved",
+                Leave.start_date <= current,
+                Leave.end_date >= current,
+            ).first()
+            if leave:
+                raise HTTPException(status_code=400, detail=f"You already have approved leave on {current.isoformat()}.")
+
+            att = db.query(Attendance).filter(
+                Attendance.keycloak_user_id == keycloak_user_id,
+                Attendance.attendance_date == current,
+                Attendance.check_in_time.isnot(None),
+            ).first()
+            if att:
+                raise HTTPException(status_code=400, detail=f"You have already checked in on {current.isoformat()}.")
+    else:
+        # Validate date range
+        current = start_date
+        has_shift = False
+        while current <= end_date:
+            if payload.skip_weekends and current.weekday() >= 5:
                 current += timedelta(days=1)
                 continue
+            if payload.skip_holidays:
+                holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
+                if holiday:
+                    current += timedelta(days=1)
+                    continue
 
-        shift = db.query(Shift).filter(
-            Shift.keycloak_user_id == keycloak_user_id,
-            Shift.date <= current,
-            Shift.end_date >= current,
-        ).first()
-        if not shift:
+            shift = db.query(Shift).filter(
+                Shift.keycloak_user_id == keycloak_user_id,
+                Shift.date <= current,
+                Shift.end_date >= current,
+            ).first()
+            if not shift:
+                current += timedelta(days=1)
+                continue
+            has_shift = True
+
+            leave = db.query(Leave).filter(
+                Leave.user_email == user_email,
+                Leave.approval_status == "approved",
+                Leave.start_date <= current,
+                Leave.end_date >= current,
+            ).first()
+            if leave:
+                raise HTTPException(status_code=400, detail=f"You already have approved leave on {current.isoformat()}.")
+
+            att = db.query(Attendance).filter(
+                Attendance.keycloak_user_id == keycloak_user_id,
+                Attendance.attendance_date == current,
+                Attendance.check_in_time.isnot(None),
+            ).first()
+            if att:
+                raise HTTPException(status_code=400, detail=f"You have already checked in on {current.isoformat()}.")
             current += timedelta(days=1)
-            continue
-        has_shift = True
-
-        leave = db.query(Leave).filter(
-            Leave.user_email == user_email,
-            Leave.approval_status == "approved",
-            Leave.start_date <= current,
-            Leave.end_date >= current,
-        ).first()
-        if leave:
-            raise HTTPException(status_code=400, detail=f"You already have approved leave on {current.isoformat()}.")
-
-        att = db.query(Attendance).filter(
-            Attendance.keycloak_user_id == keycloak_user_id,
-            Attendance.attendance_date == current,
-            Attendance.check_in_time.isnot(None),
-        ).first()
-        if att:
-            raise HTTPException(status_code=400, detail=f"You have already checked in on {current.isoformat()}.")
-        current += timedelta(days=1)
 
     if not has_shift:
         raise HTTPException(status_code=400, detail="No shift assigned for any of the requested dates. WFH can only be requested for dates with an existing shift.")
@@ -268,6 +323,7 @@ async def request_wfh(
         payload.reason, payload.comment, payload.contact_number,
         payload.approver_id, payload.project_id, payload.project_name,
         payload.skip_weekends, payload.skip_holidays,
+        wfh_dates=wfh_dates,
     )
 
     if created == 0:
@@ -463,6 +519,15 @@ async def get_wfh_stats(
     return wfh_service.get_stats(db, current_user.get("sub"), month, year)
 
 
+def _get_wfh_by_id(db: Session, request_id: str) -> Optional[WfhRequest]:
+    try:
+        from uuid import UUID
+        val = UUID(str(request_id))
+    except (ValueError, TypeError, AttributeError):
+        val = request_id
+    return db.query(WfhRequest).filter(WfhRequest.id == val).first()
+
+
 @router.put("/{request_id}/approve")
 async def approve_wfh_request(
     request: Request,
@@ -470,7 +535,7 @@ async def approve_wfh_request(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    wfh = _get_wfh_by_id(db, request_id)
     if not wfh:
         raise HTTPException(status_code=404, detail="WFH request not found.")
     if wfh.status != "pending":
@@ -517,7 +582,7 @@ async def reject_wfh_request(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    wfh = _get_wfh_by_id(db, request_id)
     if not wfh:
         raise HTTPException(status_code=404, detail="WFH request not found.")
     if wfh.status != "pending":
@@ -565,20 +630,32 @@ async def delete_wfh_request(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    wfh = _get_wfh_by_id(db, request_id)
     if not wfh:
         raise HTTPException(status_code=404, detail="WFH request not found.")
-    if wfh.status != "pending":
-        raise HTTPException(status_code=400, detail="Only pending requests can be deleted.")
+
+    today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    if wfh.status not in ("pending", "approved"):
+        raise HTTPException(status_code=400, detail="Only pending or approved requests can be deleted.")
+    if wfh.status == "approved" and wfh.start_date <= today_ist:
+        raise HTTPException(status_code=400, detail="Cannot delete approved WFH that has already started. Contact your manager.")
 
     user_email = current_user.get("email")
     is_own = wfh.user_email == user_email
     if not is_own and not _can_approve(db, current_user, wfh.user_email):
         raise HTTPException(status_code=403, detail="You are not authorized to delete this request.")
 
-    deleted = wfh_service.delete(db, request_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="WFH request not found.")
+    try:
+        deleted = wfh_service.delete(db, request_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="WFH request not found.")
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"WFH delete failed for {request_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete WFH request")
 
     audit_logger.info(
         f"WFH request deleted for {wfh.user_email} on {wfh.start_date} by {user_email}",
@@ -602,7 +679,7 @@ async def get_wfh_request(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    wfh = _get_wfh_by_id(db, request_id)
     if not wfh:
         raise HTTPException(status_code=404, detail="WFH request not found.")
     if wfh.user_email != current_user.get("email") and not _can_approve(db, current_user, wfh.user_email):
@@ -619,7 +696,7 @@ async def update_wfh_request(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    wfh = db.query(WfhRequest).filter(WfhRequest.id == request_id).first()
+    wfh = _get_wfh_by_id(db, request_id)
     if not wfh:
         raise HTTPException(status_code=404, detail="WFH request not found.")
     if wfh.status != "pending":
