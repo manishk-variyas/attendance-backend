@@ -25,7 +25,7 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.attendance import Attendance
 from app.utils.audit import audit_logger
 from app.utils.excel import build_shifts_excel
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_
 
 logger = logging.getLogger(__name__)
 
@@ -271,82 +271,82 @@ async def validate_shift(
     return await shift_service.validate_shift(db, shift_data, current_user)
 
 
-@router.post("/bulk", status_code=status.HTTP_201_CREATED)
-async def create_bulk_shifts(
-    payload: ShiftBulkCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    await authorize_shift_access(
-        current_user=current_user,
-        target_email=payload.userEmail,
-        target_project_id=payload.projectId,
-        is_write=True
-    )
+# @router.post("/bulk", status_code=status.HTTP_201_CREATED)
+# async def create_bulk_shifts(
+#     payload: ShiftBulkCreate,
+#     db: Session = Depends(get_db),
+#     current_user: dict = Depends(get_current_user),
+# ):
+#     await authorize_shift_access(
+#         current_user=current_user,
+#         target_email=payload.userEmail,
+#         target_project_id=payload.projectId,
+#         is_write=True
+#     )
 
-    try:
-        start = date.fromisoformat(payload.startDate)
-        end = date.fromisoformat(payload.endDate)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+#     try:
+#         start = date.fromisoformat(payload.startDate)
+#         end = date.fromisoformat(payload.endDate)
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
 
-    if start > end:
-        raise HTTPException(status_code=400, detail="startDate must be on or before endDate.")
+#     if start > end:
+#         raise HTTPException(status_code=400, detail="startDate must be on or before endDate.")
 
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    if start < today:
-        raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
+#     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+#     if start < today:
+#         raise HTTPException(status_code=400, detail="Cannot create shifts for past dates.")
 
-    try:
-        st = time.fromisoformat(payload.shiftStartTime[:5])
-        et = time.fromisoformat(payload.shiftEndTime[:5])
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM.")
-    if st == et:
-        raise HTTPException(status_code=400, detail="Shift start and end time cannot be the same.")
+#     try:
+#         st = time.fromisoformat(payload.shiftStartTime[:5])
+#         et = time.fromisoformat(payload.shiftEndTime[:5])
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM.")
+#     if st == et:
+#         raise HTTPException(status_code=400, detail="Shift start and end time cannot be the same.")
 
-    shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
-    if not shift_def:
-        raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
+#     shift_def = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift).first()
+#     if not shift_def:
+#         raise HTTPException(status_code=400, detail=f"Shift code '{payload.shift}' does not exist.")
 
-    base = payload.model_dump(exclude={"startDate", "endDate"})
+#     base = payload.model_dump(exclude={"startDate", "endDate"})
 
-    created = []
-    skipped_dates = []
-    leave_blocked = []
+#     created = []
+#     skipped_dates = []
+#     leave_blocked = []
 
-    from app.services.database.shift_service import ShiftService as PGShiftService
-    svc = PGShiftService(db)
-    current_date = start
-    while current_date <= end:
-        date_str = current_date.isoformat()
+#     from app.services.database.shift_service import ShiftService as PGShiftService
+#     svc = PGShiftService(db)
+#     current_date = start
+#     while current_date <= end:
+#         date_str = current_date.isoformat()
 
-        on_leave = db.execute(
-            select(Leave).where(
-                Leave.user_email == payload.userEmail,
-                Leave.approval_status.in_(["approved"]),
-                Leave.start_date <= current_date,
-                Leave.end_date >= current_date,
-            )
-        ).scalars().first()
-        if on_leave:
-            leave_blocked.append(date_str)
-            current_date += timedelta(days=1)
-            continue
+#         on_leave = db.execute(
+#             select(Leave).where(
+#                 Leave.user_email == payload.userEmail,
+#                 Leave.approval_status.in_(["approved"]),
+#                 Leave.start_date <= current_date,
+#                 Leave.end_date >= current_date,
+#             )
+#         ).scalars().first()
+#         if on_leave:
+#             leave_blocked.append(date_str)
+#             current_date += timedelta(days=1)
+#             continue
 
-        # Disabled: prevents multiple shifts per day.
-        # svc.delete_by_user_and_date(payload.userId, date_str)
-        shift_data = {**base, "date": date_str, "endDate": date_str}
-        result = await shift_service.create_shift(db, shift_data, current_user)
-        created.append(result)
-        current_date += timedelta(days=1)
+#         # Disabled: prevents multiple shifts per day.
+#         # svc.delete_by_user_and_date(payload.userId, date_str)
+#         shift_data = {**base, "date": date_str, "endDate": date_str}
+#         result = await shift_service.create_shift(db, shift_data, current_user)
+#         created.append(result)
+#         current_date += timedelta(days=1)
 
-    return {
-        "created": len(created),
-        "skipped_leave": len(leave_blocked),
-        "leave_dates": leave_blocked,
-        "shifts": created,
-    }
+#     return {
+#         "created": len(created),
+#         "skipped_leave": len(leave_blocked),
+#         "leave_dates": leave_blocked,
+#         "shifts": created,
+#     }
 
 
 @router.get("/server-time")
@@ -463,6 +463,7 @@ async def get_shifts_by_range(
     start_date: str = Query(..., description="Start date (YYYY-MM-DD)"),
     end_date: str = Query(..., description="End date (YYYY-MM-DD)"),
     user_id: Optional[int] = Query(None, description="User ID to view schedule for (PM/Admin only)"),
+    country: Optional[str] = Query(None, max_length=100, description="ISO country code e.g. IN, US — overrides profile country"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -488,6 +489,7 @@ async def get_shifts_by_range(
     target_user_id = user_id or current_rm_id
 
     target_email = current_email
+    target_emp = None
     if target_user_id != current_rm_id:
         if "Admin" in roles:
             pass
@@ -507,8 +509,19 @@ async def get_shifts_by_range(
         from app.models.employee_master import EmployeeMaster
         from app.services.database.base_service import BaseService
         emp_svc = BaseService[EmployeeMaster](db)
-        emp = emp_svc.fetch_one(EmployeeMaster, redmine_user_id=target_user_id)
-        target_email = emp.user_email if emp else None
+        target_emp = emp_svc.fetch_one(EmployeeMaster, redmine_user_id=target_user_id)
+        target_email = target_emp.user_email if target_emp else None
+    else:
+        from app.models.employee_master import EmployeeMaster
+        target_emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == current_email).first()
+
+    try:
+        sd_range = date.fromisoformat(start_date)
+        ed_range = date.fromisoformat(end_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if sd_range > ed_range:
+        raise HTTPException(status_code=400, detail="start_date must be on or before end_date.")
 
     shifts = await shift_service.get_shifts_by_date_range(
         db,
@@ -519,12 +532,10 @@ async def get_shifts_by_range(
 
     leaves = []
     if target_email:
-        sd = date.fromisoformat(start_date)
-        ed = date.fromisoformat(end_date)
         stmt = select(Leave).where(
             Leave.user_email == target_email,
-            Leave.start_date <= ed,
-            Leave.end_date >= sd,
+            Leave.start_date <= ed_range,
+            Leave.end_date >= sd_range,
             Leave.approval_status == "approved",
         ).order_by(Leave.start_date)
         leaves = [lv.to_dict() for lv in db.execute(stmt).scalars().all()]
@@ -538,13 +549,27 @@ async def get_shifts_by_range(
                     name = ltype_map.get("CO")
                 lv["leave_type_name"] = name or code
 
+    from app.utils.country import normalize_country
+
+    effective_country = normalize_country(country) if country else None
+    if not effective_country and target_emp and target_emp.country:
+        effective_country = normalize_country(target_emp.country)
+
+    hq = db.query(Holiday).filter(Holiday.holiday_date >= sd_range, Holiday.holiday_date <= ed_range)
+    if effective_country:
+        hq = hq.filter(or_(Holiday.country_code == effective_country, Holiday.is_national == True))
+    else:
+        hq = hq.filter(Holiday.is_national == True)
+    holidays = hq.all()
+    holiday_map = {h.holiday_date.isoformat(): h.to_dict() for h in holidays}
+
     timeline = {}
     for s in shifts:
         d = s.get("date")
         if not d:
             continue
         if d not in timeline:
-            timeline[d] = {"date": d, "shift": None, "leave": None}
+            timeline[d] = {"date": d, "shift": None, "leave": None, "holiday": None}
         timeline[d]["shift"] = s
 
     for lv in leaves:
@@ -557,10 +582,21 @@ async def get_shifts_by_range(
         while current <= end:
             d_str = current.isoformat()
             if d_str not in timeline:
-                timeline[d_str] = {"date": d_str, "shift": None, "leave": None}
+                timeline[d_str] = {"date": d_str, "shift": None, "leave": None, "holiday": None}
             if not timeline[d_str]["leave"]:
                 timeline[d_str]["leave"] = lv
             current += timedelta(days=1)
+
+    for d_str, h in holiday_map.items():
+        if d_str not in timeline:
+            timeline[d_str] = {"date": d_str, "shift": None, "leave": None, "holiday": None}
+        if not timeline[d_str]["holiday"]:
+            timeline[d_str]["holiday"] = h
+    for entry in timeline.values():
+        if "holiday" not in entry:
+            entry["holiday"] = None
+        if entry["holiday"] is None and entry["date"] in holiday_map:
+            entry["holiday"] = holiday_map[entry["date"]]
 
     result = sorted(timeline.values(), key=lambda x: x["date"])
     return {"timeline": result}
@@ -632,7 +668,6 @@ async def get_shifts_by_date(
     return await shift_service.get_shifts_by_date(db, date_str, email=email)
 
 
-@router.get("/history")
 async def get_shift_history(
     user_id: Optional[int] = Query(None, description="Admin/PM: view another user's shift history"),
     team: Optional[bool] = Query(None, description="PM/PC: view all team members' shifts"),
@@ -984,59 +1019,6 @@ async def update_shift(
     )
 
     return updated
-
-
-@router.delete("/by-date", status_code=status.HTTP_204_NO_CONTENT)
-@limiter.limit("5/minute")
-async def delete_shift_by_date(
-    request: Request,
-    user_id: int = Query(..., description="Redmine user ID"),
-    target_date: str = Query(..., description="YYYY-MM-DD"),
-    reason: Optional[str] = Query(None, max_length=200, description="Reason for deletion"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        td = date.fromisoformat(target_date)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
-
-    emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == user_id).first()
-    if not emp or not emp.keycloak_user_id:
-        raise HTTPException(status_code=404, detail="Employee not found or not onboarded")
-
-    shift = db.query(Shift).filter(
-        Shift.keycloak_user_id == emp.keycloak_user_id,
-        Shift.date <= td,
-        Shift.end_date >= td,
-    ).first()
-
-    await authorize_shift_access(
-        current_user=current_user,
-        target_email=emp.user_email,
-        target_project_id=shift.project_id if shift else None,
-        is_write=True,
-    )
-
-    deleted = await shift_service.delete_shift_by_date(db, emp.keycloak_user_id, td)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="No shift found for this date")
-
-    audit_logger.info(
-        f"Shift deleted for {emp.user_email} on {target_date} by {current_user.get('username')}",
-        extra={
-            "correlation_id": request.state.correlation_id,
-            "extra_data": {
-                "action": "shift_delete",
-                "username": current_user.get("username"),
-                "status": "success",
-                "client_ip": _get_client_ip(request),
-                "deleted_user": emp.user_email,
-                "deleted_date": target_date,
-                "reason": reason or "",
-            },
-        },
-    )
 
 
 @router.delete("/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)

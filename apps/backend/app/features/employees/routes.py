@@ -247,68 +247,6 @@ async def upload_profile_picture(
     return {"message": "Profile picture uploaded", "profilePictureUrl": f"/api/employees/{emp.id}/profile-picture"}
 
 
-@router.get("")
-async def list_employees(
-    status: Optional[str] = Query(None, description="Filter by status"),
-    onboarded: Optional[bool] = Query(None, description="Filter onboarded employees (have keycloak_user_id and active)"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
-):
-    svc = BaseService[EmployeeMaster](db)
-    query = db.query(EmployeeMaster)
-
-    if status:
-        query = query.filter(EmployeeMaster.status == status)
-    if onboarded is True:
-        query = query.filter(EmployeeMaster.onboarded_at.isnot(None))
-    elif onboarded is False:
-        query = query.filter(EmployeeMaster.onboarded_at.is_(None))
-
-    total = query.count()
-    employees = query.order_by(EmployeeMaster.created_at.desc()).all()
-
-    # Batch fetch Redmine project roles for all employees
-    user_redmine_roles = {}
-    user_kc_roles = {}
-    project_managers = {}  # project_name -> {"name": "...", "designation": "..."}
-    try:
-        projects = await redmine_service.get_all_projects()
-        for p in projects:
-            pid = p.get("id") if isinstance(p, dict) else p.id
-            try:
-                members = await redmine_service.get_project_members(pid)
-                pname = p.get("name") if isinstance(p, dict) else p.name
-                pm_names = []
-                for m in members:
-                    uid = m.get("user_id")
-                    roles = m.get("roles", [])
-                    if uid:
-                        if uid not in user_redmine_roles:
-                            user_redmine_roles[uid] = []
-                        for role_name in roles:
-                            user_redmine_roles[uid].append({"project": pname, "role": role_name})
-                    if "Project Manager" in roles or "Project Coordinator" in roles:
-                        pm_names.append(m.get("name", ""))
-                project_managers[pname] = pm_names
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return {
-        "total": total,
-        "employees": [{
-            **employee_to_dict(e),
-            "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
-            "keycloak_role": None,
-            "redmine_roles": [
-                {**r, "managers": project_managers.get(r["project"], [])}
-                for r in user_redmine_roles.get(e.redmine_user_id, [])
-            ],
-        } for e in employees],
-    }
-
 
 @router.get("/v1")
 async def list_employees_v1(
@@ -375,106 +313,106 @@ async def list_employees_v1(
     return result
 
 
-@router.get("/my-team")
-async def list_my_team(
-    status: Optional[str] = Query(None, description="Filter by status"),
-    onboarded: Optional[bool] = Query(None, description="Filter onboarded employees"),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_active),
-):
-    roles = current_user.get("roles", [])
-    if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
-        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+# @router.get("/my-team")
+# async def list_my_team(
+#     status: Optional[str] = Query(None, description="Filter by status"),
+#     onboarded: Optional[bool] = Query(None, description="Filter onboarded employees"),
+#     db: Session = Depends(get_db),
+#     current_user: dict = Depends(get_current_user),
+#     _: None = Depends(require_active),
+# ):
+#     roles = current_user.get("roles", [])
+#     if "Admin" not in roles and "Project Manager" not in roles and "Project Coordinator" not in roles:
+#         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
-    email = current_user.get("email")
+#     email = current_user.get("email")
 
-    from app.features.redmine.sql_service import RedmineSQLService
-    sql = RedmineSQLService(db)
+#     from app.features.redmine.sql_service import RedmineSQLService
+#     sql = RedmineSQLService(db)
 
-    rm_user = sql.get_user_by_email(email)
-    if not rm_user:
-        raise HTTPException(status_code=403, detail="Not found in Redmine.")
+#     rm_user = sql.get_user_by_email(email)
+#     if not rm_user:
+#         raise HTTPException(status_code=403, detail="Not found in Redmine.")
 
-    my_projects = sql.get_projects_for_user(rm_user["id"])
-    if not my_projects:
-        return {"total": 0, "employees": []}
+#     my_projects = sql.get_projects_for_user(rm_user["id"])
+#     if not my_projects:
+#         return {"total": 0, "employees": []}
 
-    all_member_rm_ids = set()
-    user_redmine_roles = {}
-    project_managers_my = {}
-    for p in my_projects:
-        pname = p.name if hasattr(p, 'name') else p.get('name', '')
-        pid = p.id if hasattr(p, 'id') else p.get('id')
-        members = sql.get_project_members(pid)
-        pm_names = []
-        for m in members:
-            uid = m.get("user_id")
-            if uid:
-                all_member_rm_ids.add(uid)
-                roles = m.get("roles", [])
-                if uid not in user_redmine_roles:
-                    user_redmine_roles[uid] = []
-                for role_name in roles:
-                    user_redmine_roles[uid].append({"project": pname, "role": role_name})
-                if any(r in ("Project Manager", "Project Coordinator") for r in roles):
-                    pm_names.append(m.get("name", ""))
-        project_managers_my[pname] = pm_names
+#     all_member_rm_ids = set()
+#     user_redmine_roles = {}
+#     project_managers_my = {}
+#     for p in my_projects:
+#         pname = p.name if hasattr(p, 'name') else p.get('name', '')
+#         pid = p.id if hasattr(p, 'id') else p.get('id')
+#         members = sql.get_project_members(pid)
+#         pm_names = []
+#         for m in members:
+#             uid = m.get("user_id")
+#             if uid:
+#                 all_member_rm_ids.add(uid)
+#                 roles = m.get("roles", [])
+#                 if uid not in user_redmine_roles:
+#                     user_redmine_roles[uid] = []
+#                 for role_name in roles:
+#                     user_redmine_roles[uid].append({"project": pname, "role": role_name})
+#                 if any(r in ("Project Manager", "Project Coordinator") for r in roles):
+#                     pm_names.append(m.get("name", ""))
+#         project_managers_my[pname] = pm_names
 
-    query = db.query(EmployeeMaster).filter(
-        EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)
-    )
-    if status:
-        query = query.filter(EmployeeMaster.status == status)
-    if onboarded is True:
-        query = query.filter(EmployeeMaster.onboarded_at.isnot(None))
-    elif onboarded is False:
-        query = query.filter(EmployeeMaster.onboarded_at.is_(None))
+#     query = db.query(EmployeeMaster).filter(
+#         EmployeeMaster.redmine_user_id.in_(all_member_rm_ids)
+#     )
+#     if status:
+#         query = query.filter(EmployeeMaster.status == status)
+#     if onboarded is True:
+#         query = query.filter(EmployeeMaster.onboarded_at.isnot(None))
+#     elif onboarded is False:
+#         query = query.filter(EmployeeMaster.onboarded_at.is_(None))
 
-    employees = query.order_by(EmployeeMaster.created_at.desc()).all()
+#     employees = query.order_by(EmployeeMaster.created_at.desc()).all()
 
-    return {
-        "total": len(employees),
-        "employees": [{
-            **employee_to_dict(e),
-            "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
-            "keycloak_role": None,
-            "redmine_roles": [
-                {**r, "managers": project_managers_my.get(r["project"], [])}
-                for r in user_redmine_roles.get(e.redmine_user_id, [])
-            ],
-        } for e in employees],
-    }
+#     return {
+#         "total": len(employees),
+#         "employees": [{
+#             **employee_to_dict(e),
+#             "projects": [r["project"] for r in user_redmine_roles.get(e.redmine_user_id, [])],
+#             "keycloak_role": None,
+#             "redmine_roles": [
+#                 {**r, "managers": project_managers_my.get(r["project"], [])}
+#                 for r in user_redmine_roles.get(e.redmine_user_id, [])
+#             ],
+#         } for e in employees],
+#     }
 
 
-@router.get("/my-team/emails")
-async def list_my_team_emails(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_active),
-):
-    roles = current_user.get("roles", [])
-    if "Admin" in roles:
-        emps = db.query(EmployeeMaster).order_by(EmployeeMaster.first_name).all()
-        return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
+# @router.get("/my-team/emails")
+# async def list_my_team_emails(
+#     db: Session = Depends(get_db),
+#     current_user: dict = Depends(get_current_user),
+#     _: None = Depends(require_active),
+# ):
+#     roles = current_user.get("roles", [])
+#     if "Admin" in roles:
+#         emps = db.query(EmployeeMaster).order_by(EmployeeMaster.first_name).all()
+#         return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
 
-    if "Project Manager" not in roles and "Project Coordinator" not in roles:
-        raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
+#     if "Project Manager" not in roles and "Project Coordinator" not in roles:
+#         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
-    from app.features.redmine.sql_service import RedmineSQLService
-    sql = RedmineSQLService(db)
-    pm_user = sql.get_user_by_email(current_user.get("email"))
-    if not pm_user:
-        raise HTTPException(status_code=403, detail="Not found in Redmine.")
+#     from app.features.redmine.sql_service import RedmineSQLService
+#     sql = RedmineSQLService(db)
+#     pm_user = sql.get_user_by_email(current_user.get("email"))
+#     if not pm_user:
+#         raise HTTPException(status_code=403, detail="Not found in Redmine.")
 
-    member_ids = sql.get_team_member_ids(pm_user["id"])
-    member_ids.add(pm_user["id"])
+#     member_ids = sql.get_team_member_ids(pm_user["id"])
+#     member_ids.add(pm_user["id"])
 
-    emps = db.query(EmployeeMaster).filter(
-        EmployeeMaster.redmine_user_id.in_(member_ids)
-    ).order_by(EmployeeMaster.first_name).all()
+#     emps = db.query(EmployeeMaster).filter(
+#         EmployeeMaster.redmine_user_id.in_(member_ids)
+#     ).order_by(EmployeeMaster.first_name).all()
 
-    return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
+#     return [{"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation} for e in emps if e.user_email]
 
 
 @router.get("/suggest")

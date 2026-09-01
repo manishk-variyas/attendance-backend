@@ -271,25 +271,38 @@ class LeaveBusinessService:
             resuming_str,
         )
 
+        approver_email = None
         if leave_data.approver_id:
             emp = self.leave_db.db.execute(
                 select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == leave_data.approver_id)
             ).scalars().first()
             if emp and emp.user_email:
-                self._send_email_bg(
-                    email_service.send_leave_applied,
-                    emp.user_email,
-                    applicant_name,
-                    start_str,
-                    end_str,
-                    reason_str,
-                    resuming_str,
-                )
+                approver_email = emp.user_email
+        if not approver_email:
+            applicant_emp = self.leave_db.db.execute(
+                select(EmployeeMaster).where(EmployeeMaster.user_email == email)
+            ).scalars().first()
+            if applicant_emp and applicant_emp.reports_to:
+                mgr = self.leave_db.db.execute(
+                    select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == applicant_emp.reports_to)
+                ).scalars().first()
+                if mgr and mgr.user_email:
+                    approver_email = mgr.user_email
+        if approver_email:
+            self._send_email_bg(
+                email_service.send_leave_applied,
+                approver_email,
+                applicant_name,
+                start_str,
+                end_str,
+                reason_str,
+                resuming_str,
+            )
 
         return {"leave_id": leave_ids[0], "leave_ids": leave_ids, "created": len(leave_ids), "balance": balance_info}
 
     def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
-        today = date.today()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         lt = self.leave_db.db.execute(
             select(LeaveTypeConfig).where(
@@ -868,7 +881,7 @@ class LeaveBusinessService:
         return {"created": created, "updated": updated, "id": payload.id, "fiscal_year": payload.fiscal_year}
 
     async def get_employee_leave_balance_summary(self, user_id: str) -> Dict[str, Any]:
-        today = date.today()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         fiscal_year = self._fiscal_year_for(today)
 
         types = self.leave_db.db.execute(
@@ -908,7 +921,8 @@ class LeaveBusinessService:
             availed = availed_days(self.leave_db.db, user_id, codes, fiscal_year)
             balance = total - availed
             result.append({"code": t.code, "name": t.name, "total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)})
-            total_available += balance
+            if t.is_paid:
+                total_available += balance
 
         emp = self.leave_db.db.execute(
             select(EmployeeMaster).where(EmployeeMaster.keycloak_user_id == user_id)
@@ -956,7 +970,7 @@ class LeaveBusinessService:
     ) -> Dict[str, Any]:
         roles = current_user.get("roles", [])
         email = current_user.get("email")
-        today = date.today()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         emp_query = self.leave_db.db.query(EmployeeMaster).filter(EmployeeMaster.is_active.is_(True))
 
@@ -1009,7 +1023,7 @@ class LeaveBusinessService:
             select(LeaveTypeConfig).where(LeaveTypeConfig.is_active.is_(True)).order_by(LeaveTypeConfig.name)
         ).scalars().all()
 
-        today = date.today()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         records = []
         for e in employees:
@@ -1027,7 +1041,8 @@ class LeaveBusinessService:
                 availed = availed_days(self.leave_db.db, uid, codes, fiscal_year)
                 balance = total - availed
                 type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
-                total_available += balance
+                if t.is_paid:
+                    total_available += balance
 
             records.append({
                 "id": str(e.id),
@@ -1055,8 +1070,8 @@ class LeaveBusinessService:
 
     async def get_self_leave_balance(self, current_user: dict, fiscal_year: int = None) -> Dict[str, Any]:
         if fiscal_year is None:
-            fiscal_year = self._fiscal_year_for(date.today())
-        today = date.today()
+            fiscal_year = self._fiscal_year_for(datetime.now(ZoneInfo("Asia/Kolkata")).date())
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         user_id = current_user.get("sub")
 
         emp = self.leave_db.db.execute(
@@ -1099,7 +1114,8 @@ class LeaveBusinessService:
             availed = availed_days(self.leave_db.db, user_id, codes, fiscal_year)
             balance = total - availed
             type_summary[t.code] = {"total": round(total, 2), "availed": round(availed, 2), "balance": round(balance, 2)}
-            total_available += balance
+            if t.is_paid:
+                total_available += balance
 
         return {
             "id": str(emp.id),

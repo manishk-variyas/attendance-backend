@@ -435,13 +435,13 @@ def check_out(
     return _to_response(db, attendance)
 
 
-@router.post("/complete", response_model=AttendanceResponse, status_code=status.HTTP_201_CREATED)
-async def complete_attendance(
-    payload: CompleteAttendanceRequest,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_active),
-):
+# @router.post("/complete", response_model=AttendanceResponse, status_code=status.HTTP_201_CREATED)
+# async def complete_attendance(
+#     payload: CompleteAttendanceRequest,
+#     db: Session = Depends(get_db),
+#     current_user: dict = Depends(get_current_user),
+#     _: None = Depends(require_active),
+# ):
     keycloak_user_id = current_user["sub"]
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 

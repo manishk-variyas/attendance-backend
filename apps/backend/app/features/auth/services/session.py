@@ -178,27 +178,3 @@ async def extend_session(session_id: str, hours: int = None) -> bool:
         db.close()
 
 
-# ═══════════════════════════════════════════════════════════════
-#  OLD — IN-MEMORY SESSION STORE (kept for fallback)
-# ═══════════════════════════════════════════════════════════════
-#
-# _session_store: Dict[str, dict] = {}
-#
-# async def create_session(user_data: dict, ...):
-#     session_id = generate_session_id()
-#     _session_store[session_id] = {"data": session_data, "expires": datetime.now() + timedelta(hours=expire_hours)}
-#     return session_id
-#
-# async def get_session(session_id: str):
-#     session = _session_store.get(session_id)
-#     if not session or datetime.now() > session["expires"]:
-#         ...
-#
-# async def delete_session(session_id: str):
-#     ...
-#
-# async def delete_sessions_by_sub(sub: str):
-#     ...
-#
-# async def enforce_session_limit(sub: str, max_sessions: int = 2):
-#     ...

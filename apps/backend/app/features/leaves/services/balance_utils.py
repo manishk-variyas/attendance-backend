@@ -70,20 +70,20 @@ def availed_days(
     otherwise all leaves in the fiscal year count (including future-dated
     approved leaves, so an approval deducts immediately).
     """
+    fy_start = date(fiscal_year, 4, 1)
+    fy_end = date(fiscal_year + 1, 3, 31)
     stmt = select(Leave).where(
         Leave.keycloak_user_id == user_id,
         Leave.approval_status.in_(COUNTED_STATUSES),
-        Leave.start_date >= date(fiscal_year, 4, 1),
+        Leave.start_date >= fy_start,
+        Leave.start_date <= fy_end,
+        Leave.leave_type.in_(list(codes)),
     )
     if up_to is not None:
         stmt = stmt.where(Leave.end_date <= up_to)
 
     leaves = db.execute(stmt).scalars().all()
-    code_set = set(codes)
-    return sum(
-        (lv.end_date - lv.start_date).days + 1
-        for lv in leaves if lv.leave_type in code_set
-    )
+    return sum((lv.end_date - lv.start_date).days + 1 for lv in leaves)
 
 
 def balance_for(

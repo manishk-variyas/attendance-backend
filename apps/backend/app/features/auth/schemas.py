@@ -91,26 +91,6 @@ class SignupRequest(BaseModel):
         return REDMINE_TO_IANA_TZ.get(v, v)
 
 
-# class SignupRequest(BaseModel):
-#     username: str = Field(..., min_length=3, max_length=30, pattern=r"^[a-zA-Z0-9_]+$")
-#     email: EmailStr
-#     password: str = Field(...)
-#     timezone: str = Field(default="UTC", description="IANA timezone name, e.g. 'Asia/Kolkata'")
-
-#     @field_validator("username")
-#     @classmethod
-#     def validate_username(cls, v: str) -> str:
-#         if not v.replace("_", "").isalnum():
-#             raise ValueError("Username can only contain letters, numbers, and underscores")
-#         return v
-
-#     @field_validator("password")
-#     @classmethod
-#     def validate_password(cls, v: str) -> str:
-#         if len(v) < 8:
-#             raise ValueError("Password must be at least 8 characters")
-#         return v
-
 
 class SignupResponse(BaseModel):
     message: str
