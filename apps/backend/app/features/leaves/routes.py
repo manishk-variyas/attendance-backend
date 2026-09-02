@@ -834,6 +834,7 @@ async def delete_leave(
             "extra_data": {
                 "action": "delete_leave",
                 "username": current_user.get("username"),
+                "status": "success",
                 "leave_id": leave_id,
                 "leave_user_email": leave.user_email,
                 "leave_type": leave.leave_type,

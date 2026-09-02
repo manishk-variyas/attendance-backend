@@ -67,6 +67,7 @@ async def save_leave_balance_bulk(
             "extra_data": {
                 "action": "leave_balance_save",
                 "username": current_user.get("username"),
+                "status": "success",
                 "employee_id": payload.id,
                 "fiscal_year": payload.fiscal_year,
                 "client_ip": _get_client_ip(request),

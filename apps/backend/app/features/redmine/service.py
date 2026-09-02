@@ -1,4 +1,5 @@
 import httpx
+import time
 from typing import List, Optional
 from fastapi import HTTPException
 from app.core.config import settings
@@ -7,6 +8,16 @@ import secrets
 import logging
 
 logger = logging.getLogger(__name__)
+
+ROLES_CACHE_TTL_SECONDS = 60
+_roles_cache: dict = {"data": None, "expires_at": 0.0}
+_role_detail_cache: dict = {}
+
+
+def _invalidate_roles_cache() -> None:
+    _roles_cache["data"] = None
+    _roles_cache["expires_at"] = 0.0
+    _role_detail_cache.clear()
 
 class RedmineService:
     def __init__(self):
@@ -500,8 +511,9 @@ class RedmineService:
         if permissions is not None:
             payload["role"]["permissions"] = permissions
         async with httpx.AsyncClient() as client:
-            resp = await client.post(f"{self.url}/roles.json", json=payload, headers=self.headers)
+            resp = await client.post(f"{self.url}/extended_api/roles.json", json=payload, headers=self.headers)
             resp.raise_for_status()
+            _invalidate_roles_cache()
             return resp.json().get("role", resp.json())
 
     async def update_role(self, role_id: int, name: Optional[str] = None, permissions: Optional[list] = None) -> dict:
@@ -511,17 +523,85 @@ class RedmineService:
         if permissions is not None:
             payload["permissions"] = permissions
         async with httpx.AsyncClient() as client:
-            resp = await client.put(f"{self.url}/roles/{role_id}.json", json={"role": payload}, headers=self.headers)
+            resp = await client.put(f"{self.url}/extended_api/roles/{role_id}.json", json={"role": payload}, headers=self.headers)
             resp.raise_for_status()
+            _invalidate_roles_cache()
             return resp.json().get("role", resp.json())
 
     async def delete_role(self, role_id: int) -> bool:
         async with httpx.AsyncClient() as client:
-            resp = await client.delete(f"{self.url}/roles/{role_id}.json", headers=self.headers)
+            resp = await client.delete(f"{self.url}/extended_api/roles/{role_id}.json", headers=self.headers)
             if resp.status_code == 404:
                 return False
             resp.raise_for_status()
+            _invalidate_roles_cache()
             return True
+
+    async def get_roles_list(self) -> list:
+        """Fetch all Redmine roles (lightweight list: id, name, builtin). Admin-only, cached 60s."""
+        now = time.monotonic()
+        if _roles_cache["data"] is not None and now < _roles_cache["expires_at"]:
+            return _roles_cache["data"]
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.url}/roles.json", headers=self.headers)
+            resp.raise_for_status()
+            data = resp.json().get("roles", [])
+        _roles_cache["data"] = data
+        _roles_cache["expires_at"] = now + ROLES_CACHE_TTL_SECONDS
+        return data
+
+    async def get_role_details(self, role_id: int) -> dict:
+        """Fetch a single Redmine role with permissions, assignable, and visibility flags. Admin-only, cached 60s."""
+        now = time.monotonic()
+        cache_key = f"role_{role_id}"
+        cache_entry = _role_detail_cache.get(cache_key)
+        if cache_entry is not None and now < cache_entry["expires_at"]:
+            return cache_entry["data"]
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{self.url}/roles/{role_id}.json", headers=self.headers)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json().get("role", resp.json())
+        _role_detail_cache[cache_key] = {"data": data, "expires_at": now + ROLES_CACHE_TTL_SECONDS}
+        return data
+
+    def filter_roles(
+        self,
+        roles: list,
+        search: Optional[str] = None,
+        assignable: Optional[bool] = None,
+        include_builtin: bool = True,
+    ) -> list:
+        """Apply search and filters to the roles list. Pure function, no I/O."""
+        filtered = roles
+        if not include_builtin:
+            filtered = [r for r in filtered if r.get("builtin", 0) == 0]
+        if assignable is not None:
+            filtered = [r for r in filtered if bool(r.get("assignable")) == assignable]
+        if search:
+            needle = search.casefold()
+            filtered = [r for r in filtered if needle in (r.get("name") or "").casefold()]
+        return filtered
+
+    def paginate_roles(
+        self,
+        roles: list,
+        page: int,
+        page_size: int,
+    ) -> dict:
+        """Slice a roles list into a paginated response envelope."""
+        total = len(roles)
+        offset = (page - 1) * page_size
+        items = roles[offset : offset + page_size]
+        total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 0
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
 
     async def update_user(self, user_id: int, data: dict) -> bool:
         """Update a Redmine user's profile fields."""

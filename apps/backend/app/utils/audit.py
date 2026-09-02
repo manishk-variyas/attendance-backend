@@ -148,6 +148,7 @@ def log_backchannel_logout(
             "extra_data": {
                 "action": "backchannel_logout",
                 "user_sub": user_sub,
+                "status": "success",
                 "sessions_deleted": sessions_deleted,
                 "source": "keycloak",
                 **(extra or {}),

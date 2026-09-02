@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db, SessionLocal
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity
+from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity, get_session_email
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user, get_keycloak_user_by_email
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.auth.realm_registry import get_realm_config, DEFAULT_REALM_NAME, token_issuer_matches_realm
@@ -261,11 +261,16 @@ async def logout(request: Request):
         session_data = await get_session(session_id)
 
         if session_data:
-            username = session_data.get("username", "-")
+            username = session_data.get("email") or session_data.get("username", "-")
             refresh_token = session_data.get("kc_refresh_token")
             # Tell Keycloak to revoke the refresh token so it can't be used again
             if refresh_token:
                 await revoke_keycloak_token(refresh_token, realm=session_data.get("realm"))
+        else:
+            # Session already soft-deleted; still try to resolve identity for the audit log
+            resolved = await get_session_email(session_id)
+            if resolved:
+                username = resolved
 
         # Remove the session from the database
         await delete_session(session_id)

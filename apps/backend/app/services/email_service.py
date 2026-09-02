@@ -109,9 +109,13 @@ class EmailService:
         body = _template("onboarding_welcome", employee_name=employee_name, designation=designation, employee_id=employee_id, email=email, joining_date=joining_date, reports_to_name=reports_to_name, company_name=company_name, portal_url=portal_url)
         return self.send([to], subject, body)
 
-    def send_delete_verification(self, to: str, otp: str, count: int, expires_minutes: int = 10) -> bool:
-        subject = f"Delete Verification Code — {otp}"
-        body = _template("delete_verification", otp=otp, count=str(count), expires_minutes=str(expires_minutes))
+    def send_delete_verification(self, to: str, otp: str, count: int, expires_minutes: int = 10, resource_type: str = "employee") -> bool:
+        resource_type = (resource_type or "employee").lower()
+        subject = f"{resource_type.capitalize()} Deletion Verification Code — {otp}"
+        if resource_type == "project":
+            body = _template("delete_verification_project", otp=otp, count=str(count), expires_minutes=str(expires_minutes))
+        else:
+            body = _template("delete_verification", otp=otp, count=str(count), expires_minutes=str(expires_minutes))
         return self.send([to], subject, body)
 
 
@@ -260,9 +264,17 @@ _EMAIL_TEMPLATES = {
         <div class="badge badge-danger">Delete Verification Required</div>
         <p>Hello,</p>
         <p>You requested to delete <strong>{count} employee(s)</strong>. Use the verification code below to confirm this action.</p>
-        <p style="text-align:center;margin:24px 0"><span style="font-size:32px;font-weight:800;letter-spacing:8px;background:#f4f5f7;padding:16px 24px;border-radius:8px;display:inline-block">{otp}</span></p>
+        <p style="text-align:center;margin:24px 0"><span style="font-size:18px;font-weight:700;letter-spacing:8px;background:#f4f5f7;padding:16px 24px;border-radius:8px">{otp}</span></p>
         <p style="text-align:center;color:#6b778c;font-size:13px">This code expires in <strong>{expires_minutes} minutes</strong>. Do not share it.</p>
         <p style="color:#bf2600;font-size:13px"><strong>Warning:</strong> This will permanently delete employee records including attendance, shifts, and leave data. This action cannot be undone.</p>
+    """,
+    "delete_verification_project": """
+        <div class="badge badge-danger">Delete Verification Required</div>
+        <p>Hello,</p>
+        <p>You requested to delete <strong>{count} project(s)</strong>. Use the verification code below to confirm this action.</p>
+        <p style="text-align:center;margin:24px 0"><span style="font-size:18px;font-weight:700;letter-spacing:8px;background:#f4f5f7;padding:16px 24px;border-radius:8px">{otp}</span></p>
+        <p style="text-align:center;color:#6b778c;font-size:13px">This code expires in <strong>{expires_minutes} minutes</strong>. Do not share it.</p>
+        <p style="color:#bf2600;font-size:13px"><strong>Warning:</strong> This will permanently delete the selected project(s) and all associated issues, memberships, and data. This action cannot be undone.</p>
     """,
 }
 

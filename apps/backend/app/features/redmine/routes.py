@@ -108,6 +108,54 @@ async def list_redmine_roles(
     return await redmine_service.get_roles()
 
 
+@router.get("/admin/roles")
+@limiter.limit("5/minute")
+async def list_roles(
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    search: Optional[str] = Query(None, max_length=100, description="Case-insensitive substring on role name"),
+    assignable: Optional[bool] = Query(None, description="Filter by assignable flag"),
+    include_builtin: bool = Query(True, description="Include built-in roles (Non member, Anonymous)"),
+    page: int = Query(1, ge=1, le=10000, description="Page number (default 1)"),
+    page_size: int = Query(10, ge=1, le=100, description="Items per page (default 10, max 100)"),
+):
+    """Return the lightweight Redmine roles list (id, name, builtin, assignable). Admin only. Cached 60s."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    all_roles = await redmine_service.get_roles_list()
+    filtered = redmine_service.filter_roles(
+        all_roles,
+        search=search,
+        assignable=assignable,
+        include_builtin=include_builtin,
+    )
+    return redmine_service.paginate_roles(filtered, page=page, page_size=page_size)
+
+
+@router.get("/admin/roles/{role_id}")
+@limiter.limit("10/minute")
+async def get_role_detail(
+    request: Request,
+    role_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a single Redmine role with permissions, assignable, and visibility flags. Admin only. Cached 60s."""
+    if "Admin" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    if role_id < 1 or role_id > 2_147_483_647:
+        raise HTTPException(status_code=400, detail="Invalid role_id")
+    role = await redmine_service.get_role_details(role_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return role
+
+
 @router.post("/redmine/roles", status_code=status.HTTP_201_CREATED)
 @limiter.limit("10/minute")
 async def create_redmine_role(
@@ -132,7 +180,7 @@ async def create_redmine_role(
         raise HTTPException(status_code=500, detail="Role created in Redmine but failed to commit backend transaction")
     audit_logger.info(
         f"Role created: {payload.name} by {current_user.get('username')}",
-        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "create_role", "username": current_user.get("username"), "role_name": payload.name, "client_ip": _get_client_ip(request)}},
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "create_role", "username": current_user.get("username"), "status": "success", "role_name": payload.name, "client_ip": _get_client_ip(request)}},
     )
     return role
 
@@ -170,7 +218,7 @@ async def update_redmine_role(
         raise HTTPException(status_code=500, detail="Role updated in Redmine but failed to commit backend transaction")
     audit_logger.info(
         f"Role {role_id} updated by {current_user.get('username')}",
-        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "update_role", "username": current_user.get("username"), "role_id": role_id, "client_ip": _get_client_ip(request)}},
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "update_role", "username": current_user.get("username"), "status": "success", "role_id": role_id, "role_name": payload.name, "client_ip": _get_client_ip(request)}},
     )
     return role
 
@@ -214,7 +262,7 @@ async def delete_redmine_role(
         raise HTTPException(status_code=500, detail="Role deleted in Redmine but failed to commit backend transaction")
     audit_logger.info(
         f"Role {role_id} deleted by {current_user.get('username')}",
-        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "delete_role", "username": current_user.get("username"), "role_id": role_id, "client_ip": _get_client_ip(request)}},
+        extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "delete_role", "username": current_user.get("username"), "status": "success", "role_id": role_id, "role_name": existing["name"], "client_ip": _get_client_ip(request)}},
     )
     return None
 
@@ -345,7 +393,8 @@ async def update_project(
                 "username": current_user.get("username"),
                 "status": "success",
                 "client_ip": _get_client_ip(request),
-                "project": project_id_or_identifier,
+                "project_id": project.get("id"),
+                "project_name": project.get("name") if isinstance(project, dict) else None,
             },
         },
     )
@@ -449,7 +498,7 @@ async def request_project_delete(
     db.add(token)
     db.commit()
 
-    email_service.send_delete_verification(admin_email, otp, len(resolved), 10)
+    email_service.send_delete_verification(admin_email, otp, len(resolved), 10, resource_type="project")
 
     return {
         "request_id": token_id,
@@ -496,23 +545,36 @@ async def confirm_project_delete(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid request data")
 
+    # Resolve project names before deletion so the audit log can show them
+    name_map = {}
+    if ids:
+        placeholders = ", ".join(f"'{str(i)}'" for i in ids)
+        rows = db.execute(
+            text(f"SELECT id, name FROM redmine.projects WHERE id::text IN ({placeholders})")
+        ).fetchall()
+        name_map = {str(r[0]): r[1] for r in rows}
+
     deleted = []
     failed = []
     for pid in ids:
+        pname = name_map.get(str(pid))
         try:
             ok = await redmine_service.delete_project(pid)
             if ok:
-                deleted.append(pid)
+                deleted.append({"id": pid, "name": pname})
             else:
-                failed.append({"id": pid, "reason": "Project not found"})
+                failed.append({"id": pid, "name": pname, "reason": "Project not found"})
         except Exception as e:
-            failed.append({"id": pid, "reason": str(e)[:200]})
+            failed.append({"id": pid, "name": pname, "reason": str(e)[:200]})
 
     token.used = True
     db.commit()
 
+    deleted_names = ", ".join(d["name"] or f"#{d['id']}" for d in deleted) or "none"
+    failed_names = ", ".join(f["name"] or f"#{f['id']}" for f in failed) or "none"
+
     audit_logger.info(
-        f"Verified project deletion by {current_user.get('username')}: {len(deleted)} deleted, {len(failed)} failed",
+        f"Verified project deletion by {current_user.get('username')}: {len(deleted)} deleted ({deleted_names}), {len(failed)} failed ({failed_names})",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -520,7 +582,8 @@ async def confirm_project_delete(
                 "username": current_user.get("username"),
                 "status": "success",
                 "client_ip": _get_client_ip(request),
-                "deleted_ids": deleted,
+                "deleted_ids": [d["id"] for d in deleted],
+                "deleted_names": [d["name"] for d in deleted],
                 "failed": failed,
             },
         },
@@ -529,7 +592,8 @@ async def confirm_project_delete(
     return {
         "status": "success",
         "message": f"{len(deleted)} project(s) deleted",
-        "deleted_ids": deleted,
+        "deleted_ids": [d["id"] for d in deleted],
+        "deleted_projects": deleted,
         "failed": failed,
     }
 

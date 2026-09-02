@@ -93,6 +93,7 @@ async def get_audit_logs(
     until: Optional[str] = Query(None, description="End datetime (ISO, e.g. 2026-08-24T19:00:00)"),
     tz: Optional[str] = Query(None, description="Timezone for naive since/until (default Asia/Kolkata)"),
     action: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, max_length=50, description="Filter by metadata.status (e.g. success, failure)"),
     search: Optional[str] = Query(None, description="Search username, message, or client IP"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     page: int = Query(1, description="Page number"),
@@ -101,6 +102,7 @@ async def get_audit_logs(
     page = max(1, page)
     page_size = max(1, min(100, page_size))
     search_term = (search or "").strip().lower()[:100]
+    status_term = (status or "").strip().lower()[:50]
 
     try:
         log_tz = ZoneInfo(tz or DEFAULT_LOG_TZ)
@@ -129,6 +131,8 @@ async def get_audit_logs(
         if metadata.get("action") == "backchannel_logout":
             continue
         if action and metadata.get("action", "").lower() != action.lower():
+            continue
+        if status_term and (metadata.get("status") or "").lower() != status_term:
             continue
         if search_term:
             hay = " ".join(filter(None, [
@@ -185,6 +189,8 @@ async def get_audit_logs(
             filters.append(f"search={search_term}")
         if action:
             filters.append(f"action={action}")
+        if status_term:
+            filters.append(f"status={status_term}")
         if since:
             filters.append(f"since={since}")
         if until:

@@ -148,6 +148,14 @@ def _run_migrations():
         conn.commit()
 
         conn.execute(text("""
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS logged_out_at TIMESTAMPTZ;
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS display_id VARCHAR(36);
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_sessions_display_id ON sessions(display_id);
+        """))
+        conn.commit()
+
+        conn.execute(text("""
             DO $$
             BEGIN
                 ALTER TABLE leaves ALTER COLUMN leave_type TYPE VARCHAR(20);

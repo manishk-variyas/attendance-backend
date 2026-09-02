@@ -183,3 +183,6 @@ app.include_router(admin_attendance_router, prefix="/api", tags=["admin-attendan
 from app.features.audit.admin_routes import router as audit_router
 app.include_router(audit_router, prefix="/api", tags=["admin-audit"])
 
+from app.features.admin.sessions_routes import router as admin_sessions_router
+app.include_router(admin_sessions_router, prefix="/api", tags=["admin-sessions"])
+
