@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db, SessionLocal
 from app.core.limiter import limiter, LOGIN_RATE_LIMIT
-from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity, get_session_email
+from app.features.auth.services.session import create_session, get_session, delete_session, enforce_session_limit, delete_sessions_by_sub, get_session_last_activity, get_session_email, get_previous_fingerprint_for_sub, get_session_login_ip, update_session_login_ip
 from app.features.auth.services.keycloak import refresh_keycloak_token, revoke_keycloak_token, create_keycloak_user, set_keycloak_password, get_realm_roles, add_realm_role_to_user, get_keycloak_user_by_email
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.auth.realm_registry import get_realm_config, DEFAULT_REALM_NAME, token_issuer_matches_realm
@@ -42,6 +42,15 @@ from app.models.password_reset import PasswordResetToken
 from app.services.database.base_service import BaseService
 from app.utils.jwt import get_user_info_from_token, get_token_issuer
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
+from app.utils.cloudflare import compute_fingerprint, get_country
+from app.utils.login_security import (
+    clear_ip,
+    is_brute_force_active,
+    is_ip_blocked,
+    record_ip_failure,
+)
+from app.utils.turnstile import verify_turnstile
+from app.services.email_service import email_service
 from app.utils.email import send_password_reset_email, send_password_changed_email
 from app.middleware.logging import _get_client_ip
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse, ForgotPasswordRequest, ResetPasswordRequest
@@ -56,7 +65,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
     """
     Login endpoint - authenticates user with Keycloak and creates a server-side session.
-    
+
     How it works:
     1. Receives username and password from the request body
     2. Sends these to Keycloak's token endpoint (with client credentials)
@@ -69,6 +78,23 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
 
     correlation_id = request.state.correlation_id
     client_ip = _get_client_ip(request)
+
+    # Per-IP brute-force block: short-circuit before any other work.
+    block_status = is_ip_blocked(client_ip)
+    if block_status.is_blocked:
+        log_security_event(
+            correlation_id, "ip_login_blocked",
+            f"Login blocked for IP {client_ip}",
+            severity="warning",
+            extra={"client_ip": client_ip, "blocked_until": block_status.blocked_until.isoformat() if block_status.blocked_until else None},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts from this network. Try again later.",
+        )
+
+    # Cloudflare Turnstile bot verification (no-op when TURNSTILE_SECRET_KEY is empty)
+    await verify_turnstile(payload.turnstile_token)
 
     rc = get_realm_config(payload.realm)
 
@@ -91,6 +117,29 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     if response.status_code != 200:
         logger.warning(f"Login failed for user: {payload.username}")
         log_login(correlation_id, payload.username, success=False, client_ip=client_ip)
+
+        # Per-IP brute-force recording. If this failure newly blocks the IP,
+        # return 429 instead of 401 so the client knows to back off.
+        ip_status = record_ip_failure(client_ip)
+        if ip_status.just_blocked and is_brute_force_active():
+            log_security_event(
+                correlation_id, "brute_force_suspected",
+                f"System-wide brute-force threshold reached ({ip_status.failure_count} from this IP)",
+                severity="error",
+                extra={"client_ip": client_ip, "failure_count": ip_status.failure_count},
+            )
+        if ip_status.is_blocked:
+            log_security_event(
+                correlation_id, "ip_login_blocked",
+                f"IP {client_ip} newly blocked after failed login",
+                severity="warning",
+                extra={"client_ip": client_ip, "blocked_until": ip_status.blocked_until.isoformat() if ip_status.blocked_until else None},
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts from this network. Try again later.",
+            )
+
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     # Extract tokens from Keycloak's response
@@ -125,8 +174,48 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
         is_active = emp.is_active if emp else True
 
     # Enforce single session per user
-    session_id = await create_session(user_data, tokens.get("refresh_token"), is_active=is_active, realm=payload.realm)
+    # Compute device fingerprint, compare to last seen, log+email on change
+    new_fingerprint = compute_fingerprint(request)
+    previous_fingerprint = await get_previous_fingerprint_for_sub(user_data.get("sub"))
+    if new_fingerprint and previous_fingerprint and new_fingerprint != previous_fingerprint:
+        log_security_event(
+            correlation_id,
+            "new_device_login",
+            f"New device login detected for {email or user_data.get('sub')}",
+            severity="warning",
+            extra={
+                "username": email or user_data.get("sub") or "-",
+                "action": "new_device_login",
+                "email": email,
+                "user_sub": user_data.get("sub"),
+                "client_ip": client_ip,
+                "country": get_country(request),
+            },
+        )
+        try:
+            email_service.send_new_device_login_email(
+                to=email,
+                ip=client_ip,
+                country=get_country(request) or "",
+                user_agent=request.headers.get("user-agent", ""),
+                login_time=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send new-device-login email to {email}: {e}")
+
+    session_id = await create_session(
+        user_data,
+        tokens.get("refresh_token"),
+        is_active=is_active,
+        realm=payload.realm,
+        fingerprint=new_fingerprint,
+        login_ip=client_ip,
+    )
     await enforce_session_limit(user_data.get("sub"), max_sessions=1)
+
+    # Successful login: clear this IP's failure record so legit users aren't
+    # penalized for past typos or attacks from a shared NAT.
+    clear_ip(client_ip)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
 
@@ -206,7 +295,15 @@ async def refresh_session_endpoint(
     # Create new session with new refresh token, delete old session
     # Preserve last_activity_at so the idle clock survives the rotation.
     old_last_activity = await get_session_last_activity(old_session_id)
-    new_session_id = await create_session(user_data, new_tokens.get("refresh_token"), is_active=session_data.get("is_active", True), last_activity_at=old_last_activity, realm=session_data.get("realm"))
+    old_login_ip = await get_session_login_ip(old_session_id)
+    new_session_id = await create_session(
+        user_data,
+        new_tokens.get("refresh_token"),
+        is_active=session_data.get("is_active", True),
+        last_activity_at=old_last_activity,
+        realm=session_data.get("realm"),
+        login_ip=old_login_ip or client_ip,
+    )
     await delete_session(old_session_id)
 
     log_session_refresh(correlation_id, username=user_data.get("username"), success=True, client_ip=client_ip)
@@ -234,7 +331,14 @@ async def activity(request: Request, current_user: dict = Depends(get_current_us
     The client calls this (throttled) on real user activity so an idle
     session is not prematurely expired while the user is on the page but
     making no other API calls. Requires a valid session (401 otherwise).
+
+    Also opportunistically tracks the current request IP on the session
+    so that a mid-session IP change can be detected later (compared
+    against the login IP stored in `session.data.login_ip`).
     """
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        await update_session_login_ip(session_id, _get_client_ip(request))
     return {"ok": True}
 
 
@@ -339,6 +443,23 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
     """
     correlation_id = request.state.correlation_id
     client_ip = _get_client_ip(request)
+
+    # Per-IP brute-force block: short-circuit before any other work.
+    block_status = is_ip_blocked(client_ip)
+    if block_status.is_blocked:
+        log_security_event(
+            correlation_id, "ip_login_blocked",
+            f"Forgot-password blocked for IP {client_ip}",
+            severity="warning",
+            extra={"client_ip": client_ip, "blocked_until": block_status.blocked_until.isoformat() if block_status.blocked_until else None},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests from this network. Try again later.",
+        )
+
+    # Cloudflare Turnstile bot verification (no-op when TURNSTILE_SECRET_KEY is empty)
+    await verify_turnstile(payload.turnstile_token)
 
     try:
         kc_user = await get_keycloak_user_by_email(payload.email, realm=payload.realm)

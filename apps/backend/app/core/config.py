@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # Cookie security settings
     COOKIE_SECURE: bool = False  # Set to True in production (requires HTTPS)
 
+    # Cloudflare Turnstile bot-protection (leave empty to disable)
+    # When TURNSTILE_SECRET_KEY is set, /auth/login and /auth/forgot-password
+    # require a `turnstileToken` field in the request body, which is verified
+    # against Cloudflare's siteverify API. When unset, the endpoints behave
+    # exactly as before (no Turnstile enforcement).
+    TURNSTILE_SECRET_KEY: str = ""
+    # If True, Turnstile is enforced even when the secret key is set. Useful
+    # for staged rollouts (e.g. enable in test, then go live for everyone).
+    TURNSTILE_ENABLED: bool = True
+
     # Database connections
     DATABASE_URL: str = "postgresql://keycloak:keycloak@keycloak-db:5432/keycloak"  # PostgreSQL for Keycloak
 

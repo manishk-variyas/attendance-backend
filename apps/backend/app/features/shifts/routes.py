@@ -1046,8 +1046,12 @@ async def delete_shift(
     if not deleted:
         raise HTTPException(status_code=404, detail="Shift not found.")
 
+    # Capture fields BEFORE delete (the ORM object expires after delete)
+    reason_text = (reason or "").strip()
+
     audit_logger.info(
-        f"Shift deleted for {shift.user_email} ({shift.date} to {shift.end_date or shift.date}) by {current_user.get('username')}",
+        f"Shift deleted for {shift.user_email} ({shift.date} to {shift.end_date or shift.date}) by {current_user.get('username')}"
+        + (f" — reason: {reason_text}" if reason_text else ""),
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -1059,7 +1063,7 @@ async def delete_shift(
                 "deleted_user": shift.user_email,
                 "deleted_date": shift.date.isoformat(),
                 "deleted_end_date": shift.end_date.isoformat() if shift.end_date else None,
-                "reason": reason or "",
+                "reason": reason_text,
             },
         },
     )

@@ -31,6 +31,8 @@ services:
       - infra-network
     volumes:
       - backend_logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
 
 # Reference the shared network from main docker-compose.yml
 networks:

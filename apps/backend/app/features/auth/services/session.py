@@ -32,7 +32,16 @@ def generate_session_id() -> str:
     return secrets.token_urlsafe(32)
 
 
-async def create_session(user_data: dict, keycloak_refresh_token: str = None, expires_hours: int = None, is_active: bool = True, last_activity_at: datetime = None, realm: str | None = None) -> str:
+async def create_session(
+    user_data: dict,
+    keycloak_refresh_token: str = None,
+    expires_hours: int = None,
+    is_active: bool = True,
+    last_activity_at: datetime = None,
+    realm: str | None = None,
+    fingerprint: str | None = None,
+    login_ip: str | None = None,
+) -> str:
     session_id = generate_session_id()
     expire_hours = expires_hours or settings.SESSION_EXPIRE_HOURS
 
@@ -46,6 +55,11 @@ async def create_session(user_data: dict, keycloak_refresh_token: str = None, ex
     }
     if keycloak_refresh_token:
         session_data["kc_refresh_token"] = keycloak_refresh_token
+    if login_ip:
+        session_data["login_ip"] = login_ip
+        session_data["login_at"] = datetime.now(timezone.utc).isoformat()
+    if fingerprint:
+        session_data["fingerprint"] = fingerprint
 
     now = datetime.now(timezone.utc)
     db = _db()
@@ -131,6 +145,30 @@ async def get_session_email(session_id: str) -> Optional[str]:
         db.close()
 
 
+async def get_previous_fingerprint_for_sub(user_sub: str) -> Optional[str]:
+    """Return the fingerprint stored in the most-recent active session for this user.
+
+    Used to detect "new device" logins: compare the current request's
+    fingerprint to the last one. If the new request has a fingerprint and
+    it differs from the previous, log a security event + email the user.
+    """
+    if not user_sub:
+        return None
+    db = _db()
+    try:
+        s = (
+            db.query(Session)
+            .filter(Session.user_sub == user_sub, Session.is_active == True)
+            .order_by(Session.created_at.desc())
+            .first()
+        )
+        if not s or not isinstance(s.data, dict):
+            return None
+        return s.data.get("fingerprint")
+    finally:
+        db.close()
+
+
 async def get_session_last_activity(session_id: str) -> Optional[datetime]:
     db = _db()
     try:
@@ -138,6 +176,50 @@ async def get_session_last_activity(session_id: str) -> Optional[datetime]:
         if not s:
             return None
         return s.last_activity_at
+    finally:
+        db.close()
+
+
+async def get_session_login_ip(session_id: str) -> Optional[str]:
+    """Return the IP that was used at login for this session, if recorded.
+
+    Returns None if the session is missing, the field isn't set, or the data
+    blob isn't a dict.
+    """
+    if not session_id:
+        return None
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s or not isinstance(s.data, dict):
+            return None
+        return s.data.get("login_ip")
+    finally:
+        db.close()
+
+
+async def update_session_login_ip(session_id: str, new_ip: str) -> bool:
+    """Update the stored login_ip on a session. Used by /auth/activity or any
+    other endpoint that wants to track the current request IP. Returns True on
+    a successful update, False if the session is missing or the IP is empty.
+    """
+    if not session_id or not new_ip:
+        return False
+    db = _db()
+    try:
+        s = db.query(Session).filter(Session.id == session_id).first()
+        if not s or not isinstance(s.data, dict):
+            return False
+        # Don't change anything if the IP is the same (avoid noise in audit)
+        if s.data.get("login_ip") == new_ip:
+            return True
+        data = dict(s.data)
+        data["login_ip"] = new_ip
+        data["login_at"] = datetime.now(timezone.utc).isoformat()
+        s.data = data
+        s.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return True
     finally:
         db.close()
 

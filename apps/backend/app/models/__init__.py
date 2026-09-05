@@ -12,6 +12,8 @@ from app.models.shift_attendance import ShiftAttendance
 from app.models.session import Session
 from app.models.password_reset import PasswordResetToken
 from app.models.delete_verification import DeleteVerificationToken
+from app.models.login_attempt import LoginAttempt
+from app.models.notification import Notification
 
 __all__ = [
     "Base",
@@ -26,4 +28,6 @@ __all__ = [
     "ShiftAttendance",
     "PasswordResetToken",
     "DeleteVerificationToken",
+    "LoginAttempt",
+    "Notification",
 ]

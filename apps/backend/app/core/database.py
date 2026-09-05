@@ -72,6 +72,9 @@ def _run_migrations():
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='checkout_reminder_grace_hours') THEN
                     ALTER TABLE system_settings ADD COLUMN checkout_reminder_grace_hours INTEGER DEFAULT 2;
                 END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='checkin_reminder_delay_minutes') THEN
+                    ALTER TABLE system_settings ADD COLUMN checkin_reminder_delay_minutes INTEGER DEFAULT 30;
+                END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='auto_checkout_enabled') THEN
                     ALTER TABLE system_settings ADD COLUMN auto_checkout_enabled BOOLEAN DEFAULT TRUE;
                 END IF;
@@ -225,6 +228,46 @@ def _run_migrations():
             CREATE INDEX IF NOT EXISTS idx_wfh_requests_status ON wfh_requests(status);
             CREATE INDEX IF NOT EXISTS idx_wfh_requests_start_date ON wfh_requests(start_date);
         """))
+        conn.commit()
+
+        # login_attempts table for per-IP brute-force protection
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                identifier VARCHAR(255) NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                first_failure_at TIMESTAMPTZ,
+                blocked_until TIMESTAMPTZ,
+                last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CONSTRAINT chk_login_attempts_kind CHECK (kind IN ('ip', 'email'))
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_login_attempts_identifier_kind ON login_attempts(identifier, kind)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_login_attempts_kind_blocked ON login_attempts(kind, blocked_until)"))
+        conn.commit()
+
+        # Notifications table for in-app user notifications (replaces old schema)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id         UUID NOT NULL REFERENCES employee_master(id) ON DELETE CASCADE,
+                category        VARCHAR(32) NOT NULL,
+                title           VARCHAR(255) NOT NULL,
+                message         TEXT NOT NULL,
+                priority        VARCHAR(16) NOT NULL DEFAULT 'normal',
+                actor_id        UUID REFERENCES employee_master(id) ON DELETE SET NULL,
+                actor_name      VARCHAR(255),
+                link            VARCHAR(512),
+                extra           JSONB NOT NULL DEFAULT '{}'::jsonb,
+                read_at         TIMESTAMPTZ,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications (user_id, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications (user_id, created_at DESC) WHERE read_at IS NULL"))
         conn.commit()
 
 

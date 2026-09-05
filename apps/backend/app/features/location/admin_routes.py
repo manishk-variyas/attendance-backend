@@ -44,6 +44,7 @@ def _to_response(loc: OfficeLocation) -> dict:
 
 @router.post("", response_model=OfficeLocationResponse, status_code=status.HTTP_201_CREATED)
 async def create_office_location(
+    request: Request,
     payload: OfficeLocationCreate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -71,6 +72,23 @@ async def create_office_location(
     )
     db.execute(text("UPDATE office_locations SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) WHERE id = :id"), {"id": str(loc.id)})
     db.commit()
+
+    audit_logger.info(
+        f"Office location created: {payload.name} by {current_user.get('email')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "create_location",
+                "username": current_user.get("email"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "location_id": str(loc.id),
+                "location_name": payload.name,
+                "category": payload.category,
+                "city": payload.city,
+            },
+        },
+    )
     return _to_response(loc)
 
 
@@ -170,6 +188,7 @@ async def get_office_location(
 
 @router.put("/{location_id}", response_model=OfficeLocationResponse)
 async def update_office_location(
+    request: Request,
     location_id: str,
     payload: OfficeLocationUpdate,
     db: Session = Depends(get_db),
@@ -213,11 +232,27 @@ async def update_office_location(
         """), {"id": location_id})
         db.commit()
 
+    audit_logger.info(
+        f"Office location updated: {existing.name} by {current_user.get('email')} — changed: {', '.join(update_data.keys())}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "update_location",
+                "username": current_user.get("email"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "location_id": location_id,
+                "location_name": existing.name,
+                "changed_fields": ", ".join(update_data.keys()),
+            },
+        },
+    )
     return _to_response(loc)
 
 
 @router.delete("/{location_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_office_location(
+    request: Request,
     location_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -227,6 +262,7 @@ async def delete_office_location(
     loc = svc.fetch_one(OfficeLocation, id=location_id)
     if not loc:
         raise HTTPException(status_code=404, detail="Office location not found")
+    loc_name = loc.name
 
     child = db.query(OfficeLocation).filter(OfficeLocation.parent_location_id == location_id).first()
     if child:
@@ -249,3 +285,19 @@ async def delete_office_location(
     deleted = svc.delete(OfficeLocation, location_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Office location not found")
+
+    audit_logger.info(
+        f"Office location deleted: {loc_name} by {current_user.get('email')}",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "delete_location",
+                "username": current_user.get("email"),
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "location_id": location_id,
+                "location_name": loc_name,
+            },
+        },
+    )
+    return None

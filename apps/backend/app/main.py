@@ -186,3 +186,6 @@ app.include_router(audit_router, prefix="/api", tags=["admin-audit"])
 from app.features.admin.sessions_routes import router as admin_sessions_router
 app.include_router(admin_sessions_router, prefix="/api", tags=["admin-sessions"])
 
+from app.features.notifications.routes import router as notifications_router
+app.include_router(notifications_router, prefix="/api", tags=["notifications"])
+

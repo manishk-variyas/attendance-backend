@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import List, Optional
 
 from app.core.config import settings
+from app.utils.audit import audit_email
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,22 @@ class EmailService:
         self.from_addr = settings.SMTP_FROM or settings.SMTP_USER
         self.enabled = settings.SMTP_ENABLED
 
-    def send(self, to: List[str], subject: str, body_html: str) -> bool:
+    def send(
+        self,
+        to: List[str],
+        subject: str,
+        body_html: str,
+        template: Optional[str] = None,
+        correlation_id: str = "-",
+    ) -> bool:
         if not self.enabled:
             logger.debug(f"Email not sent (disabled): {subject}")
+            audit_email(correlation_id, template or "notification", to, subject, success=False, error="smtp_disabled")
             return False
 
         if not self.user or not self.password:
             logger.warning(f"SMTP not configured, skipping email: {subject}")
+            audit_email(correlation_id, template or "notification", to, subject, success=False, error="smtp_not_configured")
             return False
 
         try:
@@ -44,79 +54,100 @@ class EmailService:
                 server.send_message(msg)
 
             logger.info(f"Email sent: {subject} → {to}")
+            audit_email(correlation_id, template or "notification", to, subject, success=True)
             return True
         except Exception as e:
             logger.error(f"Failed to send email '{subject}': {e}")
+            audit_email(correlation_id, template or "notification", to, subject, success=False, error=str(e)[:200])
             return False
 
-    def send_wfh_requested(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
+    def send_wfh_requested(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"WFH Request — {applicant_name} ({start} → {end})"
         body = _template("wfh_requested", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="wfh_requested", correlation_id=correlation_id)
 
-    def send_wfh_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
+    def send_wfh_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"WFH Approved — {start} → {end}"
         body = _template("wfh_approved", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="wfh_approved", correlation_id=correlation_id)
 
-    def send_wfh_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
+    def send_wfh_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"WFH Rejected — {start} → {end}"
         body = _template("wfh_rejected", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="wfh_rejected", correlation_id=correlation_id)
 
-    def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
+    def send_leave_applied(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"Leave Applied — {applicant_name} ({start} → {end})"
         body = _template("leave_applied", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="leave_applied", correlation_id=correlation_id)
 
-    def send_leave_applied_confirmation(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "") -> bool:
+    def send_leave_applied_confirmation(self, to: str, applicant_name: str, start: str, end: str, reason: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"Leave Submitted — {start} → {end}"
         body = _template("leave_applied_confirmation", applicant_name=applicant_name, start=start, end=end, reason=reason, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="leave_applied_confirmation", correlation_id=correlation_id)
 
-    def send_leave_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
+    def send_leave_approved(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"Leave Approved — {applicant_name} ({start} → {end})"
         body = _template("leave_approved", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="leave_approved", correlation_id=correlation_id)
 
-    def send_leave_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "") -> bool:
+    def send_leave_rejected(self, to: str, applicant_name: str, start: str, end: str, resuming: str = "", correlation_id: str = "-") -> bool:
         subject = f"Leave Rejected — {applicant_name} ({start} → {end})"
         body = _template("leave_rejected", applicant_name=applicant_name, start=start, end=end, resuming=resuming)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="leave_rejected", correlation_id=correlation_id)
 
-    def send_cancel_requested(self, to: str, applicant_name: str, start: str, end: str, remark: str) -> bool:
+    def send_cancel_requested(self, to: str, applicant_name: str, start: str, end: str, remark: str, correlation_id: str = "-") -> bool:
         subject = f"Leave Cancellation Requested — {applicant_name} ({start} → {end})"
         body = _template("cancel_requested", applicant_name=applicant_name, start=start, end=end, remark=remark)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="cancel_requested", correlation_id=correlation_id)
 
-    def send_cancel_approved(self, to: str, applicant_name: str, start: str, end: str) -> bool:
+    def send_cancel_approved(self, to: str, applicant_name: str, start: str, end: str, correlation_id: str = "-") -> bool:
         subject = f"Leave Cancellation Approved — {applicant_name} ({start} → {end})"
         body = _template("cancel_approved", applicant_name=applicant_name, start=start, end=end)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="cancel_approved", correlation_id=correlation_id)
 
-    def send_cancel_rejected(self, to: str, applicant_name: str, start: str, end: str, remark: str) -> bool:
+    def send_cancel_rejected(self, to: str, applicant_name: str, start: str, end: str, remark: str, correlation_id: str = "-") -> bool:
         subject = f"Leave Cancellation Rejected — {applicant_name} ({start} → {end})"
         body = _template("cancel_rejected", applicant_name=applicant_name, start=start, end=end, remark=remark)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="cancel_rejected", correlation_id=correlation_id)
 
-    def send_missed_checkin_reminder(self, to: str, employee_name: str, shift_date: str, shift_start_time: str) -> bool:
+    def send_missed_checkin_reminder(self, to: str, employee_name: str, shift_date: str, shift_start_time: str, correlation_id: str = "-") -> bool:
         subject = f"Reminder: Missed Check-In for Today's Shift ({shift_date})"
         body = _template("missed_checkin_reminder", employee_name=employee_name, shift_date=shift_date, shift_start_time=shift_start_time)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="missed_checkin_reminder", correlation_id=correlation_id)
 
-    def send_onboarding_welcome(self, to: str, employee_name: str, designation: str, employee_id: str, email: str, joining_date: str, reports_to_name: str, company_name: str, portal_url: str = "https://attendance.variyaslabs.com/") -> bool:
+    def send_onboarding_welcome(self, to: str, employee_name: str, designation: str, employee_id: str, email: str, joining_date: str, reports_to_name: str, company_name: str, portal_url: str = "https://attendance.variyaslabs.com/", correlation_id: str = "-") -> bool:
         subject = f"Welcome to {company_name} — Your Account is Ready, {employee_name.split()[0]}!"
         body = _template("onboarding_welcome", employee_name=employee_name, designation=designation, employee_id=employee_id, email=email, joining_date=joining_date, reports_to_name=reports_to_name, company_name=company_name, portal_url=portal_url)
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template="onboarding_welcome", correlation_id=correlation_id)
 
-    def send_delete_verification(self, to: str, otp: str, count: int, expires_minutes: int = 10, resource_type: str = "employee") -> bool:
+    def send_delete_verification(self, to: str, otp: str, count: int, expires_minutes: int = 10, resource_type: str = "employee", correlation_id: str = "-") -> bool:
         resource_type = (resource_type or "employee").lower()
         subject = f"{resource_type.capitalize()} Deletion Verification Code — {otp}"
         if resource_type == "project":
             body = _template("delete_verification_project", otp=otp, count=str(count), expires_minutes=str(expires_minutes))
         else:
             body = _template("delete_verification", otp=otp, count=str(count), expires_minutes=str(expires_minutes))
-        return self.send([to], subject, body)
+        return self.send([to], subject, body, template=f"delete_verification_{resource_type}", correlation_id=correlation_id)
+
+    def send_new_device_login_email(
+        self,
+        to: str,
+        ip: str,
+        country: str,
+        user_agent: str,
+        login_time: str,
+        correlation_id: str = "-",
+    ) -> bool:
+        subject = "New login to your Attendance account"
+        body = _template(
+            "new_device_login",
+            ip=ip or "unknown",
+            country=country or "unknown",
+            user_agent=user_agent or "unknown",
+            login_time=login_time or "unknown",
+        )
+        return self.send([to], subject, body, template="new_device_login", correlation_id=correlation_id)
 
 
 _EMAIL_TEMPLATES = {
@@ -275,6 +306,18 @@ _EMAIL_TEMPLATES = {
         <p style="text-align:center;margin:24px 0"><span style="font-size:18px;font-weight:700;letter-spacing:8px;background:#f4f5f7;padding:16px 24px;border-radius:8px">{otp}</span></p>
         <p style="text-align:center;color:#6b778c;font-size:13px">This code expires in <strong>{expires_minutes} minutes</strong>. Do not share it.</p>
         <p style="color:#bf2600;font-size:13px"><strong>Warning:</strong> This will permanently delete the selected project(s) and all associated issues, memberships, and data. This action cannot be undone.</p>
+    """,
+    "new_device_login": """
+        <div class="badge badge-warning">New device login</div>
+        <p>Hello,</p>
+        <p>We noticed a login to your Attendance account from a device we haven't seen before. If this was you, no action is needed. If you don't recognize this activity, please change your password immediately.</p>
+        <table class="details">
+            <tr><td>Login time (UTC)</td><td>{login_time}</td></tr>
+            <tr><td>IP address</td><td>{ip}</td></tr>
+            <tr><td>Country</td><td>{country}</td></tr>
+            <tr><td>User agent</td><td>{user_agent}</td></tr>
+        </table>
+        <p>If this wasn't you, sign in and change your password, then contact your admin.</p>
     """,
 }
 

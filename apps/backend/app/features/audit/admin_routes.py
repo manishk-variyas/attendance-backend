@@ -27,6 +27,29 @@ STREAM_TIMEOUT = 900
 
 DEFAULT_LOG_TZ = "Asia/Kolkata"
 
+ENTRIES_CACHE_TTL_SECONDS = 10
+_entries_cache: dict = {"data": None, "expires_at": 0.0}
+
+
+def _get_cached_entries(force: bool = False) -> list:
+    """Return parsed audit log entries, caching the result for a short TTL.
+
+    Audit logs are append-only, so a short-lived cache is safe: new entries
+    become visible within `ENTRIES_CACHE_TTL_SECONDS` (10s) or on the next
+    force-refresh / TTL expiry.
+    """
+    now = time.monotonic()
+    if not force and _entries_cache["data"] is not None and now < _entries_cache["expires_at"]:
+        return _entries_cache["data"]
+    entries = []
+    for line in _iter_log_lines():
+        entry = _parse_log_line(line)
+        if entry:
+            entries.append(entry)
+    _entries_cache["data"] = entries
+    _entries_cache["expires_at"] = now + ENTRIES_CACHE_TTL_SECONDS
+    return entries
+
 
 def _parse_datetime(value: str, tz: ZoneInfo) -> datetime:
     """Parse an ISO datetime to a timezone-aware UTC datetime.
@@ -84,7 +107,7 @@ def _iter_log_lines():
 
 
 @router.get("")
-@limiter.limit("5/minute")
+@limiter.limit("30/minute")
 async def get_audit_logs(
     request: Request,
     current_user: dict = Depends(get_current_user),
@@ -123,10 +146,7 @@ async def get_audit_logs(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid 'until' format. Use ISO datetime, e.g. 2026-08-24T19:00:00")
 
-    for line in _iter_log_lines():
-        entry = _parse_log_line(line)
-        if not entry:
-            continue
+    for entry in _get_cached_entries():
         metadata = entry.get("metadata") or {}
         if metadata.get("action") == "backchannel_logout":
             continue

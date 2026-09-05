@@ -30,6 +30,7 @@ scripts/*.py
 !scripts/auto_close_attendance.py
 !scripts/attendance_sweeper.py
 !scripts/bootstrap_admin_employee.py
+!scripts/checkin_reminder_cron.py
 
 # Env files
 .env

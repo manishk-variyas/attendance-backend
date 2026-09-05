@@ -319,11 +319,35 @@ def check_in(
         db.commit()
 
     logger.info(f"Check-in: {keycloak_user_id} on {target_date}")
+    check_in_time_str = attendance.check_in_time.strftime("%H:%M:%S") if attendance.check_in_time else (now.strftime("%H:%M:%S") if now else "-")
+    lat_str = f"{payload.latitude:.4f}" if payload.latitude is not None else "-"
+    lng_str = f"{payload.longitude:.4f}" if payload.longitude is not None else "-"
+    audit_logger.info(
+        f"Check-in: {current_user.get('email') or keycloak_user_id} on {target_date} at {check_in_time_str} (lat={lat_str}, lng={lng_str})",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "attendance_checkin",
+                "username": current_user.get("email") or keycloak_user_id,
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "attendance_id": str(attendance.id),
+                "attendance_date": target_date.isoformat(),
+                "check_in_time": now.isoformat(),
+                "work_location_status": attendance.work_location_status,
+                "location_id": str(attendance.location_id) if attendance.location_id else None,
+                "latitude": float(payload.latitude) if payload.latitude is not None else None,
+                "longitude": float(payload.longitude) if payload.longitude is not None else None,
+                "is_late": attendance.is_late,
+            },
+        },
+    )
     return _to_response(db, attendance)
 
 
 @router.post("/check-out", response_model=AttendanceResponse)
 def check_out(
+    request: Request,
     payload: CheckOutRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -432,6 +456,27 @@ def check_out(
     _credit_comp_off_if_holiday(db, attendance)
 
     logger.info(f"Check-out: {keycloak_user_id} on {today}")
+    ci_str = attendance.check_in_time.strftime("%H:%M:%S") if attendance.check_in_time else "-"
+    co_str = attendance.check_out_time.strftime("%H:%M:%S") if attendance.check_out_time else "-"
+    hours_str = f"{attendance.total_hours:.2f}" if attendance.total_hours is not None else "-"
+    audit_logger.info(
+        f"Check-out: {current_user.get('email') or keycloak_user_id} on {today} (in {ci_str} → out {co_str}, total {hours_str}h)",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "attendance_checkout",
+                "username": current_user.get("email") or keycloak_user_id,
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "attendance_id": str(attendance.id),
+                "attendance_date": today.isoformat(),
+                "check_in_time": attendance.check_in_time.isoformat() if attendance.check_in_time else None,
+                "check_out_time": attendance.check_out_time.isoformat() if attendance.check_out_time else None,
+                "work_location_status": attendance.work_location_status,
+                "total_hours": float(attendance.total_hours) if attendance.total_hours else None,
+            },
+        },
+    )
     return _to_response(db, attendance)
 
 
@@ -708,30 +753,36 @@ def get_today_attendance(
                     s = "shift_ended"
                 return _build_status_response(db, shift_att, today, s)
 
-        # Check for missed check-in email reminder (30 minutes after shift start)
-        if not shift_att and not on_leave_today and not getattr(shift, "checkin_reminder_sent", False):
-            if now > start_dt + timedelta(minutes=30):
-                user_email = current_user.get("email")
-                if not user_email:
-                    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
-                    if emp:
-                        user_email = emp.user_email
-                if user_email:
-                    emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
-                    emp_name = f"{emp.first_name} {emp.last_name}".strip() if (emp and emp.first_name) else current_user.get("preferred_username", user_email)
-                    start_str = sd.start_time.strftime("%H:%M") if (sd and sd.start_time) else "Scheduled Time"
-                    try:
-                        email_service.send_missed_checkin_reminder(
-                            to=user_email,
-                            employee_name=emp_name,
-                            shift_date=shift.date.isoformat(),
-                            shift_start_time=start_str,
-                        )
-                        shift.checkin_reminder_sent = True
-                        db.commit()
-                        logger.info(f"Sent missed check-in email reminder to {user_email} for shift {shift.date}")
-                    except Exception as e:
-                        logger.error(f"Failed to send missed check-in email reminder: {e}")
+        # OLD OPPORTUNISTIC CHECK-IN REMINDER (commented out — replaced by scripts/checkin_reminder_cron.py)
+        # The cron script now owns missed check-in reminders and runs every 15 min regardless of
+        # whether the user opens the app. The dedup flag (shift.checkin_reminder_sent) makes this safe to keep
+        # commented out — the cron is the source of truth. To re-enable this fast-path, uncomment below.
+        #
+        # if not shift_att and not on_leave_today and not getattr(shift, "checkin_reminder_sent", False):
+        #     company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        #     checkin_delay = company.checkin_reminder_delay_minutes if company and company.checkin_reminder_delay_minutes else 30
+        #     if now > start_dt + timedelta(minutes=checkin_delay):
+        #         user_email = current_user.get("email")
+        #         if not user_email:
+        #             emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
+        #             if emp:
+        #                 user_email = emp.user_email
+        #         if user_email:
+        #             emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
+        #             emp_name = f"{emp.first_name} {emp.last_name}".strip() if (emp and emp.first_name) else current_user.get("preferred_username", user_email)
+        #             start_str = sd.start_time.strftime("%H:%M") if (sd and sd.start_time) else "Scheduled Time"
+        #             try:
+        #                 email_service.send_missed_checkin_reminder(
+        #                     to=user_email,
+        #                     employee_name=emp_name,
+        #                     shift_date=shift.date.isoformat(),
+        #                     shift_start_time=start_str,
+        #                 )
+        #                 shift.checkin_reminder_sent = True
+        #                 db.commit()
+        #                 logger.info(f"Sent missed check-in email reminder to {user_email} for shift {shift.date}")
+        #             except Exception as e:
+        #                 logger.error(f"Failed to send missed check-in email reminder: {e}")
 
         if on_leave_today or shift.work_location_status == "LEAVE":
             return _no_attendance_response("on_leave", shift, sd, tz, today)
@@ -882,6 +933,7 @@ def _shift_attendance_to_dict(p: ShiftAttendance) -> dict:
 
 @router.post("/shifts/check-in", status_code=status.HTTP_201_CREATED)
 async def shift_check_in(
+    request: Request,
     payload: ShiftCheckInRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -895,11 +947,31 @@ async def shift_check_in(
         payload.longitude,
         payload.clientTimestamp,
     )
+    audit_logger.info(
+        f"Shift check-in: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} at {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} (lat={float(punch.check_in_lat):.4f if punch.check_in_lat is not None else '-'}, lng={float(punch.check_in_lng):.4f if punch.check_in_lng is not None else '-'})",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "shift_checkin",
+                "username": current_user.get("email") or current_user["sub"],
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "shift_id": payload.shiftId,
+                "shift_attendance_id": str(punch.id),
+                "check_in_time": punch.check_in_time.isoformat() if punch.check_in_time else None,
+                "latitude": float(punch.check_in_lat) if punch.check_in_lat is not None else None,
+                "longitude": float(punch.check_in_lng) if punch.check_in_lng is not None else None,
+                "work_location_status": punch.work_location_status,
+                "is_late": punch.is_late,
+            },
+        },
+    )
     return _shift_attendance_to_dict(punch)
 
 
 @router.post("/shifts/check-out")
 async def shift_check_out(
+    request: Request,
     payload: ShiftCheckOutRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -913,6 +985,24 @@ async def shift_check_out(
         payload.longitude,
         payload.clientTimestamp,
         payload.remarks,
+    )
+    audit_logger.info(
+        f"Shift check-out: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} (in {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} → out {punch.check_out_time.strftime('%H:%M:%S') if punch.check_out_time else '-'}, total {float(punch.total_hours):.2f if punch.total_hours is not None else '-'}h, lat={float(punch.check_out_lat):.4f if punch.check_out_lat is not None else '-'}, lng={float(punch.check_out_lng):.4f if punch.check_out_lng is not None else '-'})",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "shift_checkout",
+                "username": current_user.get("email") or current_user["sub"],
+                "status": "success",
+                "client_ip": _get_client_ip(request),
+                "shift_id": payload.shiftId,
+                "shift_attendance_id": str(punch.id),
+                "check_in_time": punch.check_in_time.isoformat() if punch.check_in_time else None,
+                "check_out_time": punch.check_out_time.isoformat() if punch.check_out_time else None,
+                "work_location_status": punch.work_location_status,
+                "total_hours": float(punch.total_hours) if punch.total_hours else None,
+            },
+        },
     )
     return _shift_attendance_to_dict(punch)
 

@@ -20,7 +20,7 @@ class SystemSettingService(BaseService[SystemSetting]):
                default_shift_start_time: str = None, default_shift_end_time: str = None,
                default_timezone: str = None, grace_minutes: int = None,
                 checkout_reminder_grace_hours: int = None, auto_checkout_enabled: bool = None,
-                auto_checkout_cutoff_time: str = None,
+                auto_checkout_cutoff_time: str = None, checkin_reminder_delay_minutes: int = None,
                 incorporation_date: str = None, trademark: str = None,
                 website_url: str = None, background_overlay_color: str = None) -> SystemSetting:
         existing = self.fetch()
@@ -50,6 +50,8 @@ class SystemSettingService(BaseService[SystemSetting]):
             data["grace_minutes"] = grace_minutes
         if checkout_reminder_grace_hours is not None:
             data["checkout_reminder_grace_hours"] = checkout_reminder_grace_hours
+        if checkin_reminder_delay_minutes is not None:
+            data["checkin_reminder_delay_minutes"] = checkin_reminder_delay_minutes
         if auto_checkout_enabled is not None:
             data["auto_checkout_enabled"] = auto_checkout_enabled
         if auto_checkout_cutoff_time is not None:

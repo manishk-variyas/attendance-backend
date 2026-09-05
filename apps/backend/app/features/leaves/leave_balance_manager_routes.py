@@ -1,12 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
 from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_admin_or_pm
 from app.features.leaves.schemas.leaves import EmployeeLeaveBalanceBulkCreate
 from app.features.leaves.services.leave_service import LeaveBusinessService
 from app.features.leaves.dependencies import get_leave_business_service
 from app.middleware.logging import _get_client_ip
+from app.models.employee_master import EmployeeMaster
 from app.utils.audit import audit_logger
 
 router = APIRouter(prefix="/admin/leave-balance-manager", tags=["admin-leave-balance-manager"])
@@ -58,17 +61,28 @@ async def save_leave_balance_bulk(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin_or_pm),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+    db: Session = Depends(get_db),
 ):
     result = await leave_service.save_leave_balance_bulk(payload, current_user)
+
+    target_email = "-"
+    target_name = "-"
+    emp = db.query(EmployeeMaster).filter(EmployeeMaster.id == payload.id).first()
+    if emp:
+        target_email = emp.user_email or "-"
+        target_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
+
     audit_logger.info(
-        f"Leave balance saved for employee {payload.id} FY {payload.fiscal_year} by {current_user.get('username')}",
+        f"Leave balance saved for {target_name} ({target_email}) FY {payload.fiscal_year} by {current_user.get('email') or current_user.get('username')}",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
                 "action": "leave_balance_save",
-                "username": current_user.get("username"),
+                "username": current_user.get("email") or current_user.get("username"),
                 "status": "success",
                 "employee_id": payload.id,
+                "employee_email": target_email,
+                "employee_name": target_name,
                 "fiscal_year": payload.fiscal_year,
                 "client_ip": _get_client_ip(request),
             },

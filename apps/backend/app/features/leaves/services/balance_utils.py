@@ -183,3 +183,40 @@ def credit_comp_off(db, user_id: str, on_date: date) -> None:
             month=month,
             accrued=1.0,
         ))
+
+
+def reverse_comp_off(db, user_id: str, on_date: date) -> bool:
+    """Reverse a previously credited comp-off for working on a holiday.
+
+    Decrements the monthly accrued balance by 1. If the balance would go
+    negative, the reversal is still applied (logged as a warning by the caller)
+    and the function returns True. Returns False if the leave type / balance
+    cannot be found.
+
+    NOTE: this does NOT touch the attendance record (which is typically being
+    deleted in the same transaction). The caller is responsible for the
+    attendance delete + audit log.
+    """
+    lt = db.execute(
+        select(LeaveTypeConfig).where(LeaveTypeConfig.code == "CO")
+    ).scalars().first()
+    if not lt:
+        return False
+
+    fiscal_year = fiscal_year_for(on_date)
+    monthly = db.execute(
+        select(EmployeeLeaveBalanceMonthly)
+        .join(EmployeeLeaveBalance, EmployeeLeaveBalance.id == EmployeeLeaveBalanceMonthly.leave_balance_id)
+        .where(
+            EmployeeLeaveBalance.keycloak_user_id == user_id,
+            EmployeeLeaveBalance.leave_type_id == lt.id,
+            EmployeeLeaveBalance.fiscal_year == fiscal_year,
+            EmployeeLeaveBalanceMonthly.month == fiscal_month_for(on_date),
+        )
+    ).scalars().first()
+
+    if not monthly:
+        return False
+
+    monthly.accrued = max(0.0, (monthly.accrued or 0) - 1)
+    return True

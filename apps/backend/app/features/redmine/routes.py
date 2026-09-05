@@ -1,12 +1,13 @@
 import json
 import os
 import logging
+import uuid
 import hashlib
 import httpx
 import secrets
 import openpyxl
 from io import BytesIO
-from fastapi import APIRouter, HTTPException, Depends, status, Query, UploadFile, File, Form, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends, status, Query, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError as PydanticValidationError
 from typing import List, Optional
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.core.database import get_db
 from app.features.shifts.service import shift_service
+from app.features.notifications.service import schedule_notification
 from app.models.employee_master import EmployeeMaster
 from app.models.delete_verification import DeleteVerificationToken
 from app.services.email_service import email_service
@@ -56,6 +58,35 @@ def _validate_uploaded_file(f: UploadFile):
             status_code=400,
             detail=f"File type '{ext}' is not allowed. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
+
+
+def _resolve_employee_id_from_redmine_user_id(db: Session, redmine_user_id) -> Optional[uuid.UUID]:
+    """Resolve a Redmine internal user id (integer) into our app's
+    employee_master.id (UUID).
+
+    Uses the Redmine mirror table (redmine.users joined to email_addresses)
+    to find the user's default email, then matches that email against
+    employee_master.user_email. Returns None if the Redmine user is not
+    found or has no matching employee_master row.
+
+    IMPORTANT: this is the bridge between the two keyspaces. Do NOT compare
+    redmine_user_id directly to employee_master.id or .keycloak_user_id
+    -- they're different (int vs UUID).
+    """
+    if redmine_user_id is None:
+        return None
+    try:
+        redmine_user = RedmineSQLService(db).get_user_by_id(int(redmine_user_id))
+    except (TypeError, ValueError):
+        return None
+    if not redmine_user or not redmine_user.get("mail"):
+        return None
+    emp = (
+        db.query(EmployeeMaster)
+        .filter(EmployeeMaster.user_email == redmine_user["mail"])
+        .first()
+    )
+    return emp.id if emp else None
 
 
 def _can_manage_members(current_user: dict, db: Session, project_id: int) -> bool:
@@ -1176,12 +1207,27 @@ async def add_project_member(
     if not _can_manage_members(current_user, db, project_id):
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
+    user_row = db.execute(
+        text("SELECT u.firstname, u.lastname, e.address FROM redmine.users u LEFT JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true WHERE u.id = :uid"),
+        {"uid": payload.user_id},
+    ).fetchone()
+    user_name = f"{user_row[0]} {user_row[1]}".strip() if user_row else None
+    user_email = (user_row[2] if user_row and user_row[2] else None)
+    user_label = user_email or user_name or f"#{payload.user_id}"
+
+    project_row = db.execute(
+        text("SELECT name FROM redmine.projects WHERE id = :pid"),
+        {"pid": project_id},
+    ).fetchone()
+    project_name = project_row[0] if project_row else None
+    project_label = project_name or f"#{project_id}"
+
     ok = await redmine_service.add_membership(project_id, payload.user_id, payload.role_ids)
     if not ok:
         raise HTTPException(status_code=409, detail="User is already a member of this project or invalid input.")
 
     audit_logger.info(
-        f"Member added to project {project_id} by {current_user.get('username')}",
+        f"Member {user_label} added to project {project_label} by {current_user.get('username')}",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -1190,7 +1236,10 @@ async def add_project_member(
                 "status": "success",
                 "client_ip": _get_client_ip(request),
                 "project_id": project_id,
+                "project_name": project_name,
                 "user_id": payload.user_id,
+                "user_name": user_name,
+                "user_email": user_email,
             },
         },
     )
@@ -1215,12 +1264,23 @@ async def update_project_member(
     if not member:
         raise HTTPException(status_code=404, detail="Member not found in this project.")
 
+    member_name = member.get("name")
+    member_email = member.get("email")
+    member_label = member_email or member_name or f"#{user_id}"
+
+    project_row = db.execute(
+        text("SELECT name FROM redmine.projects WHERE id = :pid"),
+        {"pid": project_id},
+    ).fetchone()
+    project_name = project_row[0] if project_row else None
+    project_label = project_name or f"#{project_id}"
+
     ok = await redmine_service.update_membership(member["membership_id"], payload.role_ids)
     if not ok:
         raise HTTPException(status_code=400, detail="Failed to update member roles.")
 
     audit_logger.info(
-        f"Member roles updated for user {user_id} in project {project_id} by {current_user.get('username')}",
+        f"Member roles updated for {member_label} in project {project_label} by {current_user.get('username')}",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -1229,7 +1289,10 @@ async def update_project_member(
                 "status": "success",
                 "client_ip": _get_client_ip(request),
                 "project_id": project_id,
+                "project_name": project_name,
                 "user_id": user_id,
+                "user_name": member_name,
+                "user_email": member_email,
             },
         },
     )
@@ -1248,12 +1311,28 @@ async def remove_project_member(
     if not _can_manage_members(current_user, db, project_id):
         raise HTTPException(status_code=403, detail="Admin, PM, or PC access required.")
 
+    sql = RedmineSQLService(db)
+    user_row = db.execute(
+        text("SELECT u.firstname, u.lastname, e.address FROM redmine.users u LEFT JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true WHERE u.id = :uid"),
+        {"uid": user_id},
+    ).fetchone()
+    user_name = f"{user_row[0]} {user_row[1]}".strip() if user_row else None
+    user_email = (user_row[2] if user_row and user_row[2] else None)
+    user_label = user_email or user_name or f"#{user_id}"
+
+    project_row = db.execute(
+        text("SELECT name FROM redmine.projects WHERE id = :pid"),
+        {"pid": project_id},
+    ).fetchone()
+    project_name = project_row[0] if project_row else None
+    project_label = project_name or f"#{project_id}"
+
     removed = await redmine_service.remove_user_from_project(user_id, project_id)
     if not removed:
         raise HTTPException(status_code=404, detail="Member not found in this project.")
 
     audit_logger.info(
-        f"Member {user_id} removed from project {project_id} by {current_user.get('username')}",
+        f"Member {user_label} removed from project {project_label} by {current_user.get('username')}",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -1262,7 +1341,10 @@ async def remove_project_member(
                 "status": "success",
                 "client_ip": _get_client_ip(request),
                 "project_id": project_id,
+                "project_name": project_name,
                 "user_id": user_id,
+                "user_name": user_name,
+                "user_email": user_email,
             },
         },
     )
@@ -1417,6 +1499,7 @@ async def list_categories(
 
 @router.post("/redmine/issues", status_code=201)
 async def create_redmine_issue(
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
     data: str = Form(...),
@@ -1511,6 +1594,57 @@ async def create_redmine_issue(
 
     try:
         issue = await redmine_service.create_issue(issue_attrs, switch_user=user["login"])
+
+        # Background-schedule a notification if the issue is assigned to someone
+        # other than the creator. We resolve the assignee's employee_master row
+        # here (using their email) so the background task only needs to insert.
+        assigned_to_id = issue_attrs.get("assigned_to_id")
+        creator_id = redmine_user_id
+        if assigned_to_id and assigned_to_id != creator_id:
+            try:
+                assignee_emp_id = _resolve_employee_id_from_redmine_user_id(db, assigned_to_id)
+                if assignee_emp_id is not None:
+                    # Resolve the actor (creator) from the session so we can
+                    # populate actor_id. The session's `sub` is the Keycloak
+                    # user id, which is stored on employee_master.keycloak_user_id.
+                    actor_sub = current_user.get("sub")
+                    actor_emp_id = None
+                    if actor_sub:
+                        try:
+                            actor_emp = (
+                                db.query(EmployeeMaster)
+                                .filter(EmployeeMaster.keycloak_user_id == str(actor_sub))
+                                .first()
+                            )
+                            if actor_emp:
+                                actor_emp_id = actor_emp.id
+                        except Exception:
+                            actor_emp_id = None
+                    creator_name = (
+                        (user.get("firstname") or "")
+                        + " "
+                        + (user.get("lastname") or "")
+                    ).strip() or user.get("login") or "Someone"
+                    schedule_notification(
+                        background_tasks,
+                        user_id=assignee_emp_id,
+                        category="ticket_assigned",
+                        title=f"Ticket #{issue['id']} assigned to you",
+                        message=f"{creator_name} assigned a ticket to you: {issue_attrs.get('subject', '')}",
+                        priority="normal",
+                        actor_id=actor_emp_id,
+                        actor_name=creator_name,
+                        link=f"/api/redmine/issues/{issue['id']}",
+                        extra={
+                            "issue_id": str(issue["id"]),
+                            "project_id": str(issue_attrs.get("project_id", "")),
+                        },
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to schedule ticket_assigned notification: {e}"
+                )
+
         return {"status": "success", "message": "Issue created successfully", "id": issue["id"]}
     except httpx.HTTPStatusError as e:
         logger.error("Redmine error (create issue): status=%s body=%s", e.response.status_code, e.response.text)
@@ -1718,6 +1852,7 @@ async def delete_redmine_issue(
 @router.put("/redmine/issues/{issue_id}")
 async def update_redmine_issue(
     issue_id: int,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
     data: str = Form(...),
@@ -1827,6 +1962,55 @@ async def update_redmine_issue(
 
     try:
         issue = await redmine_service.update_issue(issue_id, issue_attrs, switch_user=user["login"])
+
+        # Background-schedule a notification if the update assigned the issue
+        # to a new user (different from the creator).
+        assigned_to_id = issue_attrs.get("assigned_to_id")
+        creator_id = redmine_user_id
+        if assigned_to_id and assigned_to_id != creator_id:
+            try:
+                assignee_emp_id = _resolve_employee_id_from_redmine_user_id(db, assigned_to_id)
+                if assignee_emp_id is not None:
+                    # Resolve the updater (session user) so we can populate
+                    # actor_id from employee_master via the Keycloak sub.
+                    actor_sub = current_user.get("sub")
+                    actor_emp_id = None
+                    if actor_sub:
+                        try:
+                            actor_emp = (
+                                db.query(EmployeeMaster)
+                                .filter(EmployeeMaster.keycloak_user_id == str(actor_sub))
+                                .first()
+                            )
+                            if actor_emp:
+                                actor_emp_id = actor_emp.id
+                        except Exception:
+                            actor_emp_id = None
+                    updater_name = (
+                        (user.get("firstname") or "")
+                        + " "
+                        + (user.get("lastname") or "")
+                    ).strip() or user.get("login") or "Someone"
+                    schedule_notification(
+                        background_tasks,
+                        user_id=assignee_emp_id,
+                        category="ticket_assigned",
+                        title=f"Ticket #{issue_id} reassigned to you",
+                        message=f"{updater_name} reassigned a ticket to you: {issue_attrs.get('subject', '')}",
+                        priority="normal",
+                        actor_id=actor_emp_id,
+                        actor_name=updater_name,
+                        link=f"/api/redmine/issues/{issue_id}",
+                        extra={
+                            "issue_id": str(issue_id),
+                            "project_id": str(issue_attrs.get("project_id", "")),
+                        },
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to schedule ticket_assigned (update) notification: {e}"
+                )
+
         return {"status": "success", "message": "Issue updated successfully", "id": issue_id}
     except httpx.HTTPStatusError as e:
         logger.error("Redmine error (update issue): status=%s body=%s", e.response.status_code, e.response.text)

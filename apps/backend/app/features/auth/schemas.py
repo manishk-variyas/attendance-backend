@@ -36,6 +36,14 @@ class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=125)
     password: str = Field(..., min_length=1, max_length=125)
     realm: Optional[str] = Field(None, max_length=50)  # Optional Keycloak realm; None → default realm
+    turnstile_token: Optional[str] = Field(
+        None,
+        max_length=4096,
+        alias="turnstileToken",
+        description="Cloudflare Turnstile token (required when TURNSTILE_SECRET_KEY is set)",
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class SessionResponse(BaseModel):
@@ -100,6 +108,14 @@ class SignupResponse(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
     realm: Optional[str] = None  # Optional Keycloak realm; None → default realm
+    turnstile_token: Optional[str] = Field(
+        None,
+        max_length=4096,
+        alias="turnstileToken",
+        description="Cloudflare Turnstile token (required when TURNSTILE_SECRET_KEY is set)",
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class ResetPasswordRequest(BaseModel):

@@ -80,6 +80,32 @@ class RedmineSQLService:
             "mail": row[5],
         }
 
+    def get_user_by_id(self, user_id: int):
+        """Look up a Redmine user by their Redmine internal id.
+
+        Returns a dict with id/login/firstname/lastname/mail (joined from
+        redmine.email_addresses for the default address), or None if not found.
+        """
+        row = self.db.execute(
+            text("""
+                SELECT u.id, u.login, u.firstname, u.lastname, u.status, e.address as email
+                FROM redmine.users u
+                JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                WHERE u.id = :uid
+            """),
+            {"uid": int(user_id)},
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "login": row[1],
+            "firstname": row[2],
+            "lastname": row[3],
+            "status": row[4],
+            "mail": row[5],
+        }
+
     def get_projects_for_user(self, user_id: int) -> list:
         rows = self.db.execute(
             text("""

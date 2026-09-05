@@ -21,7 +21,7 @@ Each audit log includes:
 - Timestamp (added automatically by the logging system)
 """
 import logging
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 # Dedicated logger for audit events
 audit_logger = logging.getLogger("app.audit")
@@ -185,6 +185,65 @@ def log_security_event(
                 "event": event,
                 "detail": detail,
                 "severity": severity,
+                **(extra or {}),
+            },
+        },
+    )
+
+
+def _redact_subject_for_template(template: str, subject: str) -> str:
+    """Redact sensitive content from email subjects before logging.
+
+    Some templates (delete_verification, password reset, etc.) include the
+    OTP/verification code directly in the subject line. Logging the raw
+    subject would leak that code via the audit log / UI.
+    """
+    sensitive_templates = {
+        "delete_verification",
+        "delete_verification_project",
+        "delete_verification_employee",
+        "password_reset",
+        "forgot_password",
+    }
+    if template in sensitive_templates:
+        return f"{template} <redacted: contains OTP/verification code>"
+    return subject
+
+
+def audit_email(
+    correlation_id: str,
+    template: str,
+    to: List[str],
+    subject: str,
+    success: bool,
+    error: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> None:
+    """Audit an outbound email send in the same shape as other audit events.
+
+    Args:
+        correlation_id: Request correlation ID for tracing (use "-" for cron)
+        template: Email template name (e.g. "checkout_reminder", "leave_approved")
+        to: List of recipient email addresses
+        subject: Email subject line
+        success: True if SMTP accepted the message, False otherwise
+        error: Error message if send failed
+        extra: Additional data to include in the log
+    """
+    safe_subject = _redact_subject_for_template(template, subject)
+    username = to[0] if to else "-"
+    audit_logger.info(
+        f"Email sent: {template} → {', '.join(to)}: {safe_subject}",
+        extra={
+            "correlation_id": correlation_id,
+            "extra_data": {
+                "action": "email_sent",
+                "username": username,
+                "template": template,
+                "recipients": to,
+                "subject": safe_subject,
+                "status": "success" if success else "failed",
+                "error": error,
                 **(extra or {}),
             },
         },

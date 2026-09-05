@@ -92,6 +92,13 @@ class AdminAttendanceUpdate(BaseModel):
     remarks: Optional[str] = None
     per_diem_eligible: Optional[bool] = Field(None, alias="perDiemEligible")
     conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
+    location_id: Optional[str] = None
+    check_in_location_name: Optional[str] = None
+    check_out_location_name: Optional[str] = None
+    check_in_lat: Optional[float] = None
+    check_in_lng: Optional[float] = None
+    check_out_lat: Optional[float] = None
+    check_out_lng: Optional[float] = None
 
 
 class CompleteAttendanceRequest(BaseModel):

@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import date, datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -20,6 +21,9 @@ from app.services.database.base_service import BaseService
 from zoneinfo import ZoneInfo
 
 from app.utils.shift_time import safe_zone
+from app.utils.audit import audit_logger
+from app.middleware.logging import _get_client_ip
+from app.features.leaves.services.balance_utils import reverse_comp_off
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +269,7 @@ async def admin_create_attendance(
 
 @router.put("/{attendance_id}", response_model=AttendanceResponse)
 async def admin_update_attendance(
-    attendance_id: str,
+    attendance_id: uuid.UUID,
     payload: AdminAttendanceUpdate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -273,17 +277,24 @@ async def admin_update_attendance(
 ):
     roles = current_user.get("roles", [])
     is_pm = "Admin" not in roles
+    IST = ZoneInfo("Asia/Kolkata")
 
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
+    non_remark_fields = any(v is not None for v in (
+        payload.check_in_time, payload.check_out_time, payload.work_location_status,
+        payload.shift_code, payload.status, payload.is_late, payload.per_diem_eligible,
+        payload.conveyance_eligible, payload.location_id, payload.check_in_location_name,
+        payload.check_out_location_name, payload.check_in_lat, payload.check_in_lng,
+        payload.check_out_lat, payload.check_out_lng,
+    ))
+
     if is_pm:
         if payload.remarks is None:
             raise HTTPException(status_code=400, detail="PM can only update remarks.")
-        if payload.check_in_time is not None or payload.check_out_time is not None or \
-           payload.work_location_status is not None or payload.shift_code is not None or \
-           payload.status is not None or payload.is_late is not None:
+        if non_remark_fields:
             raise HTTPException(status_code=403, detail="PM can only update remarks. Admin required for other fields.")
     else:
         if payload.check_in_time is not None:
@@ -314,9 +325,31 @@ async def admin_update_attendance(
             attendance.per_diem_eligible = payload.per_diem_eligible
         if payload.conveyance_eligible is not None:
             attendance.conveyance_eligible = payload.conveyance_eligible
+        if payload.location_id is not None:
+            from uuid import UUID
+            try:
+                attendance.location_id = UUID(str(payload.location_id)) if payload.location_id else None
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="Invalid location_id format")
+        if payload.check_in_location_name is not None:
+            attendance.check_in_location_name = payload.check_in_location_name
+        if payload.check_out_location_name is not None:
+            attendance.check_out_location_name = payload.check_out_location_name
+        if payload.check_in_lat is not None:
+            attendance.check_in_lat = payload.check_in_lat
+        if payload.check_in_lng is not None:
+            attendance.check_in_lng = payload.check_in_lng
+        if payload.check_out_lat is not None:
+            attendance.check_out_lat = payload.check_out_lat
+        if payload.check_out_lng is not None:
+            attendance.check_out_lng = payload.check_out_lng
 
     if payload.remarks is not None:
         attendance.remarks = payload.remarks
+
+    # Validate check-out is not before check-in
+    if attendance.check_in_time and attendance.check_out_time and attendance.check_out_time < attendance.check_in_time:
+        raise HTTPException(status_code=400, detail="check_out_time cannot be before check_in_time")
 
     attendance.is_manual_entry = True
     attendance.modified_by = current_user["sub"]
@@ -336,13 +369,43 @@ async def admin_update_attendance(
     db.commit()
     db.refresh(attendance)
 
+    changed_fields = ", ".join([k for k, v in payload.model_dump().items() if v is not None]) or "none"
+
+    target_email = None
+    emp = db.query(EmployeeMaster).filter(
+        EmployeeMaster.keycloak_user_id == attendance.keycloak_user_id
+    ).first()
+    if emp:
+        target_email = emp.user_email
+
+    att_date = attendance.attendance_date.isoformat() if attendance.attendance_date else "-"
+    editor_email = current_user.get("email") or current_user.get("sub", "-")
+
+    audit_logger.info(
+        f"Attendance for {target_email or attendance.keycloak_user_id} on {att_date} edited by {editor_email} — changed: {changed_fields}",
+        extra={
+            "correlation_id": "-",
+            "extra_data": {
+                "action": "attendance_update",
+                "username": editor_email,
+                "status": "success",
+                "client_ip": "-",
+                "attendance_id": str(attendance_id),
+                "attendance_date": att_date,
+                "employee_email": target_email,
+                "edited_by": editor_email,
+                "changed_fields": changed_fields,
+            },
+        },
+    )
+
     logger.info(f"Admin {current_user['email']} updated attendance {attendance_id}")
     return _to_response(db, attendance)
 
 
 @router.get("/{attendance_id}", response_model=AttendanceResponse)
 async def admin_get_attendance(
-    attendance_id: str,
+    attendance_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin_or_pm),
@@ -520,7 +583,7 @@ async def admin_list_attendance(
 
 @router.delete("/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_delete_attendance(
-    attendance_id: str,
+    attendance_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
@@ -528,6 +591,20 @@ async def admin_delete_attendance(
     attendance = db.query(Attendance).filter(Attendance.id == attendance_id).first()
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
+
+    # Capture fields BEFORE delete (the ORM object expires after db.delete)
+    att_date = attendance.attendance_date
+    att_user_kc = attendance.keycloak_user_id
+    was_comp_off_credited = bool(attendance.comp_off_credited)
+
+    # Resolve the affected employee's email (NOT the raw keycloak UUID) for the audit log
+    target_email = None
+    target_name = None
+    if att_user_kc:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == att_user_kc).first()
+        if emp:
+            target_email = emp.user_email
+            target_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
 
     if attendance.check_in_time is not None and attendance.keycloak_user_id and attendance.attendance_date:
         shift_rec = db.query(Shift).filter(
@@ -537,7 +614,46 @@ async def admin_delete_attendance(
         if shift_rec:
             shift_rec.status = "Yet to start"
 
+    # If this attendance had a comp-off credited for a holiday, reverse it before
+    # deleting the record. This prevents orphan comp-off credits.
+    compoff_reversed = False
+    if was_comp_off_credited and att_user_kc and att_date:
+        compoff_reversed = reverse_comp_off(db, att_user_kc, att_date)
+
     db.delete(attendance)
     db.commit()
 
     logger.info(f"Admin {current_user['email']} deleted attendance {attendance_id}")
+    audit_logger.info(
+        f"Attendance deleted for {target_name or target_email or att_user_kc} on {att_date} by {current_user.get('email')}",
+        extra={
+            "correlation_id": "-",
+            "extra_data": {
+                "action": "attendance_delete",
+                "username": current_user.get("email"),
+                "status": "success",
+                "client_ip": "-",
+                "attendance_id": str(attendance_id),
+                "attendance_date": att_date.isoformat() if att_date else None,
+                "target_user_email": target_email,
+                "compoff_reversed": compoff_reversed,
+            },
+        },
+    )
+    if was_comp_off_credited:
+        audit_logger.info(
+            f"Comp-off reversed for {target_name or target_email or att_user_kc} (holiday {att_date}) — attendance for {att_date} deleted by {current_user.get('email')}",
+            extra={
+                "correlation_id": "-",
+                "extra_data": {
+                    "action": "compoff_reversed",
+                    "username": current_user.get("email"),
+                    "status": "success" if compoff_reversed else "warning",
+                    "client_ip": "-",
+                    "attendance_id": str(attendance_id),
+                    "attendance_date": att_date.isoformat() if att_date else None,
+                    "target_user_email": target_email,
+                    "reason": "attendance_deleted",
+                },
+            },
+        )

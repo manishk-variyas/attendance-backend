@@ -20,6 +20,7 @@ class SystemSetting(Base):
     default_timezone = Column(String(50), nullable=True, server_default=text("'Asia/Kolkata'"))
     grace_minutes = Column(Integer, nullable=True, server_default=text("15"))
     checkout_reminder_grace_hours = Column(Integer, nullable=True, server_default=text("2"))
+    checkin_reminder_delay_minutes = Column(Integer, nullable=True, server_default=text("30"))
     auto_checkout_enabled = Column(Boolean, nullable=False, server_default=text("true"))
     auto_checkout_cutoff_time = Column(Time, nullable=True, server_default=text("'22:00'"))
     incorporation_date = Column(Date, nullable=True, server_default=text("'2016-06-09'"))
@@ -39,6 +40,7 @@ class SystemSetting(Base):
             "default_timezone": self.default_timezone,
             "grace_minutes": self.grace_minutes,
             "checkout_reminder_grace_hours": self.checkout_reminder_grace_hours,
+            "checkin_reminder_delay_minutes": self.checkin_reminder_delay_minutes,
             "auto_checkout_enabled": self.auto_checkout_enabled,
             "auto_checkout_cutoff_time": self.auto_checkout_cutoff_time.isoformat() if self.auto_checkout_cutoff_time else None,
             "incorporation_date": self.incorporation_date.isoformat() if self.incorporation_date else None,

@@ -27,9 +27,28 @@ logger = logging.getLogger("app.access")
 
 
 def _get_client_ip(request: Request) -> str:
+    """Return the real client IP, with the following priority:
+    1. X-User-Public-IP — set by the frontend (browser) when the user is on the
+       public internet. This is the real public IP and is what audit logs should
+       show when the frontend is in a private network (e.g. Hetzner VM).
+    2. CF-Connecting-IP — set by Cloudflare if traffic goes through CF.
+    3. X-Real-IP — set by nginx (or any reverse proxy) when configured.
+    4. X-Forwarded-For (leftmost) — first hop in the proxy chain.
+    5. request.client.host — direct connection (no proxy). May be the
+       frontend VM's private IP if the app is behind a private network.
+    """
+    user_public_ip = request.headers.get("x-user-public-ip", "").strip()
+    if user_public_ip:
+        return user_public_ip
+    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if cf_ip:
+        return cf_ip
     real_ip = request.headers.get("x-real-ip", "").strip()
     if real_ip:
         return real_ip
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
     return request.client.host if request.client else "-"
 
 

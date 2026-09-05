@@ -115,6 +115,7 @@ async def get_settings(db: Session = Depends(get_db)):
         "default_timezone": doc.default_timezone,
         "grace_minutes": doc.grace_minutes,
         "checkout_reminder_grace_hours": doc.checkout_reminder_grace_hours,
+        "checkin_reminder_delay_minutes": doc.checkin_reminder_delay_minutes or 30,
         "auto_checkout_enabled": doc.auto_checkout_enabled,
         "auto_checkout_cutoff_time": doc.auto_checkout_cutoff_time.isoformat() if doc.auto_checkout_cutoff_time else "22:00",
         "incorporation_date": doc.incorporation_date.isoformat() if doc.incorporation_date else "2016-06-09",
@@ -168,6 +169,7 @@ async def update_settings(
     default_timezone: str = Form(None),
     grace_minutes: int = Form(None),
     checkout_reminder_grace_hours: int = Form(None),
+    checkin_reminder_delay_minutes: int = Form(None),
     auto_checkout_enabled: bool = Form(None),
     auto_checkout_cutoff_time: str = Form(None),
     incorporation_date: str = Form(None),
@@ -185,6 +187,8 @@ async def update_settings(
         raise HTTPException(status_code=400, detail="Grace minutes must be between 1 and 120.")
     if checkout_reminder_grace_hours is not None and (checkout_reminder_grace_hours < 1 or checkout_reminder_grace_hours > 24):
         raise HTTPException(status_code=400, detail="Checkout reminder grace hours must be between 1 and 24.")
+    if checkin_reminder_delay_minutes is not None and (checkin_reminder_delay_minutes < 1 or checkin_reminder_delay_minutes > 120):
+        raise HTTPException(status_code=400, detail="Check-in reminder delay must be between 1 and 120 minutes.")
     if auto_checkout_cutoff_time:
         try:
             time.fromisoformat(auto_checkout_cutoff_time)
@@ -230,6 +234,7 @@ async def update_settings(
         default_timezone=REDMINE_TO_IANA_TZ.get(default_timezone, default_timezone) if default_timezone else default_timezone,
         grace_minutes=grace_minutes,
         checkout_reminder_grace_hours=checkout_reminder_grace_hours,
+        checkin_reminder_delay_minutes=checkin_reminder_delay_minutes,
         auto_checkout_enabled=auto_checkout_enabled if auto_checkout_enabled is not None else None,
         auto_checkout_cutoff_time=auto_checkout_cutoff_time,
         incorporation_date=incorporation_date,
