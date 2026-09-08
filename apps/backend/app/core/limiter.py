@@ -24,13 +24,11 @@ DEFAULT_RATE_LIMIT = f"{settings.RATE_LIMIT_PER_SECOND}/second"
 def _client_key(request) -> str:
     """Return the client IP for rate limiting.
 
-    Trust X-Real-IP (set by nginx from $remote_addr) since it cannot be
-    spoofed through the proxy. Fall back to the socket address for direct
-    (non-proxied) requests.
+    Uses the TCP peer's address (request.client.host) which cannot be
+    spoofed by the client. Headers like X-Real-IP or CF-Connecting-IP
+    are not trusted because they can be forged when the origin is
+    directly accessible.
     """
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    if real_ip:
-        return real_ip
     return request.client.host if request.client else "unknown"
 
 

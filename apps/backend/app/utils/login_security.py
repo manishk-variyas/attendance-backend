@@ -27,7 +27,11 @@ from app.models.login_attempt import (
     BLOCK_DURATION_MINUTES,
     BLOCK_WINDOW_MINUTES,
     KIND_IP,
+    KIND_EMAIL,
     MAX_FAILURES_PER_IP,
+    MAX_FAILURES_PER_EMAIL,
+    EMAIL_BLOCK_DURATION_MINUTES,
+    EMAIL_BLOCK_WINDOW_MINUTES,
     LoginAttempt,
     BlockStatus,
 )
@@ -136,6 +140,105 @@ def clear_ip(ip: str) -> None:
         row = (
             db.query(LoginAttempt)
             .filter(LoginAttempt.identifier == ip, LoginAttempt.kind == KIND_IP)
+            .first()
+        )
+        if not row:
+            return
+        db.delete(row)
+        db.commit()
+    finally:
+        db.close()
+
+
+def is_account_blocked(account: str) -> BlockStatus:
+    """Return whether this account (email/username) is currently blocked. Does NOT record a failure."""
+    if not account:
+        return BlockStatus(is_blocked=False, failure_count=0)
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(LoginAttempt)
+            .filter(LoginAttempt.identifier == account, LoginAttempt.kind == KIND_EMAIL)
+            .first()
+        )
+        if not row or not row.blocked_until:
+            return BlockStatus(is_blocked=False, failure_count=row.failure_count if row else 0)
+        now = _utcnow()
+        if row.blocked_until > now:
+            return BlockStatus(is_blocked=True, blocked_until=row.blocked_until, failure_count=row.failure_count)
+        row.failure_count = 0
+        row.first_failure_at = None
+        row.blocked_until = None
+        row.updated_at = now
+        db.commit()
+        return BlockStatus(is_blocked=False, failure_count=0)
+    finally:
+        db.close()
+
+
+def record_account_failure(account: str) -> BlockStatus:
+    """Record one failed attempt for this account. May newly-block the account."""
+    if not account:
+        return BlockStatus(is_blocked=False, failure_count=0)
+    now = _utcnow()
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(LoginAttempt)
+            .filter(LoginAttempt.identifier == account, LoginAttempt.kind == KIND_EMAIL)
+            .first()
+        )
+        if not row:
+            row = LoginAttempt(
+                identifier=account,
+                kind=KIND_EMAIL,
+                failure_count=1,
+                first_failure_at=now,
+                last_attempt_at=now,
+            )
+            db.add(row)
+            db.commit()
+            return BlockStatus(is_blocked=False, failure_count=1)
+
+        if row.first_failure_at is None or (now - row.first_failure_at) > timedelta(minutes=EMAIL_BLOCK_WINDOW_MINUTES):
+            row.failure_count = 1
+            row.first_failure_at = now
+            row.blocked_until = None
+        else:
+            row.failure_count = (row.failure_count or 0) + 1
+
+        row.last_attempt_at = now
+        row.updated_at = now
+
+        just_blocked = False
+        if row.failure_count >= MAX_FAILURES_PER_EMAIL and row.blocked_until is None:
+            row.blocked_until = now + timedelta(minutes=EMAIL_BLOCK_DURATION_MINUTES)
+            just_blocked = True
+
+        db.commit()
+
+        is_blocked_now = (
+            row.blocked_until is not None and row.blocked_until > now
+        )
+        return BlockStatus(
+            is_blocked=is_blocked_now,
+            blocked_until=row.blocked_until,
+            failure_count=row.failure_count,
+            just_blocked=just_blocked,
+        )
+    finally:
+        db.close()
+
+
+def clear_account(account: str) -> None:
+    """Clear this account's failure record. Called on successful login."""
+    if not account:
+        return
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(LoginAttempt)
+            .filter(LoginAttempt.identifier == account, LoginAttempt.kind == KIND_EMAIL)
             .first()
         )
         if not row:

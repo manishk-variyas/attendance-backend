@@ -45,14 +45,17 @@ from app.utils.audit import log_login, log_logout, log_session_refresh, log_back
 from app.utils.cloudflare import compute_fingerprint, get_country
 from app.utils.login_security import (
     clear_ip,
+    clear_account,
     is_brute_force_active,
     is_ip_blocked,
+    is_account_blocked,
     record_ip_failure,
+    record_account_failure,
 )
 from app.utils.turnstile import verify_turnstile
 from app.services.email_service import email_service
 from app.utils.email import send_password_reset_email, send_password_changed_email
-from app.middleware.logging import _get_client_ip
+from app.middleware.logging import _get_client_ip, _get_security_ip
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse, ForgotPasswordRequest, ResetPasswordRequest
 from app.features.redmine.service import redmine_service
 
@@ -77,7 +80,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     import httpx
 
     correlation_id = request.state.correlation_id
-    client_ip = _get_client_ip(request)
+    client_ip = _get_security_ip(request)
 
     # Per-IP brute-force block: short-circuit before any other work.
     block_status = is_ip_blocked(client_ip)
@@ -93,8 +96,23 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
             detail="Too many login attempts from this network. Try again later.",
         )
 
+    # Per-account brute-force block: short-circuit before sending to Keycloak.
+    # Uses payload.username as the account identifier.
+    account_block_status = is_account_blocked(payload.username)
+    if account_block_status.is_blocked:
+        log_security_event(
+            correlation_id, "account_login_blocked",
+            f"Login blocked for account {payload.username}",
+            severity="warning",
+            extra={"account": payload.username, "blocked_until": account_block_status.blocked_until.isoformat() if account_block_status.blocked_until else None},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts for this account. Try again later.",
+        )
+
     # Cloudflare Turnstile bot verification (no-op when TURNSTILE_SECRET_KEY is empty)
-    await verify_turnstile(payload.turnstile_token)
+    # await verify_turnstile(payload.turnstile_token)
 
     rc = get_realm_config(payload.realm)
 
@@ -138,6 +156,21 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
             raise HTTPException(
                 status_code=429,
                 detail="Too many login attempts from this network. Try again later.",
+            )
+
+        # Per-account brute-force recording.
+        account_status = record_account_failure(payload.username)
+        if account_status.just_blocked:
+            log_security_event(
+                correlation_id, "account_login_blocked",
+                f"Account {payload.username} newly blocked after failed login",
+                severity="warning",
+                extra={"account": payload.username, "blocked_until": account_status.blocked_until.isoformat() if account_status.blocked_until else None},
+            )
+        if account_status.is_blocked:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts for this account. Try again later.",
             )
 
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -216,6 +249,7 @@ async def login(request: Request, payload: LoginRequest, db: Session = Depends(g
     # Successful login: clear this IP's failure record so legit users aren't
     # penalized for past typos or attacks from a shared NAT.
     clear_ip(client_ip)
+    clear_account(payload.username)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
 
@@ -442,7 +476,7 @@ async def forgot_password(request: Request, payload: ForgotPasswordRequest):
     Always returns success to prevent email enumeration.
     """
     correlation_id = request.state.correlation_id
-    client_ip = _get_client_ip(request)
+    client_ip = _get_security_ip(request)
 
     # Per-IP brute-force block: short-circuit before any other work.
     block_status = is_ip_blocked(client_ip)

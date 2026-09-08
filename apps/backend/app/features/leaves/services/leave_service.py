@@ -1,6 +1,7 @@
 from datetime import datetime, timezone, date, timedelta
 import asyncio
 import io
+import logging
 from io import BytesIO
 from typing import List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -25,6 +26,8 @@ from app.models.system_setting import SystemSetting
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
 from sqlalchemy import select, and_, or_, insert
+
+logger = logging.getLogger(__name__)
 
 class LeaveBusinessService:
     def __init__(self, leave_db: LeaveDBService, holiday_db: HolidayDBService):

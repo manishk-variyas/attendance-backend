@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -54,6 +55,22 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={"detail": "Too many requests. Please try again later."},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Sanitize Pydantic validation errors to not leak internal field paths."""
+    from fastapi.responses import JSONResponse
+    sanitized_errors = []
+    for error in exc.errors():
+        sanitized_errors.append({
+            "field": error.get("loc", ["__root__"])[-1],
+            "message": error.get("msg", "Invalid value"),
+        })
+    return JSONResponse(
+        status_code=422,
+        content={"detail": sanitized_errors},
     )
 
 

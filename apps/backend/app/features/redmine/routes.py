@@ -64,10 +64,8 @@ def _resolve_employee_id_from_redmine_user_id(db: Session, redmine_user_id) -> O
     """Resolve a Redmine internal user id (integer) into our app's
     employee_master.id (UUID).
 
-    Uses the Redmine mirror table (redmine.users joined to email_addresses)
-    to find the user's default email, then matches that email against
-    employee_master.user_email. Returns None if the Redmine user is not
-    found or has no matching employee_master row.
+    First tries direct match on employee_master.redmine_user_id.
+    Falls back to email-based lookup via Redmine's email_addresses table.
 
     IMPORTANT: this is the bridge between the two keyspaces. Do NOT compare
     redmine_user_id directly to employee_master.id or .keycloak_user_id
@@ -76,9 +74,19 @@ def _resolve_employee_id_from_redmine_user_id(db: Session, redmine_user_id) -> O
     if redmine_user_id is None:
         return None
     try:
-        redmine_user = RedmineSQLService(db).get_user_by_id(int(redmine_user_id))
+        redmine_user_id_int = int(redmine_user_id)
     except (TypeError, ValueError):
         return None
+
+    emp = (
+        db.query(EmployeeMaster)
+        .filter(EmployeeMaster.redmine_user_id == redmine_user_id_int)
+        .first()
+    )
+    if emp:
+        return emp.id
+
+    redmine_user = RedmineSQLService(db).get_user_by_id(redmine_user_id_int)
     if not redmine_user or not redmine_user.get("mail"):
         return None
     emp = (

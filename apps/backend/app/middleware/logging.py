@@ -26,8 +26,29 @@ from fastapi.responses import Response
 logger = logging.getLogger("app.access")
 
 
+def _get_security_ip(request: Request) -> str:
+    """Return the client IP for security decisions (rate limiting, blocking).
+
+    Uses only the TCP peer's address (request.client.host) which cannot be
+    spoofed by the client. Headers like CF-Connecting-IP, X-Real-IP, or
+    X-Forwarded-For are NOT trusted because they can be forged when the
+    origin is directly accessible.
+
+    Use this for: brute-force protection, IP blocklists, rate limiting.
+    Use _get_client_ip() for: audit logging, analytics (where header spoofing
+    is acceptable since it only affects logging).
+    """
+    return request.client.host if request.client else "-"
+
+
 def _get_client_ip(request: Request) -> str:
-    """Return the real client IP, with the following priority:
+    """Return the client IP for logging/analytics purposes.
+
+    This function trusts client-supplied headers (CF-Connecting-IP, X-Real-IP,
+    etc.) for visibility purposes. For SECURITY decisions (rate limiting,
+    IP blocking), use _get_security_ip() instead.
+
+    Priority:
     1. X-User-Public-IP — set by the frontend (browser) when the user is on the
        public internet. This is the real public IP and is what audit logs should
        show when the frontend is in a private network (e.g. Hetzner VM).
@@ -71,7 +92,6 @@ async def log_requests(request: Request, call_next) -> Response:
 
     # Calculate duration
     process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = f"{process_time:.4f}"
     response.headers["X-Correlation-ID"] = correlation_id
 
     # Log the request details

@@ -100,7 +100,7 @@ def _create_notification_task(
             actor_id=actor_id,
             actor_name=actor_name[:255] if actor_name else None,
             link=link[:512] if link else None,
-            extra=extra or {},
+            metadata=extra or {},
         )
         db.commit()
     except Exception as e:

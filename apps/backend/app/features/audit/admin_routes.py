@@ -251,62 +251,6 @@ async def get_audit_logs(
     }
 
 
-@router.get("/stream")
-@limiter.limit("2/minute")
-async def audit_logs_stream(
-    request: Request,
-    current_user: dict = Depends(get_current_user),
-    _: None = Depends(require_admin),
-):
-    async def event_generator():
-        loop = asyncio.get_running_loop()
-        dead_at = time.monotonic() + STREAM_TIMEOUT
-        f = None
-        try:
-            if os.path.exists(AUDIT_LOG_PATH):
-                f = open(AUDIT_LOG_PATH, "r", encoding="utf-8")
-                f.seek(0, 2)
-            while time.monotonic() < dead_at:
-                if await request.is_disconnected():
-                    break
-                if f is None:
-                    if os.path.exists(AUDIT_LOG_PATH):
-                        f = open(AUDIT_LOG_PATH, "r", encoding="utf-8")
-                        f.seek(0, 2)
-                    else:
-                        await asyncio.sleep(2)
-                        continue
-                line = await loop.run_in_executor(None, f.readline)
-                if line:
-                    entry = _parse_log_line(line)
-                    if entry:
-                        metadata = entry.get("metadata") or {}
-                        if metadata.get("action") == "backchannel_logout":
-                            continue
-                        yield f"data: {json.dumps(entry, default=str)}\n\n"
-                else:
-                    await asyncio.sleep(0.5)
-                    try:
-                        if os.path.getsize(AUDIT_LOG_PATH) < f.tell():
-                            f.close()
-                            f = open(AUDIT_LOG_PATH, "r", encoding="utf-8")
-                    except OSError:
-                        pass
-        finally:
-            if f:
-                f.close()
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 @router.get("/actions")
 async def get_audit_actions(
     current_user: dict = Depends(get_current_user),

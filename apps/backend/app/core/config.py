@@ -52,9 +52,9 @@ class Settings(BaseSettings):
     # against Cloudflare's siteverify API. When unset, the endpoints behave
     # exactly as before (no Turnstile enforcement).
     TURNSTILE_SECRET_KEY: str = ""
-    # If True, Turnstile is enforced even when the secret key is set. Useful
-    # for staged rollouts (e.g. enable in test, then go live for everyone).
-    TURNSTILE_ENABLED: bool = True
+    # If True, Turnstile is enforced. Must also set TURNSTILE_SECRET_KEY.
+    # Defaults to False (opt-in) to prevent accidental bypass when key is not set.
+    TURNSTILE_ENABLED: bool = False
 
     # Database connections
     DATABASE_URL: str = "postgresql://keycloak:keycloak@keycloak-db:5432/keycloak"  # PostgreSQL for Keycloak

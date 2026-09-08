@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from io import BytesIO
@@ -28,6 +28,7 @@ from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.holiday import Holiday as HolidayModel
 from app.features.leaves.dependencies import get_leave_business_service
+from app.features.notifications.service import schedule_notification
 from app.features.redmine.service import redmine_service
 from app.utils.audit import audit_logger
 import logging
@@ -448,7 +449,9 @@ async def validate_leave_dates(
 async def apply_leave(
     request: Request,
     leave_data: LeaveApplyRequest,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     user_id = current_user.get("sub")
@@ -456,6 +459,33 @@ async def apply_leave(
     result = await leave_service.apply_for_leave(user_id, email, leave_data)
     leave_id = result["leave_id"]
     bal = result["balance"]
+
+    applicant_name = current_user.get("email", "").split("@")[0]
+    if current_user.get("username"):
+        applicant_name = current_user.get("username")
+
+    start_str = leave_data.start_date.strftime("%Y-%m-%d") if hasattr(leave_data.start_date, 'strftime') else str(leave_data.start_date)
+    end_str = leave_data.end_date.strftime("%Y-%m-%d") if hasattr(leave_data.end_date, 'strftime') else str(leave_data.end_date)
+
+    approver_emp = None
+    if leave_data.approver_id:
+        approver_emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == leave_data.approver_id).first()
+    if not approver_emp:
+        applicant_emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
+        if applicant_emp and applicant_emp.reports_to:
+            approver_emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == applicant_emp.reports_to).first()
+
+    if approver_emp:
+        schedule_notification(
+            background_tasks,
+            user_id=approver_emp.id,
+            category="leave_applied",
+            title="New Leave Request",
+            message=f"{applicant_name} has applied for leave from {start_str} to {end_str}.",
+            priority="normal",
+            actor_name=applicant_name,
+            link="/leaves",
+        )
 
     return {"message": "Leave application submitted successfully", "leave_id": leave_id, "leave_ids": result["leave_ids"], "created": result["created"], "balance": bal}
 
@@ -641,7 +671,9 @@ async def batch_reject_cancel_leaves(
 @router.post("/{leave_id}/approve")
 async def approve_leave(
     leave_id: str,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """
@@ -663,13 +695,30 @@ async def approve_leave(
             detail="Leave application not found or unauthorized."
         )
 
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if leave:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
+        if emp:
+            schedule_notification(
+                background_tasks,
+                user_id=emp.id,
+                category="leave_approved",
+                title="Leave Approved",
+                message=f"Your leave request from {leave.start_date.strftime('%Y-%m-%d')} to {leave.end_date.strftime('%Y-%m-%d')} has been approved by {current_user.get('email')}.",
+                priority="normal",
+                actor_name=current_user.get("email"),
+                link="/leaves",
+            )
+
     return {"message": "Leave application approved successfully"}
 
 
 @router.post("/{leave_id}/reject")
 async def reject_leave(
     leave_id: str,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     """
@@ -691,6 +740,21 @@ async def reject_leave(
             detail="Leave application not found or unauthorized."
         )
 
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if leave:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
+        if emp:
+            schedule_notification(
+                background_tasks,
+                user_id=emp.id,
+                category="leave_rejected",
+                title="Leave Rejected",
+                message=f"Your leave request from {leave.start_date.strftime('%Y-%m-%d')} to {leave.end_date.strftime('%Y-%m-%d')} has been rejected by {current_user.get('email')}.",
+                priority="normal",
+                actor_name=current_user.get("email"),
+                link="/leaves",
+            )
+
     return {"message": "Leave application rejected successfully"}
 
 
@@ -707,7 +771,9 @@ async def request_cancel_leave(
 @router.post("/{leave_id}/approve-cancel")
 async def approve_cancel_leave(
     leave_id: str,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     roles = current_user.get("roles", [])
@@ -716,14 +782,33 @@ async def approve_cancel_leave(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Admin, PM, or PC can approve cancellation requests."
         )
-    return await leave_service.approve_cancel_leave(leave_id, current_user)
+    result = await leave_service.approve_cancel_leave(leave_id, current_user)
+
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if leave:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
+        if emp:
+            schedule_notification(
+                background_tasks,
+                user_id=emp.id,
+                category="leave_cancellation_approved",
+                title="Leave Cancellation Approved",
+                message=f"Your leave cancellation request for {leave.start_date.strftime('%Y-%m-%d')} to {leave.end_date.strftime('%Y-%m-%d')} has been approved.",
+                priority="normal",
+                actor_name=current_user.get("email"),
+                link="/leaves",
+            )
+
+    return result
 
 
 @router.post("/{leave_id}/reject-cancel")
 async def reject_cancel_leave(
     leave_id: str,
+    background_tasks: BackgroundTasks,
     payload: CancelLeaveRejectRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
     leave_service: LeaveBusinessService = Depends(get_leave_business_service)
 ):
     roles = current_user.get("roles", [])
@@ -732,7 +817,24 @@ async def reject_cancel_leave(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only Admin, PM, or PC can reject cancellation requests."
         )
-    return await leave_service.reject_cancel_leave(leave_id, current_user, payload.remark)
+    result = await leave_service.reject_cancel_leave(leave_id, current_user, payload.remark)
+
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if leave:
+        emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == leave.user_email).first()
+        if emp:
+            schedule_notification(
+                background_tasks,
+                user_id=emp.id,
+                category="leave_cancellation_rejected",
+                title="Leave Cancellation Rejected",
+                message=f"Your leave cancellation request for {leave.start_date.strftime('%Y-%m-%d')} to {leave.end_date.strftime('%Y-%m-%d')} has been rejected. Reason: {payload.remark}",
+                priority="normal",
+                actor_name=current_user.get("email"),
+                link="/leaves",
+            )
+
+    return result
 
 
 @router.get("/{leave_id}", response_model=LeaveHistoryItem)

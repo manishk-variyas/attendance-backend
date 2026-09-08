@@ -19,16 +19,23 @@ _VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 async def verify_turnstile(token: str | None) -> bool:
     """Verify a Cloudflare Turnstile token. Raises 400/403 on failure.
 
-    If `TURNSTILE_SECRET_KEY` is empty, this is a no-op (returns True).
-    If `TURNSTILE_ENABLED` is False, this is a no-op (returns True) — useful
-    for staged rollouts.
+    If `TURNSTILE_SECRET_KEY` is empty and `TURNSTILE_ENABLED` is True,
+    this fails closed with a 500 error to prevent accidental bypass.
+    If `TURNSTILE_ENABLED` is False, this is a no-op — useful for staged
+    rollouts or environments where Turnstile should be disabled.
 
     Note: error messages are intentionally vague so we don't give attackers
     a hint about whether they need to obtain a Turnstile token. A missing
     token and an invalid token both yield the same generic 400.
     """
-    if not settings.TURNSTILE_SECRET_KEY or not settings.TURNSTILE_ENABLED:
+    if not settings.TURNSTILE_ENABLED:
         return True
+
+    if not settings.TURNSTILE_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Turnstile is enabled but not configured. Contact administrator.",
+        )
 
     if not token:
         raise HTTPException(
