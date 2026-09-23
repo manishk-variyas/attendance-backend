@@ -16,6 +16,7 @@ How it works:
 """
 from pydantic_settings import BaseSettings
 from typing import List
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -42,6 +43,10 @@ class Settings(BaseSettings):
     # URLs for different services
     BACKEND_URL: str = "http://localhost:8000"  # This backend's public URL
     FRONTEND_URL: str = "http://localhost:5173"  # Frontend app URL (for CORS)
+    # Public portal URL used in emails/links. Empty = fall back to FRONTEND_URL.
+    PORTAL_URL: str = ""
+    # Generic company identity defaults (empty = must come from company settings row).
+    COMPANY_NAME: str = ""
 
     # Cookie security settings
     COOKIE_SECURE: bool = False  # Set to True in production (requires HTTPS)
@@ -57,10 +62,36 @@ class Settings(BaseSettings):
     TURNSTILE_ENABLED: bool = False
 
     # Database connections
-    DATABASE_URL: str = "postgresql://keycloak:keycloak@keycloak-db:5432/keycloak"  # PostgreSQL for Keycloak
+    DATABASE_URL: str = "postgresql+psycopg://keycloak:keycloak@keycloak-db:5432/keycloak"  # PostgreSQL for Keycloak
+
+    # DB pooling — the app always sits behind pgbouncer (transaction mode),
+    # so pooling is pgbouncer's job: default to NullPool (no client-side pool).
+    # Set DB_POOL_CLASS=queue to pool client-side instead (direct Postgres).
+    DB_POOL_CLASS: str = "null"
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 10
 
     # CORS - list of allowed frontend origins
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000", "http://95.216.39.97:8086", "https://attendance.variyaslabs.com"]
+    # Accepts JSON list OR comma-separated string (easier in .env files).
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            if v.startswith("["):
+                import json
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return parsed
+                except ValueError:
+                    pass
+            return [o.strip() for o in v.split(",") if o.strip()]
+        return v
 
     # Rate limiting - max requests per second per IP
     RATE_LIMIT_PER_SECOND: int = 100

@@ -94,13 +94,13 @@ def _extract_overlay_color(img: Image.Image) -> str:
     )
 
 @router.get("")
-async def get_settings(db: Session = Depends(get_db)):
+def get_settings(db: Session = Depends(get_db)):
     svc = SystemSettingService(db)
     doc = svc.fetch()
     if not doc:
         return {"id": "company", "company_name": "", "logo_url": "", "background_url": "",
                 "background_overlay_color": "#1a2332",
-                "trademark": "Variyas Labs Private Limited", "website_url": "https://variyaslabs.com"}
+                "trademark": "", "website_url": ""}
     version = int(doc.updated_at.timestamp()) if doc.updated_at else 0
     return {
         "id": "company",
@@ -118,13 +118,13 @@ async def get_settings(db: Session = Depends(get_db)):
         "checkin_reminder_delay_minutes": doc.checkin_reminder_delay_minutes or 30,
         "auto_checkout_enabled": doc.auto_checkout_enabled,
         "auto_checkout_cutoff_time": doc.auto_checkout_cutoff_time.isoformat() if doc.auto_checkout_cutoff_time else "22:00",
-        "incorporation_date": doc.incorporation_date.isoformat() if doc.incorporation_date else "2016-06-09",
+        "incorporation_date": doc.incorporation_date.isoformat() if doc.incorporation_date else None,
         "updated_at": doc.updated_at,
     }
 
 
 @router.get("/timezones")
-async def get_timezones(
+def get_timezones(
     current_user: dict = Depends(get_current_user),
 ):
     return {"timezones": sorted(set(REDMINE_TO_IANA_TZ.values()))}

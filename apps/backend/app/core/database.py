@@ -13,20 +13,25 @@ This backend stores sessions in PostgreSQL.
 """
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import NullPool
 from app.core.config import settings
 from app.core.models import Base
 
 
-# Create the database engine with connection pooling
-# pool_pre_ping=True checks connections are alive before using them.
-# pool_size/max_overflow sized for 4 gunicorn workers (10+10 = 20/worker = 80
-# peak) leaving headroom under Postgres max_connections=100.
-engine = create_engine(
-    settings.DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=10,
-)
+# Connection pooling: pgbouncer (transaction mode) owns pooling, so the
+# client holds no pool by default (NullPool). QueuePool math for reference:
+# workers x (pool_size + max_overflow) must stay under Postgres max_connections.
+# Configure via DB_POOL_CLASS=null|queue, DB_POOL_SIZE, DB_MAX_OVERFLOW.
+_pool_kwargs: dict = {"pool_pre_ping": True, "poolclass": NullPool}
+if settings.DB_POOL_CLASS == "queue":
+    from sqlalchemy.pool import QueuePool
+    _pool_kwargs = {
+        "pool_pre_ping": True,
+        "poolclass": QueuePool,
+        "pool_size": settings.DB_POOL_SIZE,
+        "max_overflow": settings.DB_MAX_OVERFLOW,
+    }
+engine = create_engine(settings.DATABASE_URL, **_pool_kwargs)
 
 # Create a session factory - each session is a new database transaction
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -52,9 +57,9 @@ def _run_migrations():
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM information_schema.columns
-                    WHERE table_name='shifts' AND column_name='project_name'
+                    WHERE table_name='system_settings' AND column_name='website_url'
                 ) THEN
-                    ALTER TABLE shifts ADD COLUMN project_name VARCHAR(255);
+                    ALTER TABLE system_settings ADD COLUMN website_url VARCHAR(255);
                 END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM information_schema.columns
@@ -88,10 +93,10 @@ def _run_migrations():
                     ALTER TABLE system_settings ADD COLUMN background_overlay_color VARCHAR(7);
                 END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='trademark') THEN
-                    ALTER TABLE system_settings ADD COLUMN trademark VARCHAR(255) DEFAULT 'Variyas Labs Private Limited';
+                    ALTER TABLE system_settings ADD COLUMN trademark VARCHAR(255) DEFAULT '';
                 END IF;
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='system_settings' AND column_name='website_url') THEN
-                    ALTER TABLE system_settings ADD COLUMN website_url VARCHAR(255) DEFAULT 'https://variyaslabs.com';
+                    ALTER TABLE system_settings ADD COLUMN website_url VARCHAR(255) DEFAULT '';
                 END IF;
             END $$;
         """))
@@ -247,6 +252,30 @@ def _run_migrations():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_login_attempts_identifier_kind ON login_attempts(identifier, kind)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_login_attempts_kind_blocked ON login_attempts(kind, blocked_until)"))
+        conn.commit()
+
+        # Trusted device fingerprints for new-device login detection
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trusted_device_hashes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                keycloak_user_id VARCHAR(255) NOT NULL,
+                fingerprint VARCHAR(64) NOT NULL,
+                device_label VARCHAR(255),
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (keycloak_user_id, fingerprint)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_trusted_device_user ON trusted_device_hashes(keycloak_user_id)"))
+        conn.execute(text("ALTER TABLE trusted_device_hashes ADD COLUMN IF NOT EXISTS device_token_hash VARCHAR(64)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_trusted_device_token ON trusted_device_hashes(device_token_hash)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS login_alert_cooldown (
+                keycloak_user_id VARCHAR(255) PRIMARY KEY,
+                last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
         conn.commit()
 
         # Notifications table for in-app user notifications (replaces old schema)

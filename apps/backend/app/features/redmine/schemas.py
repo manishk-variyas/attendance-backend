@@ -3,6 +3,8 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 from typing import List, Optional, Any
 from datetime import datetime
 
+from app.utils.sanitize import sanitize_rich_text
+
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -183,6 +185,8 @@ class IssueResponse(BaseModel):
     author_name: str
     attachments: list[dict] = []
     custom_fields: list[dict] = []
+    parent_issue_id: Optional[int] = None
+    subtasks_count: int = 0
 
 
 class IssueListResponse(BaseModel):
@@ -329,6 +333,12 @@ class IssueCreate(BaseModel):
             raise ValueError("Must be >= 0")
         return v
 
+    @field_validator("subject", "description")
+    @classmethod
+    def sanitize_text_fields(cls, v):
+        # Text + links only: strip embedded HTML/JS, keep Markdown intact.
+        return sanitize_rich_text(v)
+
     @model_validator(mode="after")
     def check_dates(self):
         if self.start_date and self.due_date and self.start_date > self.due_date:
@@ -379,6 +389,12 @@ class IssueUpdate(BaseModel):
         if v is not None and (v < 0 or v > 100):
             raise ValueError("Must be between 0 and 100")
         return v
+
+    @field_validator("subject", "description", "notes")
+    @classmethod
+    def sanitize_text_fields(cls, v):
+        # Text + links only: strip embedded HTML/JS, keep Markdown intact.
+        return sanitize_rich_text(v)
 
     @model_validator(mode="after")
     def check_dates(self):

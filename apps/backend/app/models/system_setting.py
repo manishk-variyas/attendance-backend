@@ -11,8 +11,8 @@ class SystemSetting(Base):
     logo_content_type = Column(String(100), nullable=True)
     background_content_type = Column(String(100), nullable=True)
     background_overlay_color = Column(String(7), nullable=True)
-    trademark = Column(String(255), nullable=True, server_default=text("'Variyas Labs Private Limited'"))
-    website_url = Column(String(255), nullable=True, server_default=text("'https://variyaslabs.com'"))
+    trademark = Column(String(255), nullable=True, server_default=text("''"))
+    website_url = Column(String(255), nullable=True, server_default=text("''"))
     created_by = Column(String(255), nullable=True)
     updated_by = Column(String(255), nullable=True)
     default_shift_start_time = Column(Time, nullable=True)
@@ -23,7 +23,7 @@ class SystemSetting(Base):
     checkin_reminder_delay_minutes = Column(Integer, nullable=True, server_default=text("30"))
     auto_checkout_enabled = Column(Boolean, nullable=False, server_default=text("true"))
     auto_checkout_cutoff_time = Column(Time, nullable=True, server_default=text("'22:00'"))
-    incorporation_date = Column(Date, nullable=True, server_default=text("'2016-06-09'"))
+    incorporation_date = Column(Date, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     def to_dict(self) -> dict:

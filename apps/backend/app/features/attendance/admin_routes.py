@@ -183,7 +183,7 @@ def _build_virtual_record(db: Session, shift, emp) -> dict:
 
 
 @router.post("", response_model=AttendanceResponse, status_code=status.HTTP_201_CREATED)
-async def admin_create_attendance(
+def admin_create_attendance(
     payload: AdminAttendanceCreate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -268,7 +268,7 @@ async def admin_create_attendance(
 
 
 @router.put("/{attendance_id}", response_model=AttendanceResponse)
-async def admin_update_attendance(
+def admin_update_attendance(
     attendance_id: uuid.UUID,
     payload: AdminAttendanceUpdate,
     db: Session = Depends(get_db),
@@ -404,7 +404,7 @@ async def admin_update_attendance(
 
 
 @router.get("/{attendance_id}", response_model=AttendanceResponse)
-async def admin_get_attendance(
+def admin_get_attendance(
     attendance_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -417,7 +417,7 @@ async def admin_get_attendance(
 
 
 @router.get("")
-async def admin_list_attendance(
+def admin_list_attendance(
     user_email: Optional[str] = Query(None, description="Filter by employee email"),
     from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
@@ -582,7 +582,7 @@ async def admin_list_attendance(
 
 
 @router.delete("/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def admin_delete_attendance(
+def admin_delete_attendance(
     attendance_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),

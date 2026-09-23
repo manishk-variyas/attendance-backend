@@ -108,7 +108,7 @@ def _iter_log_lines():
 
 @router.get("")
 @limiter.limit("30/minute")
-async def get_audit_logs(
+def get_audit_logs(
     request: Request,
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
@@ -252,7 +252,7 @@ async def get_audit_logs(
 
 
 @router.get("/actions")
-async def get_audit_actions(
+def get_audit_actions(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
 ):

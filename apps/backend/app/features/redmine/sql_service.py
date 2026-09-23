@@ -24,6 +24,8 @@ def _issue_row_to_dict(r) -> dict:
         author_name=r[21] or "",
         attachments=r[22] if r[22] else [],
         custom_fields=r[23] if r[23] else [],
+        parent_issue_id=r[24],
+        subtasks_count=r[25] or 0,
     )
 
 
@@ -328,12 +330,14 @@ class RedmineSQLService:
                            ) ORDER BY cf.id)
                            FROM redmine.custom_values cv
                            JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
-                           WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
-                           '[]'::json
-                       ) as custom_fields
-                FROM redmine.issues i
-                JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
-                JOIN redmine.members m ON m.project_id = pr.id {clauses}
+                            WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                            '[]'::json
+                        ) as custom_fields,
+                        i.parent_id as parent_issue_id,
+                        (SELECT COUNT(*) FROM redmine.issues c WHERE c.parent_id = i.id) as subtasks_count
+                 FROM redmine.issues i
+                 JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
+                 JOIN redmine.members m ON m.project_id = pr.id {clauses}
                 LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
                 LEFT JOIN redmine.users auth ON auth.id = i.author_id
                 JOIN redmine.issue_statuses st ON st.id = i.status_id
@@ -372,18 +376,20 @@ class RedmineSQLService:
                            ) ORDER BY cf.id)
                            FROM redmine.custom_values cv
                            JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
-                           WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
-                           '[]'::json
-                       ) as custom_fields
-                FROM redmine.issues i
-                JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
-                LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
-                LEFT JOIN redmine.users auth ON auth.id = i.author_id
-                JOIN redmine.issue_statuses st ON st.id = i.status_id
-                JOIN redmine.enumerations p ON p.id = i.priority_id
-                JOIN redmine.trackers t ON t.id = i.tracker_id
-                ORDER BY i.updated_on DESC
-            """),
+                            WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
+                            '[]'::json
+                        ) as custom_fields,
+                        i.parent_id as parent_issue_id,
+                        (SELECT COUNT(*) FROM redmine.issues c WHERE c.parent_id = i.id) as subtasks_count
+                 FROM redmine.issues i
+                 JOIN redmine.projects pr ON pr.id = i.project_id AND pr.status = 1
+                 LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+                 LEFT JOIN redmine.users auth ON auth.id = i.author_id
+                 JOIN redmine.issue_statuses st ON st.id = i.status_id
+                 JOIN redmine.enumerations p ON p.id = i.priority_id
+                 JOIN redmine.trackers t ON t.id = i.tracker_id
+                 ORDER BY i.updated_on DESC
+             """),
         ).fetchall()
         return [_issue_row_to_dict(r) for r in rows]
 
@@ -394,6 +400,7 @@ class RedmineSQLService:
         include_authored: bool = False,
         team_ids: list = None,
         admin_all: bool = False,
+        parent_id: int = None,
         status_id: int = None,
         priority_id: int = None,
         tracker_id: int = None,
@@ -425,6 +432,9 @@ class RedmineSQLService:
         if status_id is not None:
             where.append("i.status_id = :status_id")
             params["status_id"] = status_id
+        if parent_id is not None:
+            where.append("i.parent_id = :parent_id")
+            params["parent_id"] = parent_id
         if priority_id is not None:
             where.append("i.priority_id = :priority_id")
             params["priority_id"] = priority_id
@@ -477,7 +487,9 @@ class RedmineSQLService:
                 JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
                 WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
                 '[]'::json
-            ) as custom_fields
+            ) as custom_fields,
+            i.parent_id as parent_issue_id,
+            (SELECT COUNT(*) FROM redmine.issues c WHERE c.parent_id = i.id) as subtasks_count
         """
 
         base_from = """
@@ -554,15 +566,17 @@ class RedmineSQLService:
                            JOIN redmine.custom_fields cf ON cf.id = cv.custom_field_id
                            WHERE cv.customized_id = i.id AND cv.customized_type = 'Issue'),
                            '[]'::json
-                       ) as custom_fields
-                FROM redmine.issues i
-                JOIN redmine.projects pr ON pr.id = i.project_id
-                LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
-                LEFT JOIN redmine.users auth ON auth.id = i.author_id
-                JOIN redmine.issue_statuses st ON st.id = i.status_id
-                JOIN redmine.enumerations p ON p.id = i.priority_id
-                JOIN redmine.trackers t ON t.id = i.tracker_id
-                WHERE i.id = :issue_id
+                        ) as custom_fields,
+                        i.parent_id as parent_issue_id,
+                        (SELECT COUNT(*) FROM redmine.issues c WHERE c.parent_id = i.id) as subtasks_count
+                 FROM redmine.issues i
+                 JOIN redmine.projects pr ON pr.id = i.project_id
+                 LEFT JOIN redmine.users u ON u.id = i.assigned_to_id
+                 LEFT JOIN redmine.users auth ON auth.id = i.author_id
+                 JOIN redmine.issue_statuses st ON st.id = i.status_id
+                 JOIN redmine.enumerations p ON p.id = i.priority_id
+                 JOIN redmine.trackers t ON t.id = i.tracker_id
+                 WHERE i.id = :issue_id
             """),
             {"issue_id": issue_id},
         ).fetchone()

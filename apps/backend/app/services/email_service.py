@@ -1,12 +1,16 @@
 import smtplib
 import ssl
 import logging
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from app.core.config import settings
 from app.utils.audit import audit_email
+from app.utils.company import resolve_brand_name, resolve_portal_url, resolve_trademark
+from app.utils.device import is_public_ip
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +120,7 @@ class EmailService:
         body = _template("missed_checkin_reminder", employee_name=employee_name, shift_date=shift_date, shift_start_time=shift_start_time)
         return self.send([to], subject, body, template="missed_checkin_reminder", correlation_id=correlation_id)
 
-    def send_onboarding_welcome(self, to: str, employee_name: str, designation: str, employee_id: str, email: str, joining_date: str, reports_to_name: str, company_name: str, portal_url: str = "https://attendance.variyaslabs.com/", correlation_id: str = "-") -> bool:
+    def send_onboarding_welcome(self, to: str, employee_name: str, designation: str, employee_id: str, email: str, joining_date: str, reports_to_name: str, company_name: str, portal_url: Optional[str] = None, correlation_id: str = "-") -> bool:
         subject = f"Welcome to {company_name} — Your Account is Ready, {employee_name.split()[0]}!"
         body = _template("onboarding_welcome", employee_name=employee_name, designation=designation, employee_id=employee_id, email=email, joining_date=joining_date, reports_to_name=reports_to_name, company_name=company_name, portal_url=portal_url)
         return self.send([to], subject, body, template="onboarding_welcome", correlation_id=correlation_id)
@@ -134,18 +138,29 @@ class EmailService:
         self,
         to: str,
         ip: str,
-        country: str,
         user_agent: str,
         login_time: str,
+        device: Optional[str] = None,
         correlation_id: str = "-",
     ) -> bool:
-        subject = "New login to your Attendance account"
+        subject = "New sign-in to your Attendance account"
+        ip_display = (ip or "").strip()
+        ip_row = f"<tr><td>IP address</td><td>{ip_display}</td></tr>" if ip_display and is_public_ip(ip_display) else ""
+        login_ist = login_time or "unknown"
+        try:
+            dt = datetime.strptime((login_time or "").strip(), "%Y-%m-%d %H:%M:%S UTC").replace(
+                tzinfo=timezone.utc
+            )
+            login_ist = dt.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M IST")
+        except (ValueError, TypeError):
+            pass
         body = _template(
             "new_device_login",
-            ip=ip or "unknown",
-            country=country or "unknown",
-            user_agent=user_agent or "unknown",
+            ip_row=ip_row,
+            device=(device or "").strip() or "Unknown device",
+            user_agent=(user_agent or "").strip() or "Unknown browser",
             login_time=login_time or "unknown",
+            login_time_ist=login_ist,
         )
         return self.send([to], subject, body, template="new_device_login", correlation_id=correlation_id)
 
@@ -172,7 +187,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
-        <p class="cta">Please login to the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
+        <p class="cta">Please login to the <a href="{portal_url}/leaves">Attendance Portal</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
     """,
     "leave_applied_confirmation": """
         <div class="badge badge-info">Confirmation</div>
@@ -185,7 +200,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
         <p>You will receive an email notification once your manager reviews the request.</p>
-        <p class="cta">View your request on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View your request on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
     """,
     "leave_approved": """
         <div class="badge badge-success">Approved</div>
@@ -197,7 +212,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>Your leave credits have been adjusted accordingly. Please plan your work handover before the leave period.</p>
-        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
     """,
     "leave_rejected": """
         <div class="badge badge-danger">Rejected</div>
@@ -209,7 +224,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>If you have questions about this decision, please contact your manager directly.</p>
-        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
     """,
     "cancel_requested": """
         <div class="badge badge-warning">Cancellation Request</div>
@@ -251,7 +266,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
         </table>
-        <p class="cta">Please login to the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a> to approve or reject this request.</p>
+        <p class="cta">Please login to the <a href="{portal_url}/wfh">Attendance Portal</a> to approve or reject this request.</p>
     """,
     "wfh_approved": """
         <h2 style="color:#16a34a;margin:0 0 8px">WFH Approved</h2>
@@ -261,7 +276,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
         </table>
-        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/wfh">Attendance Portal</a>.</p>
     """,
     "wfh_rejected": """
         <h2 style="color:#dc2626;margin:0 0 8px">WFH Rejected</h2>
@@ -272,7 +287,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>Please contact your manager if you have any questions.</p>
-        <p class="cta">View on the <a href="https://attendance.variyaslabs.com/wfh">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/wfh">Attendance Portal</a>.</p>
     """,
     "onboarding_welcome": """
         <div class="badge badge-success">Welcome Aboard</div>
@@ -308,26 +323,46 @@ _EMAIL_TEMPLATES = {
         <p style="color:#bf2600;font-size:13px"><strong>Warning:</strong> This will permanently delete the selected project(s) and all associated issues, memberships, and data. This action cannot be undone.</p>
     """,
     "new_device_login": """
-        <div class="badge badge-warning">New device login</div>
+        <div class="badge badge-warning">Security alert</div>
+        <h2 style="margin:0 0 8px;font-size:18px">New sign-in to your account</h2>
         <p>Hello,</p>
-        <p>We noticed a login to your Attendance account from a device we haven't seen before. If this was you, no action is needed. If you don't recognize this activity, please change your password immediately.</p>
-        <table class="details">
-            <tr><td>Login time (UTC)</td><td>{login_time}</td></tr>
-            <tr><td>IP address</td><td>{ip}</td></tr>
-            <tr><td>Country</td><td>{country}</td></tr>
-            <tr><td>User agent</td><td>{user_agent}</td></tr>
+        <p>Your account was just signed in from a new device. If this was you, you're all set — no action needed.</p>
+        <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;border-radius:8px;margin:18px 0">
+            <tr><td align="center" style="padding:20px 16px">
+                <p style="margin:0;font-size:17px;font-weight:700;color:#172b4d">{device}</p>
+                <p style="margin:6px 0 0;font-size:13px;color:#6b778c">{login_time} · {login_time_ist}</p>
+            </td></tr>
         </table>
-        <p>If this wasn't you, sign in and change your password, then contact your admin.</p>
+        <table class="details">
+            {ip_row}
+        </table>
+        <p style="color:#8993a4;font-size:12px">Browser details: {user_agent}</p>
+        <div style="background:#ffebe6;border-left:4px solid #bf2600;padding:14px 16px;border-radius:8px;margin:18px 0">
+            <p style="margin:0 0 10px;font-size:14px;color:#172b4d"><strong>Don't recognize this activity?</strong> Secure your account immediately.</p>
+            <p style="margin:0;text-align:center"><a href="{portal_url}" style="display:inline-block;background:#bf2600;color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;padding:10px 22px;border-radius:8px">Review my account →</a></p>
+        </div>
     """,
 }
 
 
 def _template(name: str, **kwargs) -> str:
+    # Company identity: explicit caller values win, otherwise resolve from
+    # company settings row → env → generic defaults. No hardcoded brand/URLs.
+    if not kwargs.get("portal_url"):
+        kwargs["portal_url"] = resolve_portal_url()
+    if not kwargs.get("brand_name"):
+        kwargs["brand_name"] = resolve_brand_name()
+    if not kwargs.get("trademark"):
+        kwargs["trademark"] = resolve_trademark()
+    if not kwargs.get("company_name"):
+        kwargs["company_name"] = kwargs["brand_name"]
     tpl = _EMAIL_TEMPLATES.get(name, "")
     result = tpl
     for k, v in kwargs.items():
         result = result.replace("{" + k + "}", str(v or "—"))
     result = result.replace("\n        ", "\n").strip()
+    brand_name = kwargs["brand_name"]
+    trademark = kwargs["trademark"]
     return f"""<html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#172b4d;line-height:1.6">
@@ -337,7 +372,7 @@ def _template(name: str, **kwargs) -> str:
     <tr>
         <td style="background:linear-gradient(135deg,#1a2332,#2d3f54);padding:28px 36px;text-align:center">
             <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.3px">Attendance Portal</h1>
-            <p style="margin:4px 0 0;color:#8899aa;font-size:12px">Variyas Labs</p>
+            <p style="margin:4px 0 0;color:#8899aa;font-size:12px">{brand_name}</p>
         </td>
     </tr>
     <tr>
@@ -365,7 +400,7 @@ def _template(name: str, **kwargs) -> str:
                 This is an automated notification from the Attendance Portal.<br>
                 Please do not reply to this email. For assistance, contact your administrator.
             </p>
-            <p style="margin:10px 0 0;font-size:11px;color:#b3bac5">© Variyas Labs Attendance System</p>
+            <p style="margin:10px 0 0;font-size:11px;color:#b3bac5">© {trademark}</p>
         </td>
     </tr>
 </table>

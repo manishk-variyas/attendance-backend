@@ -61,7 +61,7 @@ def _serialize_session(s: Session, now: datetime) -> dict:
 
 @router.get("")
 @limiter.limit("10/minute")
-async def list_sessions(
+def list_sessions(
     request: Request,
     current_user: dict = Depends(get_current_user),
     search: Optional[str] = Query(None, max_length=100, description="Case-insensitive substring on email"),
@@ -122,7 +122,7 @@ async def list_sessions(
 
 @router.get("/{display_id}")
 @limiter.limit("10/minute")
-async def get_session_detail(
+def get_session_detail(
     request: Request,
     display_id: str,
     current_user: dict = Depends(get_current_user),
@@ -134,7 +134,7 @@ async def get_session_detail(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
         )
-    s = db.query(Session).filter(Session.display_id == display_id).first()
+    s =  db.query(Session).filter(Session.display_id == display_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
     return _serialize_session(s, datetime.now(timezone.utc))

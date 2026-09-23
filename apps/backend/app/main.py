@@ -206,3 +206,7 @@ app.include_router(admin_sessions_router, prefix="/api", tags=["admin-sessions"]
 from app.features.notifications.routes import router as notifications_router
 app.include_router(notifications_router, prefix="/api", tags=["notifications"])
 
+# Register Analytics routes
+from app.features.analytics.routes import router as analytics_router
+app.include_router(analytics_router, prefix="/api", tags=["analytics"])
+

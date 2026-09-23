@@ -350,7 +350,7 @@ async def validate_shift(
 
 
 @router.get("/server-time")
-async def get_server_time(
+def get_server_time(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
 ):
@@ -452,7 +452,7 @@ async def get_shifts_by_email(
 
 
 @router.get("/work-locations")
-async def get_work_locations(
+def get_work_locations(
     current_user: dict = Depends(get_current_user),
 ):
     return ["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "LEAVE"]
@@ -1081,7 +1081,7 @@ async def create_shift_definition(
 
 
 @router.get("/definitions")
-async def get_all_shift_definitions(
+def get_all_shift_definitions(
     request: Request,
     search: str = Query(None, description="Search by shift name"),
     country: str = Query(None, description="Filter by country"),

@@ -34,6 +34,12 @@ class LeaveApplyRequest(BaseModel):
     def upper_leave_type(cls, v: str) -> str:
         return v.strip().upper()
 
+class AdminLeaveCreateRequest(LeaveApplyRequest):
+    """Admin creates leave on behalf of an employee. Same fields as self-apply,
+    plus the target employee and an optional immediate approval."""
+    user_email: str = Field(..., min_length=3, max_length=255, description="Target employee's email")
+    auto_approve: bool = Field(default=False, description="Approve immediately instead of leaving pending")
+
 class LeaveHistoryItem(BaseModel):
     id: str
     user_id: Optional[str] = None

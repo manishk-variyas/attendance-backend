@@ -191,7 +191,7 @@ def _export_wfh_requests(db: Session, query, request: Request,
 
 @router.post("/request", status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
-async def request_wfh(
+def request_wfh(
     request: Request,
     payload: WfhRequestCreate,
     db: Session = Depends(get_db),
@@ -381,7 +381,7 @@ async def request_wfh(
 
 
 @router.get("/my-requests")
-async def get_my_wfh_requests(
+def get_my_wfh_requests(
     request: Request,
     status: Optional[str] = Query(None, description="pending, approved, rejected"),
     search: Optional[str] = Query(None, description="Search by reason"),
@@ -416,7 +416,7 @@ async def get_my_wfh_requests(
 
 
 @router.get("/pending")
-async def get_pending_wfh_requests(
+def get_pending_wfh_requests(
     request: Request,
     search: Optional[str] = Query(None, description="Search by name or email"),
     from_date: Optional[str] = Query(None, description="Start date filter (YYYY-MM-DD)"),
@@ -462,7 +462,7 @@ async def get_pending_wfh_requests(
 
 
 @router.get("/team-requests")
-async def get_team_wfh_requests(
+def get_team_wfh_requests(
     request: Request,
     status: Optional[str] = Query(None, description="pending, approved, rejected"),
     search: Optional[str] = Query(None, description="Search by name or email"),
@@ -511,7 +511,7 @@ async def get_team_wfh_requests(
 
 
 @router.get("/stats")
-async def get_wfh_stats(
+def get_wfh_stats(
     month: Optional[int] = Query(None, ge=1, le=12, description="Filter by month"),
     year: Optional[int] = Query(None, ge=2000, description="Filter by year"),
     db: Session = Depends(get_db),
@@ -530,7 +530,7 @@ def _get_wfh_by_id(db: Session, request_id: str) -> Optional[WfhRequest]:
 
 
 @router.put("/{request_id}/approve")
-async def approve_wfh_request(
+def approve_wfh_request(
     request: Request,
     request_id: str,
     db: Session = Depends(get_db),
@@ -577,7 +577,7 @@ async def approve_wfh_request(
 
 
 @router.put("/{request_id}/reject")
-async def reject_wfh_request(
+def reject_wfh_request(
     request: Request,
     request_id: str,
     payload: WfhRequestReject = WfhRequestReject(),
@@ -627,7 +627,7 @@ async def reject_wfh_request(
 
 @router.delete("/{request_id}", status_code=status.HTTP_204_NO_CONTENT)
 @limiter.limit("5/minute")
-async def delete_wfh_request(
+def delete_wfh_request(
     request: Request,
     request_id: str,
     db: Session = Depends(get_db),
@@ -678,7 +678,7 @@ async def delete_wfh_request(
 
 
 @router.get("/{request_id}")
-async def get_wfh_request(
+def get_wfh_request(
     request_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -693,7 +693,7 @@ async def get_wfh_request(
 
 @router.put("/{request_id}")
 @limiter.limit("5/minute")
-async def update_wfh_request(
+def update_wfh_request(
     request: Request,
     request_id: str,
     payload: WfhRequestUpdate,

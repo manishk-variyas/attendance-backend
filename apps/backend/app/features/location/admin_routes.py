@@ -43,7 +43,7 @@ def _to_response(loc: OfficeLocation) -> dict:
 
 
 @router.post("", response_model=OfficeLocationResponse, status_code=status.HTTP_201_CREATED)
-async def create_office_location(
+def create_office_location(
     request: Request,
     payload: OfficeLocationCreate,
     db: Session = Depends(get_db),
@@ -93,7 +93,7 @@ async def create_office_location(
 
 
 @router.get("")
-async def list_office_locations(
+def list_office_locations(
     request: Request,
     category: str = None,
     search: str = Query(None, description="Search by location name"),
@@ -174,7 +174,7 @@ async def list_office_locations(
 
 
 @router.get("/{location_id}", response_model=OfficeLocationResponse)
-async def get_office_location(
+def get_office_location(
     location_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -187,7 +187,7 @@ async def get_office_location(
 
 
 @router.put("/{location_id}", response_model=OfficeLocationResponse)
-async def update_office_location(
+def update_office_location(
     request: Request,
     location_id: str,
     payload: OfficeLocationUpdate,
@@ -251,7 +251,7 @@ async def update_office_location(
 
 
 @router.delete("/{location_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_office_location(
+def delete_office_location(
     request: Request,
     location_id: str,
     db: Session = Depends(get_db),

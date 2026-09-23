@@ -19,7 +19,7 @@ def _to_response(lt: LeaveTypeConfig) -> dict:
 
 
 @router.get("")
-async def list_leave_types(
+def list_leave_types(
     search: Optional[str] = Query(None, description="Search by code or name"),
     is_active: Optional[bool] = Query(None, description="Filter by active status"),
     sort_by: str = Query("name", description="name, code, created_at"),
@@ -61,7 +61,7 @@ async def list_leave_types(
 
 @router.post("", response_model=LeaveTypeResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("10/minute")
-async def create_leave_type(
+def create_leave_type(
     request: Request,
     payload: LeaveTypeCreate,
     db: Session = Depends(get_db),
@@ -90,7 +90,7 @@ async def create_leave_type(
 
 @router.put("/{leave_type_id}", response_model=LeaveTypeResponse)
 @limiter.limit("10/minute")
-async def update_leave_type(
+def update_leave_type(
     request: Request,
     leave_type_id: str,
     payload: LeaveTypeUpdate,
@@ -123,7 +123,7 @@ async def update_leave_type(
 
 @router.delete("/{leave_type_id}", status_code=status.HTTP_204_NO_CONTENT)
 @limiter.limit("10/minute")
-async def delete_leave_type(
+def delete_leave_type(
     request: Request,
     leave_type_id: str,
     db: Session = Depends(get_db),

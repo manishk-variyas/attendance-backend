@@ -8,7 +8,7 @@ router = APIRouter(prefix="/countries", tags=["countries"])
 
 
 @router.get("")
-async def list_countries(
+def list_countries(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):

@@ -12,6 +12,7 @@ from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import (
     LeaveApplyRequest, 
+    AdminLeaveCreateRequest,
     LeaveHistoryItem, 
     EmployeeLeaveBalanceSummary,
     LeaveTypeOption,
@@ -46,7 +47,7 @@ async def get_balance(
 
 @router.get("/leave-types", response_model=List[LeaveTypeOption])
 @limiter.limit("30/minute")
-async def list_active_leave_types(
+def list_active_leave_types(
     request: Request,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -274,7 +275,7 @@ async def get_team_leaves(
 
 
 @router.get("/holidays")
-async def get_holidays(
+def get_holidays(
     request: Request,
     search: str = Query(None, description="Search by holiday name"),
     holiday_type: str = Query(None, description="Filter: GAZETTED, RESTRICTED"),
@@ -363,7 +364,7 @@ async def get_holidays(
     }
 
 @router.delete("/holidays/{holiday_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_holiday(
+def delete_holiday(
     holiday_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -490,6 +491,114 @@ async def apply_leave(
     return {"message": "Leave application submitted successfully", "leave_id": leave_id, "leave_ids": result["leave_ids"], "created": result["created"], "balance": bal}
 
 
+@router.post("/create")
+@limiter.limit("10/minute")
+async def admin_create_leave(
+    request: Request,
+    payload: AdminLeaveCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    leave_service: LeaveBusinessService = Depends(get_leave_business_service),
+    _: None = Depends(require_admin),
+):
+    """Admin creates leave on behalf of an employee (e.g. sick, unreachable).
+
+    Same fields and validations as self-apply, plus the target employee and
+    an optional immediate approval. Pending leaves notify the approver;
+    auto-approved leaves notify only the employee.
+    """
+    admin_email = current_user.get("email", "")
+    admin_name = current_user.get("username") or admin_email.split("@")[0]
+
+    # 1. Resolve the target employee
+    target = db.query(EmployeeMaster).filter(
+        EmployeeMaster.user_email == payload.user_email.strip().lower()
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Employee not found: {payload.user_email}")
+    if not target.is_active or (target.status and target.status != "active"):
+        raise HTTPException(status_code=400, detail=f"Employee account is not active: {payload.user_email}")
+    if not target.keycloak_user_id:
+        raise HTTPException(status_code=400, detail=f"Employee has no linked login account: {payload.user_email}")
+
+    # 2. Create via the shared service (same validations as self-apply)
+    result = await leave_service.apply_for_leave(
+        target.keycloak_user_id,
+        target.user_email,
+        payload,
+        notify_approver=not payload.auto_approve,
+    )
+
+    start_str = payload.start_date.strftime("%Y-%m-%d") if hasattr(payload.start_date, "strftime") else str(payload.start_date)
+    end_str = payload.end_date.strftime("%Y-%m-%d") if hasattr(payload.end_date, "strftime") else str(payload.end_date)
+
+    # 3. Optionally approve immediately (chunked: batch caps at 50 ids)
+    auto_approved = False
+    if payload.auto_approve:
+        ids = result["leave_ids"]
+        for i in range(0, len(ids), 50):
+            await leave_service.batch_approve_leaves(ids[i:i + 50], current_user)
+        resuming_str = payload.resuming_date.strftime("%Y-%m-%d") if payload.resuming_date and hasattr(payload.resuming_date, "strftime") else ""
+        await leave_service.notify_leave_approved(target.user_email, start_str, end_str, resuming_str)
+        auto_approved = True
+
+    # 4. In-app notifications: always the employee; approver only when pending
+    schedule_notification(
+        background_tasks,
+        user_id=target.id,
+        category="leave_applied",
+        title="Leave created for you by admin",
+        message=f"{admin_name} created a leave for you from {start_str} to {end_str}.",
+        priority="normal",
+        actor_name=admin_name,
+        link="/leaves",
+    )
+    if not auto_approved:
+        approver_emp = None
+        if payload.approver_id:
+            approver_emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == payload.approver_id).first()
+        if not approver_emp and target.reports_to:
+            approver_emp = db.query(EmployeeMaster).filter(EmployeeMaster.redmine_user_id == target.reports_to).first()
+        if approver_emp:
+            schedule_notification(
+                background_tasks,
+                user_id=approver_emp.id,
+                category="leave_applied",
+                title="New Leave Request",
+                message=f"{admin_name} created a leave for {target.first_name} {target.last_name} from {start_str} to {end_str}.",
+                priority="normal",
+                actor_name=admin_name,
+                link="/leaves",
+            )
+
+    # 5. Audit trail (leaves table has no created_by column)
+    audit_logger.info(
+        f"Admin {admin_email} created leave for {target.user_email} (auto_approved={auto_approved})",
+        extra={
+            "correlation_id": request.state.correlation_id,
+            "extra_data": {
+                "action": "admin_create_leave",
+                "admin_email": admin_email,
+                "target_email": target.user_email,
+                "leave_ids": result["leave_ids"],
+                "auto_approve": auto_approved,
+                "client_ip": _get_client_ip(request),
+            },
+        },
+    )
+
+    return {
+        "message": "Leave created successfully",
+        "leave_id": result["leave_id"],
+        "leave_ids": result["leave_ids"],
+        "created": result["created"],
+        "balance": result["balance"],
+        "target_email": target.user_email,
+        "auto_approved": auto_approved,
+    }
+
+
 @router.post("/emergency")
 @limiter.limit("3/minute")
 async def emergency_leave(
@@ -501,7 +610,7 @@ async def emergency_leave(
     user_id = current_user.get("sub")
     email = current_user.get("email")
     reason = payload.get("reason") if payload else None
-    return leave_service.emergency_leave(user_id, email, reason)
+    return await leave_service.emergency_leave(user_id, email, reason)
 
 @router.get("/pending")
 async def get_pending_leaves(
@@ -838,7 +947,7 @@ async def reject_cancel_leave(
 
 
 @router.get("/{leave_id}", response_model=LeaveHistoryItem)
-async def get_leave_by_id(
+def get_leave_by_id(
     leave_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -893,7 +1002,7 @@ async def get_leave_by_id(
 
 @router.delete("/{leave_id}")
 @limiter.limit("5/minute")
-async def delete_leave(
+def delete_leave(
     request: Request,
     leave_id: str,
     db: Session = Depends(get_db),

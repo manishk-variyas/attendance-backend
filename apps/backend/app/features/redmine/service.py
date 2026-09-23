@@ -364,6 +364,8 @@ class RedmineService:
 
     def _build_issue_response(self, i: dict) -> IssueResponse:
         assigned = i.get("assigned_to")
+        parent = i.get("parent") or {}
+        children = i.get("children") or []
         return IssueResponse(
             id=i["id"],
             subject=i["subject"],
@@ -387,12 +389,14 @@ class RedmineService:
             tracker_id=i["tracker"]["id"],
             author_id=i["author"]["id"],
             author_name=i["author"]["name"],
+            parent_issue_id=parent.get("id"),
+            subtasks_count=len(children),
         )
 
     async def get_issues_for_user(self, user_id: int) -> List[IssueResponse]:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{self.url}/issues.json?assigned_to_id={user_id}&include=attachments,custom_fields",
+                f"{self.url}/issues.json?assigned_to_id={user_id}&include=attachments,custom_fields,children",
                 headers=self.headers,
             )
             response.raise_for_status()
@@ -401,7 +405,7 @@ class RedmineService:
 
     async def get_issues_for_project(self, project_id: int, assigned_to_id: int = None) -> List[IssueResponse]:
         async with httpx.AsyncClient() as client:
-            url = f"{self.url}/issues.json?project_id={project_id}&include=attachments,custom_fields"
+            url = f"{self.url}/issues.json?project_id={project_id}&include=attachments,custom_fields,children"
             if assigned_to_id is not None:
                 url += f"&assigned_to_id={assigned_to_id}"
             response = await client.get(url, headers=self.headers)

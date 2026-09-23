@@ -55,3 +55,7 @@ def db_session():
 @pytest.fixture()
 def client_admin():
     app.dependency_overrides[get_db] = _override_get_db
+
+
+
+

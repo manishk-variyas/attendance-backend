@@ -590,7 +590,7 @@ def check_out(
 
 
 @router.get("/pending")
-async def get_pending_attendance(
+def get_pending_attendance(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
@@ -753,37 +753,7 @@ def get_today_attendance(
                     s = "shift_ended"
                 return _build_status_response(db, shift_att, today, s)
 
-        # OLD OPPORTUNISTIC CHECK-IN REMINDER (commented out — replaced by scripts/checkin_reminder_cron.py)
-        # The cron script now owns missed check-in reminders and runs every 15 min regardless of
-        # whether the user opens the app. The dedup flag (shift.checkin_reminder_sent) makes this safe to keep
-        # commented out — the cron is the source of truth. To re-enable this fast-path, uncomment below.
-        #
-        # if not shift_att and not on_leave_today and not getattr(shift, "checkin_reminder_sent", False):
-        #     company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        #     checkin_delay = company.checkin_reminder_delay_minutes if company and company.checkin_reminder_delay_minutes else 30
-        #     if now > start_dt + timedelta(minutes=checkin_delay):
-        #         user_email = current_user.get("email")
-        #         if not user_email:
-        #             emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
-        #             if emp:
-        #                 user_email = emp.user_email
-        #         if user_email:
-        #             emp = db.query(EmployeeMaster).filter(EmployeeMaster.keycloak_user_id == keycloak_user_id).first()
-        #             emp_name = f"{emp.first_name} {emp.last_name}".strip() if (emp and emp.first_name) else current_user.get("preferred_username", user_email)
-        #             start_str = sd.start_time.strftime("%H:%M") if (sd and sd.start_time) else "Scheduled Time"
-        #             try:
-        #                 email_service.send_missed_checkin_reminder(
-        #                     to=user_email,
-        #                     employee_name=emp_name,
-        #                     shift_date=shift.date.isoformat(),
-        #                     shift_start_time=start_str,
-        #                 )
-        #                 shift.checkin_reminder_sent = True
-        #                 db.commit()
-        #                 logger.info(f"Sent missed check-in email reminder to {user_email} for shift {shift.date}")
-        #             except Exception as e:
-        #                 logger.error(f"Failed to send missed check-in email reminder: {e}")
-
+        
         if on_leave_today or shift.work_location_status == "LEAVE":
             return _no_attendance_response("on_leave", shift, sd, tz, today)
 
@@ -811,7 +781,7 @@ def get_today_attendance(
 
 
 @router.get("/today/shifts", response_model=TodayShiftsResponse)
-async def get_today_shifts(
+def get_today_shifts(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
@@ -932,7 +902,7 @@ def _shift_attendance_to_dict(p: ShiftAttendance) -> dict:
 
 
 @router.post("/shifts/check-in", status_code=status.HTTP_201_CREATED)
-async def shift_check_in(
+def shift_check_in(
     request: Request,
     payload: ShiftCheckInRequest,
     db: Session = Depends(get_db),
@@ -970,7 +940,7 @@ async def shift_check_in(
 
 
 @router.post("/shifts/check-out")
-async def shift_check_out(
+def shift_check_out(
     request: Request,
     payload: ShiftCheckOutRequest,
     db: Session = Depends(get_db),
@@ -1132,7 +1102,7 @@ def _no_attendance_response(status: str, shift: Shift, sd: ShiftDefinition, tz: 
 
 
 @router.get("/project/{project_id}")
-async def get_project_attendance(
+def get_project_attendance(
     project_id: int,
     from_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
@@ -1242,7 +1212,7 @@ async def get_project_attendance(
 
 
 @router.get("/my-projects")
-async def get_my_projects_attendance(
+def get_my_projects_attendance(
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -1597,7 +1567,7 @@ def _get_attendance_paginated(
 
 
 @router.get("/my-attendance")
-async def get_my_attendance(
+def get_my_attendance(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
@@ -1656,7 +1626,7 @@ async def get_my_attendance(
 
 
 @router.get("/team-attendance")
-async def get_team_attendance(
+def get_team_attendance(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),

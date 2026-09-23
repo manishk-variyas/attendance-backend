@@ -17,6 +17,8 @@ services:
     volumes:
       # Persist database data across container restarts
       - keycloak_db_data:/var/lib/postgresql/data
+    ports:
+      - "192.168.122.101:5433:5432"
     environment:
       # Variables are substituted from infra/.env or environment
       POSTGRES_DB: ${POSTGRES_DB}

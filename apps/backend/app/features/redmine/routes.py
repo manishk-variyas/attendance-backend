@@ -19,6 +19,7 @@ from .constants import REDMINE_TIMEZONES
 from app.features.auth.dependencies import get_current_user
 from app.core.limiter import limiter
 from app.utils.audit import audit_logger
+from app.utils.email_bg import send_email_bg
 from app.middleware.logging import _get_client_ip
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -121,7 +122,7 @@ router = APIRouter()
 #  GET /api/redmine/timezones  — Redmine-compatible timezone list    #
 # ------------------------------------------------------------------ #
 @router.get("/redmine/timezones", response_model=List[TimeZoneInfo])
-async def list_timezones(
+def list_timezones(
     current_user: dict = Depends(get_current_user),
 ):
     """Return the full list of Redmine-compatible timezones.
@@ -325,7 +326,7 @@ async def list_redmine_users(
 
 
 @router.get("/projects", response_model=List[dict])
-async def list_all_projects(
+def list_all_projects(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -480,7 +481,7 @@ async def delete_project(
 
 @router.post("/projects/delete-request")
 @limiter.limit("5/minute")
-async def request_project_delete(
+def request_project_delete(
     request: Request,
     payload: ProjectDeleteRequest,
     db: Session = Depends(get_db),
@@ -537,7 +538,8 @@ async def request_project_delete(
     db.add(token)
     db.commit()
 
-    email_service.send_delete_verification(admin_email, otp, len(resolved), 10, resource_type="project")
+    # Off-loop: smtplib blocks for seconds; never await it in the request path.
+    send_email_bg(email_service.send_delete_verification, admin_email, otp, len(resolved), 10, resource_type="project")
 
     return {
         "request_id": token_id,
@@ -639,7 +641,7 @@ async def confirm_project_delete(
 
 @router.get("/admin/projects", response_model=AdminProjectListResponse)
 @limiter.limit("30/minute")
-async def list_admin_projects(
+def list_admin_projects(
     request: Request,
     q: Optional[str] = Query(None, max_length=100, description="Search name, identifier, description, custom fields"),
     status_filter: Optional[str] = Query(None, alias="status", description="active, closed, archived, or all"),
@@ -676,7 +678,7 @@ async def list_admin_projects(
 
 @router.get("/admin/projects/{project_id}", response_model=AdminProjectDetail)
 @limiter.limit("30/minute")
-async def get_admin_project_detail(
+def get_admin_project_detail(
     request: Request,
     project_id: int,
     current_user: dict = Depends(get_current_user),
@@ -765,7 +767,7 @@ async def get_all_user_projects(
 
 
 @router.get("/projects/all/issues", response_model=List[IssueResponse])
-async def get_all_project_issues(
+def get_all_project_issues(
     team: Optional[bool] = Query(False, description="Set to true to view your team's issues. Admin/PM/PC only."),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -835,7 +837,7 @@ def _build_issues_excel(records: list) -> BytesIO:
     ws.title = "Issues"
     ws.append(["ID", "Subject", "Description", "Status", "Priority", "Tracker", "Project",
                "Assigned To", "Author", "Created On", "Updated On", "Start Date", "Due Date",
-               "Estimated Hours", "Done Ratio"])
+               "Estimated Hours", "Done Ratio", "Parent Issue ID", "Subtasks Count"])
     for r in records:
         ws.append([
             r.get("id"),
@@ -853,6 +855,8 @@ def _build_issues_excel(records: list) -> BytesIO:
             r.get("due_date"),
             r.get("estimated_hours"),
             r.get("done_ratio"),
+            r.get("parent_issue_id"),
+            r.get("subtasks_count", 0),
         ])
     output = BytesIO()
     wb.save(output)
@@ -885,7 +889,7 @@ def _export_issues(request: Request, current_user: dict, records: list, label: s
 
 @router.get("/my-issues/paginated", response_model=IssueListResponse)
 @limiter.limit("30/minute")
-async def get_my_issues_paginated(
+def get_my_issues_paginated(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
@@ -936,7 +940,7 @@ async def get_my_issues_paginated(
 
 @router.get("/team-issues", response_model=IssueListResponse)
 @limiter.limit("30/minute")
-async def get_team_issues_paginated(
+def get_team_issues_paginated(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
@@ -1027,7 +1031,7 @@ async def get_user_issues_by_id(
     return await redmine_service.get_issues_for_user(user_id)
 
 @router.get("/my-projects", response_model=List[ProjectResponse])
-async def get_my_projects(
+def get_my_projects(
     user_id: Optional[int] = Query(None, description="Admin/PM/PC: view another user's projects"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1101,7 +1105,7 @@ async def get_my_issues(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/project-members/{project_id}", response_model=List[ProjectMember])
-async def get_project_members(
+def get_project_members(
     project_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1135,7 +1139,7 @@ async def get_project_members(
 
 
 @router.get("/projects/{project_id}/members")
-async def list_project_members(
+def list_project_members(
     project_id: int,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
@@ -1412,7 +1416,7 @@ async def global_search(
 
 
 @router.get("/redmine/trackers")
-async def list_trackers(
+def list_trackers(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1422,7 +1426,7 @@ async def list_trackers(
 
 
 @router.get("/redmine/priorities")
-async def list_priorities(
+def list_priorities(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1432,7 +1436,7 @@ async def list_priorities(
 
 
 @router.get("/redmine/statuses")
-async def list_statuses(
+def list_statuses(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1442,7 +1446,7 @@ async def list_statuses(
 
 
 @router.get("/redmine/users")
-async def list_users(
+def list_users(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1452,7 +1456,7 @@ async def list_users(
 
 
 @router.get("/redmine/custom_fields")
-async def list_custom_fields(
+def list_custom_fields(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1462,7 +1466,7 @@ async def list_custom_fields(
 
 
 @router.get("/redmine/issues/search")
-async def search_redmine_issues(
+def search_redmine_issues(
     q: str = Query(..., min_length=1, description="Search query"),
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
     limit: int = Query(20, ge=1, le=100),
@@ -1478,7 +1482,7 @@ async def search_redmine_issues(
 
 
 @router.get("/redmine/versions")
-async def list_versions(
+def list_versions(
     project_id: int = Query(..., description="Project ID"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1492,7 +1496,7 @@ async def list_versions(
 
 
 @router.get("/redmine/categories")
-async def list_categories(
+def list_categories(
     project_id: int = Query(..., description="Project ID"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1566,6 +1570,22 @@ async def create_redmine_issue(
             status_code=status.HTTP_409_CONFLICT,
             detail="An issue with this subject already exists in this project",
         )
+
+    # Subtask validation: parent must exist and live in the same project
+    # (Redmine rejects cross-project subtasks). Membership of the parent's
+    # project is covered by the project membership check below.
+    if issue_data.parent_issue_id is not None:
+        parent_project_id = sql.get_issue_project_id(issue_data.parent_issue_id)
+        if parent_project_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Parent issue #{issue_data.parent_issue_id} not found",
+            )
+        if parent_project_id != issue_data.project_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Subtask must belong to the same project as its parent issue #{issue_data.parent_issue_id}",
+            )
 
     # Build issue payload
     issue_attrs = issue_data.model_dump(exclude_none=True)
@@ -1825,7 +1845,7 @@ async def upload_issue_attachment(
 
 
 @router.get("/redmine/issues/{issue_id}")
-async def get_redmine_issue(
+def get_redmine_issue(
     issue_id: int,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -1839,6 +1859,87 @@ async def get_redmine_issue(
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
     return {"status": "success", "issue": issue}
+
+
+@router.get("/redmine/issues/{issue_id}/subtasks", response_model=IssueListResponse)
+@limiter.limit("30/minute")
+def get_issue_subtasks(
+    issue_id: int,
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    sort_by: str = Query("updated_on", description="updated_on, created_on, subject, priority, status, due_date, done_ratio, project_name"),
+    sort_dir: str = Query("desc", description="asc or desc"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    status_id: Optional[int] = Query(None, description="Filter by status id"),
+    priority_id: Optional[int] = Query(None, description="Filter by priority id"),
+    tracker_id: Optional[int] = Query(None, description="Filter by tracker id"),
+    search: Optional[str] = Query(None, description="Search subject or author name"),
+    export: bool = Query(False, description="Export as Excel spreadsheet"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List subtasks of an issue.
+
+    Same pagination, filters, response shape, and role-based security
+    as the team-issues endpoint — scoped to children of ``issue_id``.
+    """
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in ["Admin", "Project Manager", "Project Coordinator", "Technical Resource"]):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    sql = RedmineSQLService(db)
+    rm_user = sql.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+
+    parent_project_id = sql.get_issue_project_id(issue_id)
+    if parent_project_id is None:
+        raise HTTPException(status_code=404, detail="Parent issue not found")
+
+    is_admin = "Admin" in roles
+    is_pm_or_pc = "Project Manager" in roles or "Project Coordinator" in roles
+
+    scope_user_id = None
+    include_authored = False
+    if not is_admin:
+        if is_pm_or_pc:
+            if not sql.is_project_member(rm_user["id"], parent_project_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this issue's project",
+                )
+        else:  # Technical Resource: parent must be theirs, children scoped to them
+            assigned_to = sql.get_issue_assigned_to(issue_id)
+            author_id = sql.get_issue_author_id(issue_id)
+            if assigned_to != rm_user["id"] and author_id != rm_user["id"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You can only view subtasks of tickets you created or are assigned to",
+                )
+            scope_user_id = rm_user["id"]
+            include_authored = True
+
+    records, total = sql.get_issues_paginated(
+        scope_user_id=scope_user_id,
+        include_authored=include_authored,
+        parent_id=issue_id,
+        status_id=status_id,
+        priority_id=priority_id,
+        tracker_id=tracker_id,
+        search=(search or "").strip()[:100] or None,
+        from_date=_parse_issue_date(from_date),
+        to_date=_parse_issue_date(to_date, add_day=True),
+        sort_by=sort_by,
+        sort_dir=sort_dir if sort_dir in ("asc", "desc") else "desc",
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        export=export,
+    )
+    if export:
+        return _export_issues(request, current_user, records, "subtasks")
+    return _paginated_response(records, total, page, page_size)
 
 
 @router.delete("/redmine/issues/{issue_id}")
@@ -1927,6 +2028,26 @@ async def update_redmine_issue(
             )
     else:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    # Subtask validation: new parent must exist, share the issue's project,
+    # and not be the issue itself (deeper cycles are rejected by Redmine).
+    if issue_data.parent_issue_id is not None:
+        if issue_data.parent_issue_id == issue_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="An issue cannot be a subtask of itself",
+            )
+        parent_project_id = sql.get_issue_project_id(issue_data.parent_issue_id)
+        if parent_project_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Parent issue #{issue_data.parent_issue_id} not found",
+            )
+        if parent_project_id != issue_pid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Subtask must belong to the same project as its parent issue #{issue_data.parent_issue_id}",
+            )
 
     # Build issue payload
     issue_attrs = issue_data.model_dump(exclude_none=True)

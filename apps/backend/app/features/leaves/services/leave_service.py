@@ -1,5 +1,4 @@
 from datetime import datetime, timezone, date, timedelta
-import asyncio
 import io
 import logging
 from io import BytesIO
@@ -53,11 +52,10 @@ class LeaveBusinessService:
         return emp.user_email if emp else None
 
     def _send_email_bg(self, method, *args):
-        try:
-            loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, method, *args)
-        except RuntimeError:
-            pass
+        # Shared helper offloads to a worker thread and logs failures —
+        # never silently swallow mail errors (see app/utils/email_bg.py).
+        from app.utils.email_bg import send_email_bg
+        send_email_bg(method, *args)
 
     async def validate_leave_dates(self, start_date: datetime, end_date: datetime, user_id: str = None, leave_dates: list = None) -> dict:
         IST = ZoneInfo("Asia/Kolkata")
@@ -136,8 +134,12 @@ class LeaveBusinessService:
             "warnings": warnings,
         }
 
-    async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest) -> dict:
-        """Submit a new leave application with overlap protection."""
+    async def apply_for_leave(self, user_id: str, email: str, leave_data: LeaveApplyRequest, notify_approver: bool = True) -> dict:
+        """Submit a new leave application with overlap protection.
+
+        notify_approver=False skips the "new request" email to the approver —
+        used when an admin creates a pre-approved leave (nothing to approve).
+        """
         lt = self.leave_db.db.execute(
             select(LeaveTypeConfig).where(
                 LeaveTypeConfig.code == leave_data.leave_type,
@@ -275,34 +277,46 @@ class LeaveBusinessService:
         )
 
         approver_email = None
-        if leave_data.approver_id:
-            emp = self.leave_db.db.execute(
-                select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == leave_data.approver_id)
-            ).scalars().first()
-            if emp and emp.user_email:
-                approver_email = emp.user_email
-        if not approver_email:
-            applicant_emp = self.leave_db.db.execute(
-                select(EmployeeMaster).where(EmployeeMaster.user_email == email)
-            ).scalars().first()
-            if applicant_emp and applicant_emp.reports_to:
-                mgr = self.leave_db.db.execute(
-                    select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == applicant_emp.reports_to)
+        if notify_approver:
+            if leave_data.approver_id:
+                emp = self.leave_db.db.execute(
+                    select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == leave_data.approver_id)
                 ).scalars().first()
-                if mgr and mgr.user_email:
-                    approver_email = mgr.user_email
-        if approver_email:
-            self._send_email_bg(
-                email_service.send_leave_applied,
-                approver_email,
-                applicant_name,
-                start_str,
-                end_str,
-                reason_str,
-                resuming_str,
-            )
+                if emp and emp.user_email:
+                    approver_email = emp.user_email
+            if not approver_email:
+                applicant_emp = self.leave_db.db.execute(
+                    select(EmployeeMaster).where(EmployeeMaster.user_email == email)
+                ).scalars().first()
+                if applicant_emp and applicant_emp.reports_to:
+                    mgr = self.leave_db.db.execute(
+                        select(EmployeeMaster).where(EmployeeMaster.redmine_user_id == applicant_emp.reports_to)
+                    ).scalars().first()
+                    if mgr and mgr.user_email:
+                        approver_email = mgr.user_email
+            if approver_email:
+                self._send_email_bg(
+                    email_service.send_leave_applied,
+                    approver_email,
+                    applicant_name,
+                    start_str,
+                    end_str,
+                    reason_str,
+                    resuming_str,
+                )
 
         return {"leave_id": leave_ids[0], "leave_ids": leave_ids, "created": len(leave_ids), "balance": balance_info}
+
+    async def notify_leave_approved(self, user_email: str, start_str: str, end_str: str, resuming_str: str = "") -> None:
+        """Send a single leave-approved email covering the whole range."""
+        self._send_email_bg(
+            email_service.send_leave_approved,
+            user_email,
+            self._get_employee_name(user_email),
+            start_str,
+            end_str,
+            resuming_str,
+        )
 
     def emergency_leave(self, user_id: str, email: str, reason: str = None) -> dict:
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date()

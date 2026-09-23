@@ -14,6 +14,7 @@ from app.models.password_reset import PasswordResetToken
 from app.models.delete_verification import DeleteVerificationToken
 from app.models.login_attempt import LoginAttempt
 from app.models.notification import Notification
+from app.models.trusted_device import TrustedDevice, LoginAlertCooldown
 
 __all__ = [
     "Base",
@@ -30,4 +31,6 @@ __all__ = [
     "DeleteVerificationToken",
     "LoginAttempt",
     "Notification",
+    "TrustedDevice",
+    "LoginAlertCooldown",
 ]

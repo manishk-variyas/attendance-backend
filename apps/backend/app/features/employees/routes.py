@@ -27,6 +27,8 @@ from app.features.employees.service import employee_to_dict, get_employees_pagin
 from app.services.email_service import email_service
 from app.utils.storage import storage_service
 from app.utils.audit import audit_logger
+from app.utils.company import resolve_brand_name, resolve_portal_url
+from app.utils.email_bg import send_email_bg
 from app.utils.excel import build_employees_excel
 from app.middleware.logging import _get_client_ip
 from app.models.system_setting import SystemSetting
@@ -52,7 +54,7 @@ router = APIRouter(prefix="/employees", tags=["employees"])
 
 
 @router.get("/me", response_model=UserProfileResponse)
-async def get_my_profile(
+def get_my_profile(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
@@ -249,7 +251,7 @@ async def upload_profile_picture(
 
 
 @router.get("/v1")
-async def list_employees_v1(
+def list_employees_v1(
     request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
@@ -416,7 +418,7 @@ async def list_employees_v1(
 
 
 @router.get("/suggest")
-async def suggest_employees(
+def suggest_employees(
     q: str = Query(..., min_length=1, description="Search prefix for email or name"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -432,7 +434,7 @@ async def suggest_employees(
 
 
 @router.get("/{employee_id}/projects")
-async def employee_projects(
+def employee_projects(
     employee_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -580,7 +582,7 @@ async def onboard_employee(
     db.refresh(emp)
     try:
         company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        company_name = company.company_name if company and company.company_name else "Variyas Labs"
+        company_name = (company.company_name if company and company.company_name else None) or resolve_brand_name()
         employee_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
         background_tasks.add_task(
             email_service.send_onboarding_welcome,
@@ -592,7 +594,7 @@ async def onboard_employee(
             emp.joining_date.isoformat() if emp.joining_date else "—",
             emp.reports_to_name or "—",
             company_name,
-            "https://attendance.variyaslabs.com/",
+            resolve_portal_url(),
         )
     except Exception as e:
         logger.warning(f"Failed to schedule onboarding welcome email for {emp.user_email}: {e}")
@@ -623,7 +625,7 @@ async def update_employee_status(
 
 
 @router.patch("/{employee_id}/location")
-async def update_employee_location(
+def update_employee_location(
     employee_id: str,
     payload: EmployeeLocationUpdate,
     db: Session = Depends(get_db),
@@ -646,7 +648,7 @@ async def update_employee_location(
 
 
 @router.patch("/{employee_id}/activate")
-async def toggle_employee_active(
+def toggle_employee_active(
     employee_id: str,
     payload: EmployeeActiveToggle,
     db: Session = Depends(get_db),
@@ -944,7 +946,7 @@ def _hash_otp(otp: str) -> str:
 
 
 @router.post("/delete-request", status_code=status.HTTP_200_OK)
-async def request_delete_verification(
+def request_delete_verification(
     payload: DeleteRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -998,7 +1000,8 @@ async def request_delete_verification(
     db.add(token)
     db.commit()
 
-    email_service.send_delete_verification(admin_email, otp, len(ids), 10)
+    # Off-loop: smtplib blocks for seconds; never await it in the request path.
+    send_email_bg(email_service.send_delete_verification, admin_email, otp, len(ids), 10)
 
     return {"request_id": token_id, "expires_at": expires_at.isoformat(), "count": len(ids), "message": f"Verification code sent to {admin_email}"}
 
@@ -1158,7 +1161,7 @@ async def nuke_employee(
 
 
 @router.get("/by-email/{email}", response_model=EmployeeResponse)
-async def get_employee_by_email(
+def get_employee_by_email(
     email: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),

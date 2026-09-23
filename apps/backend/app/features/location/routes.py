@@ -66,7 +66,7 @@ def _loc_name(db: Session, lat: float, lng: float, location_id) -> str:
     return f"{lat:.4f}, {lng:.4f}"
 
 @router.post("", response_model=LocationSaveResponse)
-async def save_location(
+def save_location(
     payload: LocationSaveRequest,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
@@ -107,7 +107,7 @@ async def save_location(
     return result
 
 @router.get("/{email}", response_model=LocationGetResponse)
-async def get_location(
+def get_location(
     email: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
