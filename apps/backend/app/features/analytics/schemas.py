@@ -38,6 +38,7 @@ class TeamMemberAttendance(BaseModel):
     redmine_user_id: Optional[int] = None
     name: str
     email: str = ""
+    has_login: bool = False
     present_days: int = 0
     absent_days: int = 0
     leave_days: int = 0
@@ -61,6 +62,9 @@ class TeamAttendanceResponse(BaseModel):
     working_days: int
     group_by: str = "day"
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     members: List[TeamMemberAttendance] = []
     totals: Dict[str, float] = {}
     daily: List[TeamDayAttendance] = []
@@ -95,6 +99,7 @@ class PunctualityTeamMember(BaseModel):
     redmine_user_id: Optional[int] = None
     name: str
     email: str = ""
+    has_login: bool = False
     late_days: int = 0
     total_checkins: int = 0
     avg_check_in: Optional[str] = None
@@ -106,6 +111,9 @@ class PunctualityTeam(BaseModel):
     to_date: str
     late_threshold: int = 3
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     habitual_count: int = 0
     ranking: List[PunctualityTeamMember] = []
     by_weekday: Dict[str, int] = {}
@@ -135,6 +143,7 @@ class AbsenteeismTeamMember(BaseModel):
     redmine_user_id: Optional[int] = None
     name: str
     email: str = ""
+    has_login: bool = False
     absent_days: int = 0
     longest_streak: int = 0
     monday_absences: int = 0
@@ -154,6 +163,9 @@ class AbsenteeismTeam(BaseModel):
     to_date: str
     streak_threshold: int = 3
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     members: List[AbsenteeismTeamMember] = []
     red_flags: List[AbsenceRedFlag] = []
     zero_attendance: List[str] = []
@@ -208,6 +220,7 @@ class TeamTicketMember(BaseModel):
     redmine_user_id: int
     name: str
     email: str = ""
+    has_login: bool = False
     open_now: int = 0
     overdue_now: int = 0
     created_in_range: int = 0
@@ -226,6 +239,9 @@ class TeamTicketsResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     members: List[TeamTicketMember] = []
     by_project: List[TeamTicketProject] = []
     totals: Dict[str, int] = {}
@@ -276,6 +292,7 @@ class TeamLeaveMember(BaseModel):
     redmine_user_id: Optional[int] = None
     name: str
     email: str = ""
+    has_login: bool = False
     applied: int = 0
     approved: int = 0
     pending: int = 0
@@ -286,6 +303,9 @@ class TeamLeavesResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     members: List[TeamLeaveMember] = []
     totals: Dict[str, int] = {}
     monthly: List[MonthlyLeavePoint] = []
@@ -323,6 +343,7 @@ class TeamWfhMember(BaseModel):
     redmine_user_id: Optional[int] = None
     name: str
     email: str = ""
+    has_login: bool = False
     total: int = 0
     approved: int = 0
     pending: int = 0
@@ -333,6 +354,9 @@ class TeamWfhResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
     members: List[TeamWfhMember] = []
     totals: Dict[str, int] = {}
     monthly: List[MonthlyWfhPoint] = []
@@ -360,3 +384,24 @@ class OutTodayResponse(BaseModel):
     on_leave: List[OutTodayLeave] = []
     on_wfh: List[OutTodayWfh] = []
     counts: Dict[str, int] = {}
+
+
+# ── Per-member drill-down (tickets / leaves / wfh) ─────────────────────────
+# Defined last so the referenced summary models above already exist.
+
+class TicketMemberDetail(BaseModel):
+    """One employee's ticket analytics in a single call."""
+    user: MemberInfo
+    tickets: TicketSummaryMe
+
+
+class LeaveMemberDetail(BaseModel):
+    """One employee's leave activity in a single call."""
+    user: MemberInfo
+    leaves: LeaveSummaryMe
+
+
+class WfhMemberDetail(BaseModel):
+    """One employee's WFH activity in a single call."""
+    user: MemberInfo
+    wfh: WfhSummaryMe

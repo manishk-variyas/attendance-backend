@@ -19,6 +19,7 @@ from app.features.analytics.schemas import (
     AbsenteeismMe,
     AbsenteeismTeam,
     AttendanceSummary,
+    LeaveMemberDetail,
     LeaveSummaryMe,
     MemberAttendanceDetail,
     OutTodayResponse,
@@ -28,7 +29,9 @@ from app.features.analytics.schemas import (
     TeamLeavesResponse,
     TeamTicketsResponse,
     TeamWfhResponse,
+    TicketMemberDetail,
     TicketSummaryMe,
+    WfhMemberDetail,
     WfhSummaryMe,
 )
 from app.features.analytics.service import MAX_RANGE_DAYS, AnalyticsService
@@ -76,6 +79,70 @@ def _require_roles(current_user: dict, allowed: list) -> list:
     return roles
 
 
+def _resolve_member_target(
+    svc: AnalyticsService,
+    current_user: dict,
+    roles: list,
+    rm_user: dict,
+    redmine_user_id: Optional[int],
+    user_email: Optional[str],
+    project_id: Optional[int],
+) -> tuple[str, dict]:
+    """Resolve (keycloak_user_id, user_info) for a per-member analytics target.
+
+    Two server-resolved paths (never trust a client "self" flag):
+      - Self: the requested id/email equals the viewer's own Redmine identity.
+        Allowed for any member role; keycloak id comes from the session.
+      - Lead: Admin/PM/PC requesting a target inside their team scope.
+    Raises 400 (no identifier), 403 (non-lead asking for another user),
+    404 (out of scope / not linked to an employee login).
+    """
+    target_email = (user_email or "").strip().lower()
+    if redmine_user_id is None and not target_email:
+        raise HTTPException(status_code=400, detail="redmine_user_id is required")
+
+    viewer_redmine_id = rm_user["id"]
+    viewer_email = (rm_user.get("mail") or "").strip().lower()
+    is_self = (
+        (redmine_user_id is not None and redmine_user_id == viewer_redmine_id)
+        or (redmine_user_id is None and bool(viewer_email) and target_email == viewer_email)
+    )
+    if is_self:
+        kc_id = current_user.get("sub")
+        if not kc_id:
+            raise HTTPException(status_code=400, detail="User id not found in session")
+        return str(kc_id), {
+            "redmine_user_id": viewer_redmine_id,
+            "name": f"{rm_user.get('firstname', '')} {rm_user.get('lastname', '')}".strip(),
+            "email": rm_user.get("mail") or "",
+        }
+
+    if not any(r in roles for r in _LEAD_ROLES):
+        raise HTTPException(status_code=403, detail="You can only view your own analytics")
+
+    try:
+        scope_where, scope_params = svc.team_scope(roles, viewer_redmine_id, project_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+    if redmine_user_id is not None:
+        target = svc.find_team_member(scope_where, scope_params, redmine_user_id=redmine_user_id)
+    else:
+        target = svc.find_team_member(scope_where, scope_params, user_email=target_email)
+    if not target:
+        raise HTTPException(status_code=404, detail="Employee not found in your team scope")
+    if not target["keycloak_user_id"]:
+        raise HTTPException(
+            status_code=404,
+            detail="No analytics data for this account (not linked to an employee login)",
+        )
+    return target["keycloak_user_id"], {
+        "redmine_user_id": target["redmine_user_id"],
+        "name": target["name"],
+        "email": target["email"],
+    }
+
+
 @router.get("/attendance/me", response_model=AttendanceSummary)
 @limiter.limit("30/minute")
 def my_attendance(
@@ -105,6 +172,9 @@ def team_attendance(
     sort_dir: str = Query("asc", description="asc or desc"),
     group_by: str = Query("day", description="day, week, or month buckets for the daily grid"),
     hide_empty: bool = Query(False, description="Hide members with no attendance rows"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (member list)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -123,12 +193,13 @@ def team_attendance(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     return svc.attendance_team(
-        members, from_d, to_d,
+        scope_where, scope_params, from_d, to_d,
         sort_by=sort_by, sort_dir=sort_dir, group_by=group_by, hide_empty=hide_empty,
+        page=page, page_size=page_size,
     )
 
 
@@ -136,7 +207,8 @@ def team_attendance(
 @limiter.limit("30/minute")
 def member_attendance(
     request: Request,
-    user_email: str = Query(..., description="Target employee's email"),
+    redmine_user_id: Optional[int] = Query(None, description="Target employee's Redmine user id (preferred)"),
+    user_email: Optional[str] = Query(None, description="Deprecated fallback: target employee's email"),
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Restrict the target lookup to one project"),
@@ -145,42 +217,22 @@ def member_attendance(
 ):
     """One employee's full attendance analytics: summary + punctuality + absenteeism.
 
-    Admin/PM/PC only. The target must be inside the viewer's scope (same project
-    membership rules as /team); others get 404 so cross-team probing leaks nothing.
+    Self (any role) or Admin/PM/PC within team scope. See _resolve_member_target.
     """
-    roles = _require_roles(current_user, _LEAD_ROLES)
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in _MEMBER_ROLES):
+        raise HTTPException(status_code=403, detail="Access denied")
     _check_project(db, project_id)
     svc = AnalyticsService(db)
     rm_user = svc.rm.get_user_by_email(current_user.get("email"))
     if not rm_user:
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
-
-    target_email = (user_email or "").strip().lower()
-    if not target_email:
-        raise HTTPException(status_code=400, detail="user_email is required")
-    try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    target = next((m for m in members if (m["email"] or "").lower() == target_email), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="Employee not found in your team scope")
-    if not target["keycloak_user_id"]:
-        # Test/vendor/service Redmine accounts have no employee login and
-        # therefore no attendance rows — nothing to analyse.
-        raise HTTPException(
-            status_code=404,
-            detail="No attendance data for this account (not linked to an employee login)",
-        )
-
-    kc_id = target["keycloak_user_id"]
+    kc_id, user_info = _resolve_member_target(
+        svc, current_user, roles, rm_user, redmine_user_id, user_email, project_id
+    )
     return {
-        "user": {
-            "redmine_user_id": target["redmine_user_id"],
-            "name": target["name"],
-            "email": target["email"],
-        },
+        "user": user_info,
         "attendance": svc.attendance_me(kc_id, from_d, to_d),
         "punctuality": svc.punctuality_me(kc_id, from_d, to_d),
         "absenteeism": svc.absenteeism_me(kc_id, from_d, to_d),
@@ -213,6 +265,9 @@ def team_punctuality(
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     late_min: int = Query(3, ge=1, le=31, description="Late days marking a habitual latecomer"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (ranking)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -225,10 +280,10 @@ def team_punctuality(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.punctuality_team(members, from_d, to_d, late_min=late_min)
+    return svc.punctuality_team(scope_where, scope_params, from_d, to_d, late_min=late_min, page=page, page_size=page_size)
 
 
 @router.get("/attendance/absenteeism/me", response_model=AbsenteeismMe)
@@ -257,6 +312,9 @@ def team_absenteeism(
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     streak_min: int = Query(3, ge=2, le=31, description="Consecutive absent days marking a red flag"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (member list)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -269,10 +327,10 @@ def team_absenteeism(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.absenteeism_team(members, from_d, to_d, streak_min=streak_min)
+    return svc.absenteeism_team(scope_where, scope_params, from_d, to_d, streak_min=streak_min, page=page, page_size=page_size)
 
 
 @router.get("/tickets/me", response_model=TicketSummaryMe)
@@ -301,6 +359,9 @@ def team_tickets(
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (member list)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -312,11 +373,39 @@ def team_tickets(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    team_ids = {m["redmine_user_id"] for m in members}
-    return svc.tickets_team(team_ids, from_d, to_d, project_id)
+    return svc.tickets_team(scope_where, scope_params, from_d, to_d, project_id, page=page, page_size=page_size)
+
+
+@router.get("/tickets/member", response_model=TicketMemberDetail)
+@limiter.limit("30/minute")
+def member_tickets(
+    request: Request,
+    redmine_user_id: Optional[int] = Query(None, description="Target employee's Redmine user id (preferred)"),
+    user_email: Optional[str] = Query(None, description="Deprecated fallback: target employee's email"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
+    project_id: Optional[int] = Query(None, description="Restrict the target lookup to one project"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One employee's ticket analytics. Self (any role) or Admin/PM/PC in scope."""
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in _MEMBER_ROLES):
+        raise HTTPException(status_code=403, detail="Access denied")
+    _check_project(db, project_id)
+    svc = AnalyticsService(db)
+    rm_user = svc.rm.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+    from_d, to_d = _parse_range(from_date, to_date)
+    _kc_id, user_info = _resolve_member_target(
+        svc, current_user, roles, rm_user, redmine_user_id, user_email, project_id
+    )
+    # tickets_me keys on the Redmine user id.
+    return {"user": user_info, "tickets": svc.tickets_me(user_info["redmine_user_id"], from_d, to_d)}
 
 
 @router.get("/leaves/me", response_model=LeaveSummaryMe)
@@ -344,6 +433,9 @@ def team_leaves(
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (member list)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -355,10 +447,38 @@ def team_leaves(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.leaves_team(members, from_d, to_d)
+    return svc.leaves_team(scope_where, scope_params, from_d, to_d, page=page, page_size=page_size)
+
+
+@router.get("/leaves/member", response_model=LeaveMemberDetail)
+@limiter.limit("30/minute")
+def member_leaves(
+    request: Request,
+    redmine_user_id: Optional[int] = Query(None, description="Target employee's Redmine user id (preferred)"),
+    user_email: Optional[str] = Query(None, description="Deprecated fallback: target employee's email"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
+    project_id: Optional[int] = Query(None, description="Restrict the target lookup to one project"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One employee's leave activity. Self (any role) or Admin/PM/PC in scope."""
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in _MEMBER_ROLES):
+        raise HTTPException(status_code=403, detail="Access denied")
+    _check_project(db, project_id)
+    svc = AnalyticsService(db)
+    rm_user = svc.rm.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+    from_d, to_d = _parse_range(from_date, to_date)
+    kc_id, user_info = _resolve_member_target(
+        svc, current_user, roles, rm_user, redmine_user_id, user_email, project_id
+    )
+    return {"user": user_info, "leaves": svc.leaves_me(kc_id, from_d, to_d)}
 
 
 @router.get("/wfh/me", response_model=WfhSummaryMe)
@@ -386,6 +506,9 @@ def team_wfh(
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
+    search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
+    page: int = Query(1, ge=1, description="Page number (member list)"),
+    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -397,10 +520,38 @@ def team_wfh(
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
     try:
-        members = svc.resolve_team_members(roles, rm_user["id"], project_id)
+        scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.wfh_team(members, from_d, to_d)
+    return svc.wfh_team(scope_where, scope_params, from_d, to_d, page=page, page_size=page_size)
+
+
+@router.get("/wfh/member", response_model=WfhMemberDetail)
+@limiter.limit("30/minute")
+def member_wfh(
+    request: Request,
+    redmine_user_id: Optional[int] = Query(None, description="Target employee's Redmine user id (preferred)"),
+    user_email: Optional[str] = Query(None, description="Deprecated fallback: target employee's email"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
+    project_id: Optional[int] = Query(None, description="Restrict the target lookup to one project"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One employee's WFH activity. Self (any role) or Admin/PM/PC in scope."""
+    roles = current_user.get("roles", [])
+    if not any(r in roles for r in _MEMBER_ROLES):
+        raise HTTPException(status_code=403, detail="Access denied")
+    _check_project(db, project_id)
+    svc = AnalyticsService(db)
+    rm_user = svc.rm.get_user_by_email(current_user.get("email"))
+    if not rm_user:
+        raise HTTPException(status_code=404, detail="User not found in Redmine")
+    from_d, to_d = _parse_range(from_date, to_date)
+    kc_id, user_info = _resolve_member_target(
+        svc, current_user, roles, rm_user, redmine_user_id, user_email, project_id
+    )
+    return {"user": user_info, "wfh": svc.wfh_me(kc_id, from_d, to_d)}
 
 
 @router.get("/team/out-today", response_model=OutTodayResponse)

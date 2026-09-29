@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import date, timedelta, datetime, timezone
 from io import BytesIO
@@ -6,7 +5,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import openpyxl
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -15,6 +14,7 @@ from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_active
 from app.features.wfh.schemas import WfhRequestCreate, WfhRequestUpdate, WfhRequestReject
 from app.features.wfh.service import wfh_service
+from app.features.redmine.sql_service import RedmineSQLService
 from app.models.wfh_request import WfhRequest
 from app.models.employee_master import EmployeeMaster
 from app.models.holiday import Holiday
@@ -52,20 +52,12 @@ def _can_approve(db: Session, current_user: dict, target_email: str) -> bool:
             EmployeeMaster.user_email == target_email
         ).first()
         if requester_emp and requester_emp.redmine_user_id:
-            from app.features.redmine.service import redmine_service
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            reviewer = loop.run_until_complete(redmine_service.get_user_by_email(reviewer_email))
-            requester = loop.run_until_complete(redmine_service.get_user_by_email(target_email))
-            if reviewer and requester:
-                rp = loop.run_until_complete(redmine_service.get_projects_for_user(reviewer["id"]))
-                tp = loop.run_until_complete(redmine_service.get_projects_for_user(requester["id"]))
-                if {p.id for p in rp} & {p.id for p in tp}:
-                    return True
+            # Direct DB lookup (sync) — no event loop needed inside a sync route.
+            sql = RedmineSQLService(db)
+            reviewer = sql.get_user_by_email(reviewer_email)
+            requester = sql.get_user_by_email(target_email)
+            if reviewer and requester and sql.check_project_access(reviewer["id"], requester["id"]):
+                return True
     return False
 
 
@@ -194,6 +186,7 @@ def _export_wfh_requests(db: Session, query, request: Request,
 def request_wfh(
     request: Request,
     payload: WfhRequestCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
@@ -365,9 +358,10 @@ def request_wfh(
                 approver_email = manager.user_email
 
     if approver_email:
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(
-            None, email_service.send_wfh_requested,
+        # BackgroundTasks runs the blocking SMTP send in the threadpool after
+        # the response — safe from a sync route (no event loop here).
+        background_tasks.add_task(
+            email_service.send_wfh_requested,
             approver_email, applicant_name,
             start_date.isoformat(), end_date.isoformat(),
             payload.reason or "No reason provided",
@@ -533,6 +527,7 @@ def _get_wfh_by_id(db: Session, request_id: str) -> Optional[WfhRequest]:
 def approve_wfh_request(
     request: Request,
     request_id: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
@@ -567,8 +562,8 @@ def approve_wfh_request(
 
     applicant_name = _batch_user_names(db, [result.user_email]).get(result.user_email, result.user_email)
     logger.info(f"Dispatching WFH approval email to {result.user_email}")
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, email_service.send_wfh_approved,
+    background_tasks.add_task(
+        email_service.send_wfh_approved,
         result.user_email, applicant_name,
         result.start_date.isoformat(), result.end_date.isoformat(),
         result.resuming_date.isoformat() if result.resuming_date else "")
@@ -580,6 +575,7 @@ def approve_wfh_request(
 def reject_wfh_request(
     request: Request,
     request_id: str,
+    background_tasks: BackgroundTasks,
     payload: WfhRequestReject = WfhRequestReject(),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -616,8 +612,8 @@ def reject_wfh_request(
 
     applicant_name = _batch_user_names(db, [result.user_email]).get(result.user_email, result.user_email)
     logger.info(f"Dispatching WFH rejection email to {result.user_email}")
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, email_service.send_wfh_rejected,
+    background_tasks.add_task(
+        email_service.send_wfh_rejected,
         result.user_email, applicant_name,
         result.start_date.isoformat(), result.end_date.isoformat(),
         result.resuming_date.isoformat() if result.resuming_date else "")

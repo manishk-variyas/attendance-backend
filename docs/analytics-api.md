@@ -38,6 +38,19 @@ Rate limit: 30 requests/minute. Auth: session cookie (same as all APIs).
 - `absent_days = working_days − present_days − leave_days` (min 0) — missing punches count as absent.
 - `attendance_pct = present_days / working_days × 100`.
 
+### Per-member drill-downs (shared rules)
+`/attendance/member`, `/tickets/member`, `/leaves/member`, `/wfh/member` share one
+access model and one target key:
+
+- Provide `redmine_user_id` (preferred — the value on the `/…/team` rows) or
+  `user_email` (deprecated fallback).
+- **Self:** any authenticated role may request their own id/email.
+- **Lead:** Admin / Project Manager / Project Coordinator may request any target
+  in their team scope. A non-lead asking for someone else gets `403`.
+- Out-of-scope/unknown target or an account with no employee login ⇒ `404`.
+- Team rows now carry **`has_login: bool`** — disable the drill-down when `false`
+  (e.g. test/vendor Redmine accounts have no attendance to analyse).
+
 ---
 
 ## 1. My attendance summary
@@ -88,13 +101,22 @@ Field notes: `daily` has one entry per recorded row (sorted by date).
 ## 1b. One employee's attendance drill-down
 
 ```
-GET /api/analytics/attendance/member?user_email=abhilash@variyaslabs.com&from_date=2026-09-01&to_date=2026-09-11&project_id=33
+GET /api/analytics/attendance/member?redmine_user_id=20&from_date=2026-09-01&to_date=2026-09-11&project_id=33
 ```
-Roles: Admin, Project Manager, Project Coordinator only.
-`user_email` **required**. `project_id` optional (restricts the target lookup).
-The target must be inside the viewer's scope — same project-membership rules as
-`/attendance/team`. A target outside scope (or unknown) returns **`404 Employee
-not found in your team scope`** so cross-team probing leaks nothing.
+Access — two server-resolved paths (never trust a client "self" flag):
+- **Self:** any authenticated role may request **their own** `redmine_user_id`
+  (or their own email). The viewer is computed from the session, not the client.
+- **Lead:** Admin / Project Manager / Project Coordinator may request a target
+  **inside their team scope** (same project-membership rules as `/attendance/team`).
+
+`redmine_user_id` preferred (stable, unique — matches the value returned by
+`/attendance/team`); `user_email` is a **deprecated fallback**. `project_id`
+optional (restricts the lead lookup).
+
+Errors: `400` when neither identifier is supplied; `403` when a non-lead asks for
+someone other than themselves; `404` when the target is out of scope **or** the
+account has no linked login (test/vendor/service accounts). The user's `/me`
+endpoints remain the lightweight self-dashboard.
 
 Returns the employee's attendance summary, punctuality and absenteeism in a
 single call (same shapes as sections 1 / 2a / 2c):
@@ -108,10 +130,12 @@ single call (same shapes as sections 1 / 2a / 2c):
 }
 ```
 
-Errors: `400` empty `user_email`; `404` target not in scope **or** account has no
-attendance data (test/vendor/service accounts with no employee login);
-`422` missing `user_email`. To build a picker, use the `/attendance/team`
-list (already returns name + email) or the employee suggest endpoint.
+Errors: `400` when neither `redmine_user_id` nor `user_email` is provided;
+`403` when a non-lead requests someone other than themselves; `404` target not
+in scope **or** account has no attendance data (test/vendor/service accounts
+with no employee login). To build a picker, use the `/attendance/team` list
+(already returns `redmine_user_id`, name, email) or the employee suggest
+endpoint.
 
 ---
 
@@ -366,6 +390,28 @@ over `members`.
 
 ---
 
+## 4b. One employee's ticket analytics
+
+```
+GET /api/analytics/tickets/member?redmine_user_id=72&from_date=2026-09-01&to_date=2026-09-29
+```
+Self (any role) or Admin/PM/PC in scope — same access model as §1b. Returns the
+same `tickets` payload as §3 plus the `user` identity:
+
+```json
+{
+  "user": { "redmine_user_id": 72, "name": "Himanshu Pokhariya", "email": "himanshu@variyaslabs.com" },
+  "tickets": { "open_now": 4, "overdue_now": 1, "created_in_range": 2, "closed_in_range": 1,
+               "authored_in_range": 1, "avg_resolution_days": 2.5,
+               "by_status": [], "by_priority": [], "by_tracker": [], "trend": [] }
+}
+```
+
+Errors: `400` no identifier · `403` non-lead for another user · `404` out of
+scope / no linked login.
+
+---
+
 ## Leaves & WFH counting rules
 
 - Counts cover requests **overlapping** `[from_date, to_date]` (the time off
@@ -448,6 +494,27 @@ Roles: Admin, Project Manager, Project Coordinator only.
 
 ---
 
+## 6b. One employee's leave activity
+
+```
+GET /api/analytics/leaves/member?redmine_user_id=72&from_date=2026-09-01&to_date=2026-09-29
+```
+Self (any role) or Admin/PM/PC in scope. Returns the same `leaves` payload as §5
+plus the `user` identity:
+
+```json
+{
+  "user": { "redmine_user_id": 72, "name": "Himanshu Pokhariya", "email": "himanshu@variyaslabs.com" },
+  "leaves": { "applied": 4, "approved": 2, "pending": 1, "rejected": 1, "cancelled": 0,
+              "approved_days": 2, "by_type": [], "by_status": [], "trend": [], "monthly": [] }
+}
+```
+
+Errors: `400` no identifier · `403` non-lead for another user · `404` out of
+scope / no linked login.
+
+---
+
 ## 7. My WFH activity
 
 ```
@@ -504,6 +571,27 @@ Roles: Admin, Project Manager, Project Coordinator only.
   "monthly": [{ "month": "2026-09", "total": 0, "approved": 0, "approved_days": 0 }]
 }
 ```
+
+---
+
+## 8b. One employee's WFH activity
+
+```
+GET /api/analytics/wfh/member?redmine_user_id=72&from_date=2026-09-01&to_date=2026-09-29
+```
+Self (any role) or Admin/PM/PC in scope. Returns the same `wfh` payload as §7
+plus the `user` identity:
+
+```json
+{
+  "user": { "redmine_user_id": 72, "name": "Himanshu Pokhariya", "email": "himanshu@variyaslabs.com" },
+  "wfh": { "total": 3, "pending": 1, "approved": 2, "rejected": 0, "approved_days": 2,
+           "by_status": [], "trend": [], "monthly": [] }
+}
+```
+
+Errors: `400` no identifier · `403` non-lead for another user · `404` out of
+scope / no linked login.
 
 ---
 

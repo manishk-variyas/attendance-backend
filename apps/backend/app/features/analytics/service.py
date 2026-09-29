@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.features.redmine.sql_service import RedmineSQLService
+from app.utils.pagination import paginate_text
 
 MAX_RANGE_DAYS = 366
 _LEAVE_STATUSES = {"leave", "on_leave", "on leave"}
@@ -97,12 +98,17 @@ class AnalyticsService:
             "by_status": dict(Counter((r[2] or "unknown") for r in rows)),
         }
 
-    def resolve_team_members(self, roles: list, rm_user_id: int, project_id: Optional[int]) -> list:
-        """Return [{redmine_user_id, keycloak_user_id, name, email}] for the viewer's team.
+    def team_scope(self, roles: list, rm_user_id: int, project_id: Optional[int],
+                     search: Optional[str] = None) -> tuple[str, dict]:
+        """Build the (WHERE fragment, params) filtering redmine.users (alias ``u``)
+        to the viewer's team scope, with optional name search.
 
         - Admin: project members when project_id given, else all active employees.
         - PM/PC: members sharing a project with the viewer (+ self), optionally
           narrowed to one project (viewer must belong to it).
+        May raise PermissionError. The fragment also references ``e``
+        (default email_addresses row) and ``em`` (employee_master) joins, so
+        callers must include those joins with the same aliases.
         """
         is_admin = "Admin" in roles
         if is_admin:
@@ -119,25 +125,87 @@ class AnalyticsService:
             else:
                 rm_ids = team_ids
 
-        if rm_ids is not None and not rm_ids:
-            return []
-        rows = self.db.execute(
-            text("""
-                SELECT u.id, u.firstname || ' ' || u.lastname AS name,
-                       e.address AS email, em.keycloak_user_id
-                FROM redmine.users u
-                JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
-                LEFT JOIN employee_master em ON em.redmine_user_id = u.id
-                WHERE u.status = 1
-                  AND (:all_ids OR u.id = ANY(:ids))
-                ORDER BY name
+        params: dict = {}
+        clauses = ["u.status = 1"]
+        if rm_ids is not None:
+            if not rm_ids:
+                return "FALSE", {}
+            clauses.append("u.id = ANY(:ids)")
+            params["ids"] = list(rm_ids)
+        term = (search or "").strip()[:100]
+        if term:
+            clauses.append("(u.firstname || ' ' || u.lastname) ILIKE :search")
+            params["search"] = f"%{term}%"
+        return " AND ".join(clauses), params
+
+    _MEMBER_JOINS = """
+        FROM redmine.users u
+        JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+        LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+    """
+
+    _MEMBER_COLS = """
+        u.id AS redmine_user_id,
+        u.firstname || ' ' || u.lastname AS name,
+        e.address AS email,
+        em.keycloak_user_id AS keycloak_user_id
+    """
+
+    @staticmethod
+    def _member_from_row(r) -> dict:
+        return {
+            "redmine_user_id": r[0],
+            "name": (r[1] or "").strip(),
+            "email": r[2] or "",
+            "keycloak_user_id": r[3],
+        }
+
+    def find_team_member(self, scope_where: str, scope_params: dict,
+                         redmine_user_id: Optional[int] = None,
+                         user_email: Optional[str] = None) -> Optional[dict]:
+        """Single scoped member lookup (LIMIT 1) for drill-down targets."""
+        filt, params = dict(scope_params), ""
+        if redmine_user_id is not None:
+            filt["rid"] = redmine_user_id
+            params = "AND u.id = :rid"
+        elif (user_email or "").strip():
+            filt["email"] = (user_email or "").strip().lower()
+            params = "AND LOWER(e.address) = :email"
+        else:
+            return None
+        row = self.db.execute(
+            text(f"""
+                SELECT {self._MEMBER_COLS} {self._MEMBER_JOINS}
+                WHERE {scope_where} {params}
+                LIMIT 1
             """),
-            {"all_ids": rm_ids is None, "ids": list(rm_ids) if rm_ids is not None else []},
+            filt,
+        ).fetchone()
+        return self._member_from_row(row) if row else None
+
+    def resolve_team_members(self, roles: list, rm_user_id: int, project_id: Optional[int],
+                             search: Optional[str] = None) -> list:
+        """Return [{redmine_user_id, keycloak_user_id, name, email}] for the viewer's team.
+
+        - Admin: project members when project_id given, else all active employees.
+        - PM/PC: members sharing a project with the viewer (+ self), optionally
+          narrowed to one project (viewer must belong to it).
+        Optional ``search`` filters by full name at the database level.
+
+        Full-list variant kept for snapshot endpoints (e.g. out-today) that
+        genuinely need every member; paged team endpoints must use
+        :meth:`page_team_members` instead.
+        """
+        scope_where, scope_params = self.team_scope(roles, rm_user_id, project_id, search)
+        rows = self.db.execute(
+            text(f"""
+                SELECT {self._MEMBER_COLS} {self._MEMBER_JOINS}
+                WHERE {scope_where}
+                ORDER BY name ASC, redmine_user_id ASC
+            """),
+            scope_params,
         ).fetchall()
-        return [
-            {"redmine_user_id": r[0], "name": (r[1] or "").strip(), "email": r[2] or "", "keycloak_user_id": r[3]}
-            for r in rows
-        ]
+        return [self._member_from_row(r) for r in rows]
 
     def _project_member_ids(self, project_id: int) -> set:
         rows = self.db.execute(
@@ -210,9 +278,30 @@ class AnalyticsService:
         })
         return summary
 
+    # Attendance row predicates shared by the member/totals/daily queries below.
+    # They mirror _is_present/_is_leave exactly (NULL-safe: FILTER keeps only TRUE).
+    _ATT_PRESENT = "LOWER(a.status::text) = 'present'"
+    _ATT_LEAVE = ("NOT (LOWER(a.status::text) = 'present') AND "
+                  "(UPPER(a.work_location_status::text) = 'LEAVE' OR "
+                  "LOWER(a.status::text) IN ('leave', 'on_leave', 'on leave'))")
+    _ATT_WFH = ("LOWER(a.status::text) = 'present' AND "
+                "UPPER(a.work_location_status::text) = 'WFH'")
+
+    def _attendance_scope_join(self, hide_empty: bool) -> str:
+        """JOIN fragment from the member-identity subquery to attendance rows.
+
+        hide_empty switches to an INNER JOIN so members without rows in range
+        disappear from member pages, counts and totals alike.
+        """
+        join = "JOIN" if hide_empty else "LEFT JOIN"
+        return f"""{join} attendance a ON a.keycloak_user_id = m.keycloak_user_id
+            AND a.attendance_date BETWEEN :f AND :t
+            AND COALESCE(a.is_deleted, false) = false"""
+
     def attendance_team(
         self,
-        members: list,
+        scope_where: str,
+        scope_params: dict,
         from_d: date,
         to_d: date,
         *,
@@ -220,78 +309,138 @@ class AnalyticsService:
         sort_dir: str = "asc",
         group_by: str = "day",
         hide_empty: bool = False,
+        page: int = 1,
+        page_size: int = 50,
     ) -> dict:
+        from app.utils.pagination import paginate_text
+
         working = self.working_days(from_d, to_d)
-        kids = [m["keycloak_user_id"] for m in members if m["keycloak_user_id"]]
-        rows = self._attendance_rows(kids, from_d, to_d)
+        if sort_by not in self._MEMBER_SORT_KEYS:
+            raise ValueError(f"Invalid sort_by. Use one of: {', '.join(sorted(self._MEMBER_SORT_KEYS))}")
+        direction = (sort_dir or "asc").lower()
+        if direction not in ("asc", "desc"):
+            raise ValueError("sort_dir must be 'asc' or 'desc'")
+        if group_by == "month":
+            trunc: str = "month"
+        elif group_by == "week":
+            trunc = "week"
+        elif group_by == "day":
+            trunc = "day"
+        else:
+            raise ValueError("group_by must be day, week, or month")
 
-        by_kid: dict = defaultdict(list)
-        for r in rows:
-            by_kid[r[0]].append(r)
-
+        identity = f"""SELECT u.id AS redmine_user_id,
+               u.firstname || ' ' || u.lastname AS name,
+               e.address AS email,
+               em.keycloak_user_id AS keycloak_user_id
+            FROM redmine.users u
+            JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+            LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+            WHERE {scope_where}"""
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
+               COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days,
+               COUNT(a.id) FILTER (WHERE a.is_late) AS late_days,
+               COALESCE(SUM(a.total_hours), 0) AS total_hours,
+               COUNT(a.id) FILTER (WHERE {self._ATT_WFH}) AS wfh_days
+            FROM ({identity}) m
+            {self._attendance_scope_join(hide_empty)}
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        # NOTE: name ordering uses COLLATE "C" (binary) to match the old
+        # Python-level sort exactly; the DB default collation sorts
+        # case-insensitively first ("ac@..." before "Akansha").
+        sort_map = {
+            "name": 'name COLLATE "C"',
+            "attendance_pct": f"COALESCE(present_days * 100.0 / NULLIF({working}, 0), 0)",
+            "present_days": "present_days",
+            "absent_days": f"({working} - present_days - leave_days)",
+            "late_days": "late_days",
+            "total_hours": "total_hours",
+        }
+        params = {**scope_params, "f": from_d, "t": to_d}
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            # Name tiebreak mirrors the old Python stable sort over the
+            # name-ordered member list; rm_id keeps it fully deterministic.
+            order_by=f"{sort_map[sort_by]} {direction.upper()}, name ASC, rm_id ASC",
+        )
         member_rows = []
-        totals = Counter()
-        total_hours = 0.0
-        for m in members:
-            s = self._summarize_rows(by_kid.get(m["keycloak_user_id"] or "", []), working)
-            if hide_empty and s["recorded_days"] == 0:
-                continue
-            total_hours += s["total_hours"]
-            for k in ("present_days", "absent_days", "leave_days", "wfh_days", "late_days"):
-                totals[k] += s[k]
+        for r in page_result.items:
+            present, leave, late = (r[4] or 0), (r[5] or 0), (r[6] or 0)
+            hours = round(float(r[7] or 0), 2)
+            wfh = r[8] or 0
+            absent = max(working - present - leave, 0)
             member_rows.append({
-                "redmine_user_id": m["redmine_user_id"],
-                "name": m["name"],
-                "email": m["email"],
-                "present_days": s["present_days"],
-                "absent_days": s["absent_days"],
-                "leave_days": s["leave_days"],
-                "wfh_days": s["wfh_days"],
-                "late_days": s["late_days"],
-                "total_hours": s["total_hours"],
-                "attendance_pct": s["attendance_pct"],
+                "redmine_user_id": r[0],
+                "name": (r[1] or "").strip(),
+                "email": r[2] or "",
+                "has_login": bool(r[3]),
+                "present_days": present,
+                "absent_days": absent,
+                "leave_days": leave,
+                "wfh_days": wfh,
+                "late_days": late,
+                "total_hours": hours,
+                "attendance_pct": round(present / working * 100, 1) if working else 0.0,
             })
-        reverse = sort_dir == "desc"
-        member_rows.sort(key=lambda x: x.get(sort_by, 0), reverse=reverse)
 
-        # Team grid grouped by day/week/month (working days carry absentees).
-        day_status = self._member_day_status(rows)
-        n = len(member_rows)
-        kid_of = {m["redmine_user_id"]: m["keycloak_user_id"] or "" for m in members}
-        buckets: dict = defaultdict(lambda: {"present": 0, "leave": 0})
+        n = page_result.total
+        agg = self.db.execute(
+            text(f"""SELECT
+                    COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present,
+                    COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave,
+                    COUNT(a.id) FILTER (WHERE a.is_late) AS late,
+                    COALESCE(SUM(a.total_hours), 0) AS hours,
+                    COUNT(a.id) FILTER (WHERE {self._ATT_WFH}) AS wfh
+                FROM ({identity}) m
+                {self._attendance_scope_join(hide_empty)}"""),
+            params,
+        ).fetchone()
+        present_total, leave_total = (agg[0] or 0), (agg[1] or 0)
+        totals = {
+            "present_days": present_total,
+            "absent_days": max(working * n - present_total - leave_total, 0),
+            "leave_days": leave_total,
+            "wfh_days": (agg[4] or 0),
+            "late_days": (agg[2] or 0),
+            "total_hours": round(float(agg[3] or 0), 2),
+        }
+
+        day_rows = self.db.execute(
+            text(f"""SELECT date_trunc('{trunc}', a.attendance_date)::date AS b,
+                    COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_PRESENT}) AS present,
+                    COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_LEAVE}) AS leave,
+                    COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_WFH}) AS wfh
+                FROM attendance a
+                JOIN ({identity}) m ON m.keycloak_user_id = a.keycloak_user_id
+                WHERE a.attendance_date BETWEEN :f AND :t
+                  AND COALESCE(a.is_deleted, false) = false
+                GROUP BY b ORDER BY b"""),
+            params,
+        ).fetchall()
+        per_bucket = {r[0]: {"present": r[1] or 0, "leave": r[2] or 0, "wfh": r[3] or 0} for r in day_rows}
         bucket_workdays: dict = defaultdict(int)
         for d in _date_range(from_d, to_d):
-            b = self._bucket(d, group_by)
             if d.weekday() < 5:
-                bucket_workdays[b] += 1
-            for m in member_rows:
-                st = day_status.get(kid_of[m["redmine_user_id"]], {}).get(d)
-                if st == "present":
-                    buckets[b]["present"] += 1
-                elif st == "leave":
-                    buckets[b]["leave"] += 1
-        # wfh per bucket from row-level location info (first WFH row per member-day wins).
-        wfh_by_bucket: dict = Counter()
-        seen_wfh: dict = defaultdict(set)
-        shown_kids = {kid_of[m["redmine_user_id"]] for m in member_rows}
-        for r in rows:
-            kid, day, status, loc = r[0], r[1], r[2], r[3]
-            if kid not in shown_kids:
-                continue
-            b = self._bucket(day, group_by)
-            if self._is_present(status) and (loc or "").upper() == "WFH" and day not in seen_wfh[(kid, b)]:
-                seen_wfh[(kid, b)].add(day)
-                wfh_by_bucket[b] += 1
+                bucket_workdays[self._bucket(d, group_by)] += 1
         daily = [
             {
                 "date": b.isoformat(),
-                "present": buckets[b]["present"],
-                "leave": buckets[b]["leave"],
-                "wfh": wfh_by_bucket.get(b, 0),
-                "absent": max(n * bucket_workdays[b] - buckets[b]["present"] - buckets[b]["leave"], 0),
+                "present": per_bucket.get(b, {}).get("present", 0),
+                "leave": per_bucket.get(b, {}).get("leave", 0),
+                "wfh": per_bucket.get(b, {}).get("wfh", 0),
+                "absent": max(
+                    n * bucket_workdays[b]
+                    - per_bucket.get(b, {}).get("present", 0)
+                    - per_bucket.get(b, {}).get("leave", 0), 0),
             }
-            for b in sorted(set(list(buckets) + list(bucket_workdays)))
-            if b in bucket_workdays or b in buckets
+            for b in sorted(set(list(per_bucket) + list(bucket_workdays)))
+            if b in bucket_workdays or b in per_bucket
         ]
 
         return {
@@ -300,8 +449,11 @@ class AnalyticsService:
             "working_days": working,
             "group_by": group_by,
             "member_count": n,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
             "members": member_rows,
-            "totals": {**{k: int(v) for k, v in totals.items()}, "total_hours": round(total_hours, 2)},
+            "totals": totals,
             "daily": daily,
         }
 
@@ -357,40 +509,146 @@ class AnalyticsService:
             ],
         }
 
-    def punctuality_team(self, members: list, from_d: date, to_d: date, late_min: int = 3) -> dict:
-        kids = [m["keycloak_user_id"] for m in members if m["keycloak_user_id"]]
-        rows = self._attendance_rows(kids, from_d, to_d)
-        by_kid: dict = defaultdict(list)
-        for r in rows:
-            by_kid[r[0]].append(r)
-        ranking, weekday_total = [], Counter()
-        for m in members:
-            mrows = by_kid.get(m["keycloak_user_id"] or "", [])
-            late = [r for r in mrows if r[7]]
-            for r in late:
-                weekday_total[self._WEEKDAY_LABELS[r[1].weekday()]] += 1
-            secs = [self._ist_secs(r[4]) for r in mrows if r[4] is not None]
+    def punctuality_team(self, scope_where: str, scope_params: dict,
+                           from_d: date, to_d: date, late_min: int = 3,
+                           page: int = 1, page_size: int = 50) -> dict:
+        from app.utils.pagination import paginate_text
+
+        identity = f"""SELECT u.id AS redmine_user_id,
+               u.firstname || ' ' || u.lastname AS name,
+               e.address AS email,
+               em.keycloak_user_id AS keycloak_user_id
+            FROM redmine.users u
+            JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+            LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+            WHERE {scope_where}"""
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(a.id) FILTER (WHERE a.is_late) AS late_days,
+               COUNT(a.check_in_time) AS total_checkins
+            FROM ({identity}) m
+            LEFT JOIN attendance a ON a.keycloak_user_id = m.keycloak_user_id
+                AND a.attendance_date BETWEEN :f AND :t
+                AND COALESCE(a.is_deleted, false) = false
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        params = {**scope_params, "f": from_d, "t": to_d}
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            order_by="late_days DESC, name ASC, rm_id ASC",
+        )
+        # Avg/earliest/latest need actual timestamps: fetch them for page kids only.
+        page_kids = []
+        kid_of = {}
+        for r in page_result.items:
+            kid_of[r[0]] = None
+        # Re-resolve kids for page members (bounded, single narrow query).
+        kid_rows = self.db.execute(
+            text(f"""SELECT m.redmine_user_id, m.keycloak_user_id
+                FROM ({identity}) m WHERE m.redmine_user_id = ANY(:rmids)"""),
+            {**params, "rmids": [r[0] for r in page_result.items]},
+        ).fetchall() if page_result.items else []
+        kid_of = {r[0]: r[1] for r in kid_rows}
+        checkin_rows = []
+        page_kids = [k for k in kid_of.values() if k]
+        if page_kids:
+            checkin_rows = self.db.execute(
+                text("""SELECT keycloak_user_id, attendance_date, check_in_time
+                    FROM attendance
+                    WHERE keycloak_user_id = ANY(:kids)
+                      AND attendance_date BETWEEN :f AND :t
+                      AND COALESCE(is_deleted, false) = false
+                      AND check_in_time IS NOT NULL"""),
+                {"kids": page_kids, "f": from_d, "t": to_d},
+            ).fetchall()
+        by_kid_times: dict = defaultdict(list)
+        for kid, day, ci in checkin_rows:
+            by_kid_times[kid].append((day, ci))
+
+        ranking = []
+        for r in page_result.items:
+            kid = kid_of.get(r[0])
+            times = by_kid_times.get(kid, []) if kid else []
+            secs = [self._ist_secs(c) for _, c in times]
             ranking.append({
-                "redmine_user_id": m["redmine_user_id"],
-                "name": m["name"],
-                "email": m["email"],
-                "late_days": len(late),
-                "total_checkins": len(secs),
+                "redmine_user_id": r[0],
+                "name": (r[1] or "").strip(),
+                "email": r[2] or "",
+                "has_login": bool(r[3]),
+                "late_days": r[4] or 0,
+                "total_checkins": r[5] or 0,
                 "avg_check_in": self._secs_to_hhmm(sum(secs) / len(secs)) if secs else None,
-                "habitual": len(late) >= late_min,
+                "habitual": (r[4] or 0) >= late_min,
             })
-        ranking.sort(key=lambda x: x["late_days"], reverse=True)
-        late_by_day = Counter(r[1] for r in rows if r[7])
+            if times:
+                ci_sorted = sorted(times, key=lambda x: x[1])
+                ranking[-1]["_earliest"] = ci_sorted[0]
+                ranking[-1]["_latest"] = ci_sorted[-1]
+        # Attach earliest/latest in response shape (kept out of the loop above for clarity).
+        for entry in ranking:
+            e, l = entry.pop("_earliest", None), entry.pop("_latest", None)
+            entry["earliest_check_in"] = (
+                {"date": e[0].isoformat(), "time": self._ist_hhmm(e[1])} if e else None
+            )
+            entry["latest_check_in"] = (
+                {"date": l[0].isoformat(), "time": self._ist_hhmm(l[1])} if l else None
+            )
+
+        dow_rows = self.db.execute(
+            text(f"""SELECT EXTRACT(ISODOW FROM a.attendance_date)::int AS dow, COUNT(*)
+                FROM attendance a
+                JOIN ({identity}) m ON m.keycloak_user_id = a.keycloak_user_id
+                WHERE a.attendance_date BETWEEN :f AND :t
+                  AND COALESCE(a.is_deleted, false) = false
+                  AND a.is_late
+                GROUP BY dow"""),
+            params,
+        ).fetchall()
+        by_weekday = {d: 0 for d in self._WEEKDAY_LABELS}
+        for dow, cnt in dow_rows:
+            by_weekday[self._WEEKDAY_LABELS[dow - 1]] = cnt
+
+        trend_rows = self.db.execute(
+            text(f"""SELECT a.attendance_date AS d,
+                    COUNT(*) FILTER (WHERE a.is_late) AS late
+                FROM attendance a
+                JOIN ({identity}) m ON m.keycloak_user_id = a.keycloak_user_id
+                WHERE a.attendance_date BETWEEN :f AND :t
+                  AND COALESCE(a.is_deleted, false) = false
+                GROUP BY d ORDER BY d"""),
+            params,
+        ).fetchall()
+        trend_by_day = {r[0]: r[1] for r in trend_rows}
+
+        habitual_count = self.db.execute(
+            text(f"""SELECT COUNT(*) FROM (
+                    SELECT m.redmine_user_id
+                    FROM ({identity}) m
+                    LEFT JOIN attendance a ON a.keycloak_user_id = m.keycloak_user_id
+                        AND a.attendance_date BETWEEN :f AND :t
+                        AND COALESCE(a.is_deleted, false) = false
+                    GROUP BY m.redmine_user_id
+                    HAVING COUNT(a.id) FILTER (WHERE a.is_late) >= :late_min
+                ) t"""),
+            {**params, "late_min": late_min},
+        ).scalar() or 0
+
         return {
             "from_date": from_d.isoformat(),
             "to_date": to_d.isoformat(),
             "late_threshold": late_min,
-            "member_count": len(members),
-            "habitual_count": sum(1 for r in ranking if r["habitual"]),
+            "member_count": page_result.total,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
+            "habitual_count": habitual_count,
             "ranking": ranking,
-            "by_weekday": {d: weekday_total.get(d, 0) for d in self._WEEKDAY_LABELS},
+            "by_weekday": by_weekday,
             "trend": [
-                {"date": d.isoformat(), "late": late_by_day.get(d, 0)}
+                {"date": d.isoformat(), "late": trend_by_day.get(d, 0)}
                 for d in _date_range(from_d, to_d)
             ],
         }
@@ -434,40 +692,155 @@ class AnalyticsService:
             "friday_absences": by_weekday.get(4, 0),
         }
 
-    def absenteeism_team(self, members: list, from_d: date, to_d: date, streak_min: int = 3) -> dict:
-        kids = [m["keycloak_user_id"] for m in members if m["keycloak_user_id"]]
-        rows = self._attendance_rows(kids, from_d, to_d)
-        all_status = self._member_day_status(rows)
+    def absenteeism_team(self, scope_where: str, scope_params: dict,
+                           from_d: date, to_d: date, streak_min: int = 3,
+                           page: int = 1, page_size: int = 50) -> dict:
+        from app.utils.pagination import paginate_text
+
+        identity = f"""SELECT u.id AS redmine_user_id,
+               u.firstname || ' ' || u.lastname AS name,
+               e.address AS email,
+               em.keycloak_user_id AS keycloak_user_id
+            FROM redmine.users u
+            JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+            LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+            WHERE {scope_where}"""
+        working = self.working_days(from_d, to_d)
+        # absent per member is a pure function of present/leave counts, so the
+        # page (ordered by absenteeism) comes straight from SQL.
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
+               COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days
+            FROM ({identity}) m
+            LEFT JOIN attendance a ON a.keycloak_user_id = m.keycloak_user_id
+                AND a.attendance_date BETWEEN :f AND :t
+                AND COALESCE(a.is_deleted, false) = false
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        params = {**scope_params, "f": from_d, "t": to_d}
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            order_by=f"({working} - present_days - leave_days) DESC, name ASC, rm_id ASC",
+        )
+        page_kids = []
+        kid_of = {}
+        if page_result.items:
+            kid_rows = self.db.execute(
+                text(f"""SELECT m.redmine_user_id, m.keycloak_user_id
+                    FROM ({identity}) m WHERE m.redmine_user_id = ANY(:rmids)"""),
+                {**params, "rmids": [r[0] for r in page_result.items]},
+            ).fetchall()
+            kid_of = {r[0]: r[1] for r in kid_rows}
+            page_kids = [k for k in kid_of.values() if k]
+        page_rows = []
+        if page_kids:
+            page_rows = self.db.execute(
+                text("""SELECT keycloak_user_id, attendance_date, status, work_location_status
+                    FROM attendance
+                    WHERE keycloak_user_id = ANY(:kids)
+                      AND attendance_date BETWEEN :f AND :t
+                      AND COALESCE(is_deleted, false) = false"""),
+                {"kids": page_kids, "f": from_d, "t": to_d},
+            ).fetchall()
+        page_status = self._member_day_status(page_rows)
         work_dates = sorted(d for d in _date_range(from_d, to_d) if d.weekday() < 5)
-        member_rows, red_flags, zero_list = [], [], []
-        for m in members:
-            kid = m["keycloak_user_id"] or ""
-            status = all_status.get(kid, {})
-            day_map = {d: ("present" if status.get(d) == "present" else "leave" if status.get(d) == "leave" else "absent") for d in work_dates}
+
+        def _day_map_for(kid: str) -> dict:
+            status = page_status.get(kid, {})
+            return {d: ("present" if status.get(d) == "present"
+                        else "leave" if status.get(d) == "leave" else "absent")
+                    for d in work_dates}
+
+        member_rows = []
+        for r in page_result.items:
+            kid = kid_of.get(r[0], "")
+            day_map = _day_map_for(kid)
             absent = sum(1 for d in work_dates if day_map[d] == "absent")
-            streaks = self._streaks(day_map, work_dates, streak_min)
-            longest = max([s["length"] for s in self._streaks(day_map, work_dates, 1)], default=0)
+            streaks = self._streaks(day_map, work_dates, 1)
+            longest = max([s["length"] for s in streaks], default=0)
             by_wd = Counter(d.weekday() for d in work_dates if day_map[d] == "absent")
-            if not status:
-                zero_list.append(m["name"])
-            for s in streaks:
-                red_flags.append({"name": m["name"], "email": m["email"], **s})
             member_rows.append({
-                "redmine_user_id": m["redmine_user_id"], "name": m["name"], "email": m["email"],
-                "absent_days": absent, "longest_streak": longest,
+                "redmine_user_id": r[0], "name": (r[1] or "").strip(), "email": r[2] or "",
+                "has_login": bool(r[3]),
+                "absent_days": absent,
+                "longest_streak": longest,
                 "monday_absences": by_wd.get(0, 0), "friday_absences": by_wd.get(4, 0),
             })
+
+        # Team-wide pattern stats need absence shape per member across the scope.
+        # One narrow (kid, date, status, loc) query — compact tuples, no enrichment —
+        # then the exact same Python streak logic as before.
+        scope_rows = self.db.execute(
+            text("""SELECT a.keycloak_user_id, a.attendance_date, a.status, a.work_location_status
+                FROM attendance a
+                WHERE a.keycloak_user_id IN (
+                    SELECT em.keycloak_user_id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE {scope_where} AND em.keycloak_user_id IS NOT NULL
+                )
+                AND a.attendance_date BETWEEN :f AND :t
+                AND COALESCE(a.is_deleted, false) = false""".replace("{scope_where}", scope_where)),
+            params,
+        ).fetchall()
+        all_status = self._member_day_status(scope_rows)
+        # Full identity list (narrow: rm_id, name, email, kid) so zero-attendance
+        # and red flags iterate exactly the members the old loop saw — including
+        # no-login members, who count as fully absent AND get a full-range
+        # streak in red_flags, just like before.
+        ident_rows = self.db.execute(
+            text(f"""SELECT m.redmine_user_id, m.name, m.email, m.keycloak_user_id
+                FROM ({identity}) m ORDER BY m.name ASC, m.redmine_user_id ASC"""),
+            params,
+        ).fetchall()
+        red_flags, zero_list = [], []
+        for rm_id, name, email, kid in ident_rows:
+            status = all_status.get(kid or "", {})
+            if not status:
+                zero_list.append((name or "").strip())
+            day_map = {d: ("present" if status.get(d) == "present"
+                           else "leave" if status.get(d) == "leave" else "absent")
+                       for d in work_dates}
+            for s in self._streaks(day_map, work_dates, streak_min):
+                red_flags.append({"name": (name or "").strip(), "email": email or "", **s})
+        # Stable sort keeps the name-ASC input order within equal lengths,
+        # matching the old loop-over-name-ordered-members behavior.
         red_flags.sort(key=lambda x: x["length"], reverse=True)
-        member_rows.sort(key=lambda x: x["absent_days"], reverse=True)
+        # totals.absent_days must mirror the old per-member max() sum — a member
+        # with present > working must not offset others. Aggregate functions
+        # cannot nest, so sum over the grouped member subquery instead.
+        member_sums = f"""SELECT
+                COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
+                COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days
+            FROM ({identity}) m
+            LEFT JOIN attendance a ON a.keycloak_user_id = m.keycloak_user_id
+                AND a.attendance_date BETWEEN :f AND :t
+                AND COALESCE(a.is_deleted, false) = false
+            GROUP BY m.redmine_user_id"""
+        absent_total = self.db.execute(
+            text(f"""SELECT COALESCE(SUM(GREATEST({working} - present_days - leave_days, 0)), 0)
+                FROM ({member_sums}) t"""),
+            params,
+        ).fetchone()
+        absent_total = absent_total[0] or 0 if absent_total else 0
+        n = page_result.total
         return {
             "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
             "streak_threshold": streak_min,
-            "member_count": len(members),
+            "member_count": n,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
             "members": member_rows,
             "red_flags": red_flags,
             "zero_attendance": sorted(zero_list),
             "totals": {
-                "absent_days": sum(m["absent_days"] for m in member_rows),
+                "absent_days": absent_total,
                 "members_with_streaks": len({f["name"] for f in red_flags}),
             },
         }
@@ -595,30 +968,131 @@ class AnalyticsService:
             "monthly": self._monthly_leaves(rows, to_d, holidays),
         }
 
-    def leaves_team(self, members: list, from_d: date, to_d: date) -> dict:
+    # Leave buckets mirror _leave_bucket exactly (NULL statuses fall through
+    # to pending on both sides: Python's else-branch vs applied-minus-rest).
+    _LEAVE_BUCKET_SQL = """CASE
+        WHEN LOWER(l.approval_status::text) IN ('approved', 'emergency') THEN 'approved'
+        WHEN LOWER(l.approval_status::text) IN ('pending', 'cancellation_requested') THEN 'pending'
+        WHEN LOWER(l.approval_status::text) IN ('rejected', 'cancellation_rejected') THEN 'rejected'
+        WHEN LOWER(l.approval_status::text) = 'cancelled' THEN 'cancelled'
+        ELSE 'pending' END"""
+
+    def leaves_team(self, scope_where: str, scope_params: dict,
+                    from_d: date, to_d: date, page: int = 1, page_size: int = 50) -> dict:
+        from app.utils.pagination import paginate_text
+
         span_start = min(from_d, self._month_bounds(to_d)[0])
         holidays = self._holiday_set(span_start, to_d)
-        kids = [m["keycloak_user_id"] for m in members if m["keycloak_user_id"]]
-        rows = self._leave_rows(kids, span_start, to_d)
+        identity = f"""SELECT u.id AS redmine_user_id,
+               u.firstname || ' ' || u.lastname AS name,
+               e.address AS email,
+               em.keycloak_user_id AS keycloak_user_id
+            FROM redmine.users u
+            JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+            LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+            WHERE {scope_where}"""
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(l.keycloak_user_id) AS applied,
+               COUNT(l.keycloak_user_id) FILTER (WHERE {self._LEAVE_BUCKET_SQL} = 'approved') AS approved,
+               COUNT(l.keycloak_user_id) FILTER (WHERE {self._LEAVE_BUCKET_SQL} = 'pending') AS pending
+            FROM ({identity}) m
+            LEFT JOIN leaves l ON l.keycloak_user_id = m.keycloak_user_id
+                AND l.start_date <= :t AND l.end_date >= :f
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        params = {**scope_params, "f": from_d, "t": to_d}
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            order_by="name ASC, rm_id ASC",
+        )
+        # approved_days needs working-day overlap math: narrow rows for page
+        # members only, then the same Python helper as before.
+        kid_of_page: dict = {}
+        if page_result.items:
+            kid_of_page = {
+                r[0]: r[1] for r in self.db.execute(
+                    text(f"""SELECT m.redmine_user_id, m.keycloak_user_id
+                        FROM ({identity}) m WHERE m.redmine_user_id = ANY(:rmids)"""),
+                    {**params, "rmids": [r[0] for r in page_result.items]},
+                ).fetchall()
+            }
+        page_kids = [k for k in kid_of_page.values() if k]
+        page_rows = []
+        if page_kids:
+            page_rows = self.db.execute(
+                text("""SELECT keycloak_user_id, leave_type, approval_status, start_date, end_date
+                    FROM leaves
+                    WHERE keycloak_user_id = ANY(:kids)
+                      AND start_date <= :t AND end_date >= :f"""),
+                {"kids": page_kids, "f": from_d, "t": to_d},
+            ).fetchall()
         by_kid: dict = defaultdict(list)
-        for r in rows:
-            if r[3] <= to_d and r[4] >= from_d:
-                by_kid[r[0]].append(r)
-        member_rows, totals = [], Counter()
-        for m in members:
-            s = self._summarize_leaves(by_kid.get(m["keycloak_user_id"] or "", []), from_d, to_d, holidays)
-            for k in ("applied", "approved", "pending", "approved_days"):
-                totals[k] += s[k]
+        for r in page_rows:
+            by_kid[r[0]].append(r)
+        member_rows = []
+        for r in page_result.items:
+            kid_rows = by_kid.get(kid_of_page.get(r[0]) or "", [])
             member_rows.append({
-                "redmine_user_id": m["redmine_user_id"], "name": m["name"], "email": m["email"],
-                "applied": s["applied"], "approved": s["approved"],
-                "pending": s["pending"], "approved_days": s["approved_days"],
+                "redmine_user_id": r[0], "name": (r[1] or "").strip(), "email": r[2] or "",
+                "has_login": bool(r[3]),
+                "applied": r[4] or 0, "approved": r[5] or 0,
+                "pending": r[6] or 0,
+                "approved_days": sum(
+                    self._working_overlap_days(x[3], x[4], from_d, to_d, holidays)
+                    for x in kid_rows
+                    if self._leave_bucket(x[2]) == "approved"
+                ),
             })
+        # Team totals: counts from SQL over the full scope; approved_days and
+        # monthly from one narrow scope-rows query (calendar arithmetic in Python).
+        totals_row = self.db.execute(
+            text(f"""SELECT COUNT(l.keycloak_user_id) AS applied,
+                    COUNT(l.keycloak_user_id) FILTER (WHERE {self._LEAVE_BUCKET_SQL} = 'approved') AS approved,
+                    COUNT(l.keycloak_user_id) FILTER (WHERE {self._LEAVE_BUCKET_SQL} = 'rejected') AS rejected,
+                    COUNT(l.keycloak_user_id) FILTER (WHERE {self._LEAVE_BUCKET_SQL} = 'cancelled') AS cancelled
+                FROM ({identity}) m
+                LEFT JOIN leaves l ON l.keycloak_user_id = m.keycloak_user_id
+                    AND l.start_date <= :t AND l.end_date >= :f"""),
+            params,
+        ).fetchone()
+        applied_total = totals_row[0] or 0
+        approved_total = totals_row[1] or 0
+        scope_rows = self.db.execute(
+            text("""SELECT keycloak_user_id, leave_type, approval_status, start_date, end_date
+                FROM leaves
+                WHERE keycloak_user_id IN (
+                    SELECT em.keycloak_user_id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE __SCOPE__ AND em.keycloak_user_id IS NOT NULL
+                )
+                AND start_date <= :t2 AND end_date >= :f2""".replace("__SCOPE__", scope_where)),
+            {**params, "f2": span_start, "t2": to_d, "f": from_d, "t": to_d},
+        ).fetchall()
+        in_range = [r for r in scope_rows if r[3] <= to_d and r[4] >= from_d]
+        approved_days_total = sum(
+            self._working_overlap_days(r[3], r[4], from_d, to_d, holidays)
+            for r in in_range if self._leave_bucket(r[2]) == "approved"
+        )
         return {
             "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
-            "member_count": len(members), "members": member_rows,
-            "totals": {k: int(v) for k, v in totals.items()},
-            "monthly": self._monthly_leaves(rows, to_d, holidays),
+            "member_count": page_result.total,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
+            "members": member_rows,
+            "totals": {
+                "applied": applied_total,
+                "approved": approved_total,
+                "pending": applied_total - approved_total - (totals_row[2] or 0) - (totals_row[3] or 0),
+                "approved_days": approved_days_total,
+            },
+            "monthly": self._monthly_leaves(scope_rows, to_d, holidays),
         }
 
     # ── wfh ─────────────────────────────────────────────────────────────
@@ -694,30 +1168,116 @@ class AnalyticsService:
             "monthly": self._monthly_wfh(rows, to_d, holidays),
         }
 
-    def wfh_team(self, members: list, from_d: date, to_d: date) -> dict:
+    def wfh_team(self, scope_where: str, scope_params: dict,
+                 from_d: date, to_d: date, page: int = 1, page_size: int = 50) -> dict:
+        from app.utils.pagination import paginate_text
+
         span_start = min(from_d, self._month_bounds(to_d)[0])
         holidays = self._holiday_set(span_start, to_d)
-        kids = [m["keycloak_user_id"] for m in members if m["keycloak_user_id"]]
-        rows = self._wfh_rows(kids, span_start, to_d)
+        identity = f"""SELECT u.id AS redmine_user_id,
+               u.firstname || ' ' || u.lastname AS name,
+               e.address AS email,
+               em.keycloak_user_id AS keycloak_user_id
+            FROM redmine.users u
+            JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+            LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+            WHERE {scope_where}"""
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(w.keycloak_user_id) AS total,
+               COUNT(w.keycloak_user_id) FILTER (WHERE LOWER(w.status::text) = 'approved') AS approved,
+               COUNT(w.keycloak_user_id) FILTER (WHERE LOWER(w.status::text) = 'pending') AS pending
+            FROM ({identity}) m
+            LEFT JOIN wfh_requests w ON w.keycloak_user_id = m.keycloak_user_id
+                AND w.start_date <= :t AND w.end_date >= :f
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        params = {**scope_params, "f": from_d, "t": to_d}
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            order_by="name ASC, rm_id ASC",
+        )
+        kid_of_page: dict = {}
+        if page_result.items:
+            kid_of_page = {
+                r[0]: r[1] for r in self.db.execute(
+                    text(f"""SELECT m.redmine_user_id, m.keycloak_user_id
+                        FROM ({identity}) m WHERE m.redmine_user_id = ANY(:rmids)"""),
+                    {**params, "rmids": [r[0] for r in page_result.items]},
+                ).fetchall()
+            }
+        page_kids = [k for k in kid_of_page.values() if k]
+        page_rows = []
+        if page_kids:
+            page_rows = self.db.execute(
+                text("""SELECT keycloak_user_id, status, start_date, end_date
+                    FROM wfh_requests
+                    WHERE keycloak_user_id = ANY(:kids)
+                      AND start_date <= :t AND end_date >= :f"""),
+                {"kids": page_kids, "f": from_d, "t": to_d},
+            ).fetchall()
         by_kid: dict = defaultdict(list)
-        for r in rows:
-            if r[2] <= to_d and r[3] >= from_d:
-                by_kid[r[0]].append(r)
-        member_rows, totals = [], Counter()
-        for m in members:
-            s = self._summarize_wfh(by_kid.get(m["keycloak_user_id"] or "", []), from_d, to_d, holidays)
-            for k in ("total", "approved", "pending", "approved_days"):
-                totals[k] += s[k]
+        for r in page_rows:
+            by_kid[r[0]].append(r)
+        member_rows = []
+        for r in page_result.items:
+            kid_rows = by_kid.get(kid_of_page.get(r[0]) or "", [])
             member_rows.append({
-                "redmine_user_id": m["redmine_user_id"], "name": m["name"], "email": m["email"],
-                "total": s["total"], "approved": s["approved"],
-                "pending": s["pending"], "approved_days": s["approved_days"],
+                "redmine_user_id": r[0], "name": (r[1] or "").strip(), "email": r[2] or "",
+                "has_login": bool(r[3]),
+                "total": r[4] or 0, "approved": r[5] or 0,
+                "pending": r[6] or 0,
+                "approved_days": sum(
+                    self._working_overlap_days(x[2], x[3], from_d, to_d, holidays)
+                    for x in kid_rows
+                    if (x[1] or "").lower() == "approved"
+                ),
             })
+        totals_row = self.db.execute(
+            text(f"""SELECT COUNT(w.keycloak_user_id) AS total,
+                    COUNT(w.keycloak_user_id) FILTER (WHERE LOWER(w.status::text) = 'approved') AS approved,
+                    COUNT(w.keycloak_user_id) FILTER (WHERE LOWER(w.status::text) = 'pending') AS pending,
+                    COUNT(w.keycloak_user_id) FILTER (WHERE LOWER(w.status::text) = 'rejected') AS rejected
+                FROM ({identity}) m
+                LEFT JOIN wfh_requests w ON w.keycloak_user_id = m.keycloak_user_id
+                    AND w.start_date <= :t AND w.end_date >= :f"""),
+            params,
+        ).fetchone()
+        scope_rows = self.db.execute(
+            text("""SELECT keycloak_user_id, status, start_date, end_date
+                FROM wfh_requests
+                WHERE keycloak_user_id IN (
+                    SELECT em.keycloak_user_id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE __SCOPE__ AND em.keycloak_user_id IS NOT NULL
+                )
+                AND start_date <= :t2 AND end_date >= :f2""".replace("__SCOPE__", scope_where)),
+            {**params, "f2": span_start, "t2": to_d, "f": from_d, "t": to_d},
+        ).fetchall()
+        in_range = [r for r in scope_rows if r[2] <= to_d and r[3] >= from_d]
+        approved_days_total = sum(
+            self._working_overlap_days(r[2], r[3], from_d, to_d, holidays)
+            for r in in_range if (r[1] or "").lower() == "approved"
+        )
         return {
             "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
-            "member_count": len(members), "members": member_rows,
-            "totals": {k: int(v) for k, v in totals.items()},
-            "monthly": self._monthly_wfh(rows, to_d, holidays),
+            "member_count": page_result.total,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
+            "members": member_rows,
+            "totals": {
+                "total": totals_row[0] or 0,
+                "approved": totals_row[1] or 0,
+                "pending": totals_row[2] or 0,
+                "approved_days": approved_days_total,
+            },
+            "monthly": self._monthly_wfh(scope_rows, to_d, holidays),
         }
 
     # ── tickets ─────────────────────────────────────────────────────────
@@ -821,46 +1381,108 @@ class AnalyticsService:
             ],
         }
 
-    def tickets_team(self, team_ids: set, from_d: date, to_d: date, project_id: Optional[int]) -> dict:
-        ids = list(team_ids)
-        if not ids:
-            return {
-                "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
-                "member_count": 0, "members": [], "by_project": [],
-                "totals": {"open_now": 0, "overdue_now": 0, "created_in_range": 0, "closed_in_range": 0},
-            }
+    def tickets_team(self, scope_where: str, scope_params: dict,
+                       from_d: date, to_d: date, project_id: Optional[int] = None,
+                       page: int = 1, page_size: int = 50) -> dict:
+        from app.utils.pagination import paginate_text
+
         proj_filter = "AND i.project_id = :pid" if project_id is not None else ""
-        params = {"ids": ids, "f": from_d, "t": to_d}
+        params = {**scope_params, "f": from_d, "t": to_d}
         if project_id is not None:
             params["pid"] = project_id
 
-        member_rows = self.db.execute(
-            text(f"""
-                SELECT i.assigned_to_id,
-                       u.firstname || ' ' || u.lastname AS name,
-                       e.address AS email,
-                       COUNT(*) FILTER (WHERE NOT st.is_closed) AS open_now,
-                       COUNT(*) FILTER (WHERE NOT st.is_closed AND i.due_date < CURRENT_DATE) AS overdue,
-                       COUNT(*) FILTER (WHERE i.created_on::date BETWEEN :f AND :t) AS created_in_range,
-                       COUNT(*) FILTER (WHERE st.is_closed AND i.closed_on::date BETWEEN :f AND :t) AS closed_in_range
-                FROM redmine.issues i
-                JOIN redmine.issue_statuses st ON st.id = i.status_id
-                JOIN redmine.users u ON u.id = i.assigned_to_id
-                JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
-                WHERE i.assigned_to_id = ANY(:ids) {proj_filter}
-                GROUP BY i.assigned_to_id, u.firstname, u.lastname, e.address
-                ORDER BY name
-            """),
-            params,
-        ).fetchall()
+        # Member page: assignees with issues in scope (preserves the existing
+        # contract that only members holding issues appear here).
+        member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
+               (m.keycloak_user_id IS NOT NULL) AS has_login,
+               COUNT(i.id) FILTER (WHERE NOT st.is_closed) AS open_now,
+               COUNT(i.id) FILTER (WHERE NOT st.is_closed AND i.due_date < CURRENT_DATE) AS overdue,
+               COUNT(i.id) FILTER (WHERE i.created_on::date BETWEEN :f AND :t) AS created_in_range,
+               COUNT(i.id) FILTER (WHERE st.is_closed AND i.closed_on::date BETWEEN :f AND :t) AS closed_in_range
+            FROM (SELECT u.id AS redmine_user_id,
+                         u.firstname || ' ' || u.lastname AS name,
+                         e.address AS email,
+                         em.keycloak_user_id AS keycloak_user_id
+                  FROM redmine.users u
+                  JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                  LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                  WHERE {scope_where}) m
+            JOIN redmine.issues i ON i.assigned_to_id = m.redmine_user_id {proj_filter}
+            JOIN redmine.issue_statuses st ON st.id = i.status_id
+            GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
+        page_result = paginate_text(
+            self.db,
+            select_sql=f"SELECT * FROM ({member_inner}) t",
+            count_sql=f"SELECT COUNT(*) FROM ({member_inner}) t",
+            params=params,
+            page=page, page_size=page_size,
+            order_by="name ASC, rm_id ASC",
+        )
         members = [
             {
                 "redmine_user_id": r[0], "name": (r[1] or "").strip(), "email": r[2] or "",
-                "open_now": r[3] or 0, "overdue_now": r[4] or 0,
-                "created_in_range": r[5] or 0, "closed_in_range": r[6] or 0,
+                "has_login": bool(r[3]),
+                "open_now": r[4] or 0, "overdue_now": r[5] or 0,
+                "created_in_range": r[6] or 0, "closed_in_range": r[7] or 0,
             }
-            for r in member_rows
+            for r in page_result.items
         ]
+
+        totals = self.db.execute(
+            text(f"""SELECT COUNT(i.id) FILTER (WHERE NOT st.is_closed) AS open_now,
+                    COUNT(i.id) FILTER (WHERE NOT st.is_closed AND i.due_date < CURRENT_DATE) AS overdue,
+                    COUNT(i.id) FILTER (WHERE i.created_on::date BETWEEN :f AND :t) AS created_in_range,
+                    COUNT(i.id) FILTER (WHERE st.is_closed AND i.closed_on::date BETWEEN :f AND :t) AS closed_in_range
+                FROM redmine.issues i
+                JOIN redmine.issue_statuses st ON st.id = i.status_id
+                WHERE i.assigned_to_id IN (
+                    SELECT u.id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE {scope_where}
+                ) {proj_filter}"""),
+            params,
+        ).fetchone()
+
+        project_rows = self.db.execute(
+            text(f"""SELECT i.project_id, pr.name,
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE NOT st.is_closed) AS open,
+                       COUNT(*) FILTER (WHERE st.is_closed) AS closed
+                FROM redmine.issues i
+                JOIN redmine.issue_statuses st ON st.id = i.status_id
+                JOIN redmine.projects pr ON pr.id = i.project_id
+                WHERE i.assigned_to_id IN (
+                    SELECT u.id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE {scope_where}
+                ) {proj_filter}
+                GROUP BY i.project_id, pr.name
+                ORDER BY total DESC"""),
+            params,
+        ).fetchall()
+        return {
+            "from_date": from_d.isoformat(),
+            "to_date": to_d.isoformat(),
+            "member_count": page_result.total,
+            "page": page_result.page,
+            "page_size": page_result.page_size,
+            "total_pages": page_result.total_pages,
+            "members": members,
+            "by_project": [
+                {"project_id": r[0], "project_name": r[1], "total": r[2], "open": r[3] or 0, "closed": r[4] or 0}
+                for r in project_rows
+            ],
+            "totals": {
+                "open_now": totals[0] or 0,
+                "overdue_now": totals[1] or 0,
+                "created_in_range": totals[2] or 0,
+                "closed_in_range": totals[3] or 0,
+            },
+        }
 
         project_rows = self.db.execute(
             text(f"""
