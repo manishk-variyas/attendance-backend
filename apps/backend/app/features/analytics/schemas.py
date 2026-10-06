@@ -20,6 +20,7 @@ class AttendanceSummary(BaseModel):
     from_date: str
     to_date: str
     working_days: int
+    holiday_days: int = 0
     recorded_days: int
     present_days: int
     absent_days: int
@@ -60,11 +61,9 @@ class TeamAttendanceResponse(BaseModel):
     from_date: str
     to_date: str
     working_days: int
+    holiday_days: int = 0
     group_by: str = "day"
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     members: List[TeamMemberAttendance] = []
     totals: Dict[str, float] = {}
     daily: List[TeamDayAttendance] = []
@@ -111,9 +110,6 @@ class PunctualityTeam(BaseModel):
     to_date: str
     late_threshold: int = 3
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     habitual_count: int = 0
     ranking: List[PunctualityTeamMember] = []
     by_weekday: Dict[str, int] = {}
@@ -163,9 +159,6 @@ class AbsenteeismTeam(BaseModel):
     to_date: str
     streak_threshold: int = 3
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     members: List[AbsenteeismTeamMember] = []
     red_flags: List[AbsenceRedFlag] = []
     zero_attendance: List[str] = []
@@ -204,6 +197,15 @@ class TicketTrendPoint(BaseModel):
 class TicketSummaryMe(BaseModel):
     from_date: str
     to_date: str
+    # Header counts — current state of my tickets (assigned to me ∪ created by me).
+    total: int = 0
+    assigned_to_me: int = 0
+    created_by_me: int = 0
+    open: int = 0
+    pending: int = 0
+    closed: int = 0
+    overdue: int = 0
+    # Range-scoped activity.
     open_now: int
     overdue_now: int
     created_in_range: int
@@ -239,9 +241,6 @@ class TeamTicketsResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     members: List[TeamTicketMember] = []
     by_project: List[TeamTicketProject] = []
     totals: Dict[str, int] = {}
@@ -303,9 +302,6 @@ class TeamLeavesResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     members: List[TeamLeaveMember] = []
     totals: Dict[str, int] = {}
     monthly: List[MonthlyLeavePoint] = []
@@ -354,9 +350,6 @@ class TeamWfhResponse(BaseModel):
     from_date: str
     to_date: str
     member_count: int
-    page: int = 1
-    page_size: int = 50
-    total_pages: int = 1
     members: List[TeamWfhMember] = []
     totals: Dict[str, int] = {}
     monthly: List[MonthlyWfhPoint] = []

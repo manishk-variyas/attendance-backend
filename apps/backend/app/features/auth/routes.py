@@ -46,13 +46,14 @@ from app.utils.jwt import get_user_info_from_token, get_token_issuer
 from app.utils.audit import log_login, log_logout, log_session_refresh, log_backchannel_logout, log_security_event
 from app.utils.cloudflare import get_country
 from app.utils.login_security import (
-    clear_ip,
     clear_account,
+    clear_login_pair,
     is_brute_force_active,
     is_ip_blocked,
     is_account_blocked,
-    record_ip_failure,
+    is_login_pair_blocked,
     record_account_failure,
+    record_login_pair_failure,
 )
 from app.utils.turnstile import verify_turnstile
 from app.services.email_service import email_service
@@ -89,18 +90,24 @@ async def login(
     correlation_id = request.state.correlation_id
     client_ip = _get_security_ip(request)
 
-    # Per-IP brute-force block: short-circuit before any other work.
-    block_status = is_ip_blocked(client_ip)
-    if block_status.is_blocked:
+    # Per-(account, IP) brute-force block: short-circuit before any other work.
+    # Keyed on the account + source IP (not the IP alone) so one noisy client
+    # behind a shared NAT/proxy can never lock out unrelated users.
+    pair_status = is_login_pair_blocked(payload.username, client_ip)
+    if pair_status.is_blocked:
         log_security_event(
-            correlation_id, "ip_login_blocked",
-            f"Login blocked for IP {client_ip}",
+            correlation_id, "login_pair_blocked",
+            f"Login blocked for account from IP {client_ip}",
             severity="warning",
-            extra={"client_ip": client_ip, "blocked_until": block_status.blocked_until.isoformat() if block_status.blocked_until else None},
+            extra={
+                "client_ip": client_ip,
+                "account": payload.username,
+                "blocked_until": pair_status.blocked_until.isoformat() if pair_status.blocked_until else None,
+            },
         )
         raise HTTPException(
             status_code=429,
-            detail="Too many login attempts from this network. Try again later.",
+            detail="Too many login attempts for this account from this network. Try again later.",
         )
 
     # Per-account brute-force block: short-circuit before sending to Keycloak.
@@ -143,26 +150,30 @@ async def login(
         logger.warning(f"Login failed for user: {payload.username}")
         log_login(correlation_id, payload.username, success=False, client_ip=client_ip)
 
-        # Per-IP brute-force recording. If this failure newly blocks the IP,
-        # return 429 instead of 401 so the client knows to back off.
-        ip_status = record_ip_failure(client_ip)
-        if ip_status.just_blocked and is_brute_force_active():
+        # Per-(account, IP) brute-force recording. If this failure newly blocks
+        # the pair, return 429 instead of 401 so the client knows to back off.
+        pair_status = record_login_pair_failure(payload.username, client_ip)
+        if pair_status.just_blocked and is_brute_force_active():
             log_security_event(
                 correlation_id, "brute_force_suspected",
-                f"System-wide brute-force threshold reached ({ip_status.failure_count} from this IP)",
+                f"System-wide brute-force threshold reached ({pair_status.failure_count} for this account/IP)",
                 severity="error",
-                extra={"client_ip": client_ip, "failure_count": ip_status.failure_count},
+                extra={"client_ip": client_ip, "account": payload.username, "failure_count": pair_status.failure_count},
             )
-        if ip_status.is_blocked:
+        if pair_status.is_blocked:
             log_security_event(
-                correlation_id, "ip_login_blocked",
-                f"IP {client_ip} newly blocked after failed login",
+                correlation_id, "login_pair_blocked",
+                f"Account from IP {client_ip} newly blocked after failed login",
                 severity="warning",
-                extra={"client_ip": client_ip, "blocked_until": ip_status.blocked_until.isoformat() if ip_status.blocked_until else None},
+                extra={
+                    "client_ip": client_ip,
+                    "account": payload.username,
+                    "blocked_until": pair_status.blocked_until.isoformat() if pair_status.blocked_until else None,
+                },
             )
             raise HTTPException(
                 status_code=429,
-                detail="Too many login attempts from this network. Try again later.",
+                detail="Too many login attempts for this account from this network. Try again later.",
             )
 
         # Per-account brute-force recording.
@@ -309,9 +320,9 @@ async def login(
     )
     await enforce_session_limit(user_data.get("sub"), max_sessions=1)
 
-    # Successful login: clear this IP's failure record so legit users aren't
-    # penalized for past typos or attacks from a shared NAT.
-    clear_ip(client_ip)
+    # Successful login: clear this account's failures (pair + account) so legit
+    # users aren't penalized for past typos or attacks from a shared NAT.
+    clear_login_pair(payload.username, client_ip)
     clear_account(payload.username)
 
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})

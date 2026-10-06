@@ -39,7 +39,7 @@ class Attendance(Base):
         persisted=True,
     ))
     is_late = Column(Boolean, nullable=False, server_default=text("false"))
-    status = Column(String(50), nullable=False, server_default=text("'present'"))
+    status = Column(SAEnum('present', 'absent', 'half_day', 'on_leave', 'holiday', name='attendance_status', create_type=False), nullable=False, server_default=text("'present'"))
     is_manual_entry = Column(Boolean, nullable=False, server_default=text("false"))
     is_synced = Column(Boolean, nullable=False, server_default=text("false"))
     server_received_at = Column(DateTime(timezone=True), nullable=True)

@@ -23,22 +23,25 @@ import time
 from fastapi import Request
 from fastapi.responses import Response
 
+from app.core.client_ip import security_client_ip
+
 logger = logging.getLogger("app.access")
 
 
 def _get_security_ip(request: Request) -> str:
     """Return the client IP for security decisions (rate limiting, blocking).
 
-    Uses only the TCP peer's address (request.client.host) which cannot be
-    spoofed by the client. Headers like CF-Connecting-IP, X-Real-IP, or
-    X-Forwarded-For are NOT trusted because they can be forged when the
-    origin is directly accessible.
+    The API is only reachable through nginx (no published port), so the
+    proxy-set ``X-Real-IP`` / leftmost ``X-Forwarded-For`` is the real client
+    and cannot be forged. Keying on the TCP peer instead would collapse every
+    user into one shared nginx-container IP — a single global rate limit and
+    brute-force block. See ``app.core.client_ip``.
 
     Use this for: brute-force protection, IP blocklists, rate limiting.
-    Use _get_client_ip() for: audit logging, analytics (where header spoofing
-    is acceptable since it only affects logging).
+    Use _get_client_ip() for: audit logging, analytics (which additionally
+    trusts client-supplied headers like X-User-Public-IP).
     """
-    return request.client.host if request.client else "-"
+    return security_client_ip(request)
 
 
 def _get_client_ip(request: Request) -> str:

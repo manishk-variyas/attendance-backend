@@ -15,9 +15,25 @@ All eight endpoints accept the same date params and return chart-ready shapes
 | `from_date` | string | no | default: first day of current month. `YYYY-MM-DD`, else `400 Invalid date format. Use YYYY-MM-DD.` |
 | `to_date` | string | no | default: today. `YYYY-MM-DD` |
 | `project_id` | int | no | team endpoints only — narrow to one project |
+| `search` | string | no | team endpoints only — case-insensitive substring match on the member's full name; max 100 chars. Omit to return every member. |
 
 Rules: `from_date <= to_date` (else `400`), max range 366 days (else `400`).
 Rate limit: 30 requests/minute. Auth: session cookie (same as all APIs).
+
+### Searching & filtering (team endpoints)
+
+All six team endpoints — `/attendance/team`, `/attendance/punctuality/team`,
+`/attendance/absenteeism/team`, `/tickets/team`, `/leaves/team`, `/wfh/team` —
+support the same two filters:
+
+- **`search=<name>`** — substring match on `firstname + " " + lastname`
+  (`ILIKE '%term%'`, case-insensitive). e.g. `search=Himanshu` returns
+  `Himanshu Pokhariya` and `Himanshu Singh`. No match ⇒ `member_count: 0`.
+- **`project_id=<id>`** — narrows the team to one project (PM/PC must belong to
+  it, else `403`; unknown id ⇒ `404 Project not found`).
+
+Filters combine, and every per-member list, total, and (where present) the
+`monthly`/`trend` aggregates are recomputed over the filtered scope.
 
 ### Common error responses
 
@@ -31,12 +47,17 @@ Rate limit: 30 requests/minute. Auth: session cookie (same as all APIs).
 
 ### Attendance counting rules
 
-- `working_days` = weekdays (Mon–Fri) in range minus **national** holidays.
+- **Working days come from the roster**: a day is a working day for a member
+  **only if they have a shift** that day (a `shifts` row). Weekdays, weekends,
+  and holidays are all treated the same way — the assigned schedule decides.
+  No-shift members have 0 working days.
 - `present_days` = rows with `status = present` (includes OFFICE / WFH / remote).
 - `leave_days` = rows with `work_location_status = LEAVE` (or leave status).
 - `wfh_days` = present rows with `work_location_status = WFH`; `office_days = present − wfh`.
-- `absent_days = working_days − present_days − leave_days` (min 0) — missing punches count as absent.
-- `attendance_pct = present_days / working_days × 100`.
+- `absent_days = max(working_days − present_days − leave_days, 0)` — a scheduled
+  day with no punch counts as absent.
+- `attendance_pct = present_days / working_days × 100` (0 when no shifts).
+- Team scope includes **active employees only** (`employee_master.is_active`).
 
 ### Per-member drill-downs (shared rules)
 `/attendance/member`, `/tickets/member`, `/leaves/member`, `/wfh/member` share one
@@ -151,7 +172,8 @@ to it, else `403`; unknown id → `404 Project not found`).
 Extra params: `sort_by` (name, attendance_pct, present_days, absent_days,
 late_days, total_hours; default `name`), `sort_dir` (`asc`/`desc`, default
 `asc`), `group_by` (`day`/`week`/`month` buckets for the grid, default `day`),
-`hide_empty` (default `false`; `true` drops members with no rows).
+`hide_empty` (default `false`; `true` drops members with no rows),
+`search` (full-name substring filter, see §0).
 
 Team scope: Admin → project members (or all active employees when no
 `project_id`); PM/PC → members sharing a project with the viewer (+ self).
@@ -229,6 +251,8 @@ Roles: all four. Times in IST (`HH:MM`).
 GET /api/analytics/attendance/punctuality/team?from_date=2026-09-01&to_date=2026-09-11&late_min=2
 ```
 Roles: Admin/PM/PC. `late_min` (1–31, default 3) marks habitual latecomers.
+Also supports `project_id` and `search` (§0); `habitual_count`, `by_weekday`
+and `trend` are recomputed over the filtered scope.
 
 ```json
 {
@@ -277,6 +301,8 @@ Roles: all four. Streaks = consecutive absent working days (min length 2).
 GET /api/analytics/attendance/absenteeism/team?from_date=2026-09-01&to_date=2026-09-11&streak_min=3
 ```
 Roles: Admin/PM/PC. `streak_min` (2–31, default 3) marks red-flag streaks.
+Also supports `project_id` and `search` (§0); `red_flags`, `zero_attendance`
+and `totals` are recomputed over the filtered scope.
 
 ```json
 {
@@ -311,6 +337,22 @@ Roles: Admin, Project Manager, Project Coordinator, Technical Resource.
 Scope: `open_now` / `overdue_now` are current state (all time) of tickets
 assigned to me; breakdowns and trend cover tickets assigned to me created
 in `[from_date, to_date]`.
+
+### `scope` — date filtering for the header counts
+
+`GET /api/analytics/tickets/me?from_date=2026-08-01&to_date=2026-08-31&scope=range`
+
+- `scope=current` (default): header counts (`total`, `assigned_to_me`,
+  `created_by_me`, `open`, `pending`, `closed`, `overdue`, `open_now`,
+  `overdue_now`) describe **all my tickets as of now** — the range only
+  drives `created/closed_in_range`, breakdowns, and `trend`.
+- `scope=range`: the header describes the **created-in-range cohort with
+  current statuses** ("of last month's tickets, what's still open").
+  `open_now`/`overdue_now` then equal the cohort's `open`/`overdue`.
+  Statuses are always *as of now* — there is no status-history table.
+
+Status buckets: `closed` = Redmine `is_closed`; `pending` = `Resolved`;
+`open` = other non-closed. All date boundaries use IST explicitly.
 
 ### Success response `200`
 
@@ -348,10 +390,15 @@ Field notes:
 ## 4. Team ticket analytics
 
 ```
-GET /api/analytics/tickets/team?from_date=2026-09-01&to_date=2026-09-11&project_id=33
+GET /api/analytics/tickets/team?from_date=2026-09-01&to_date=2026-09-11&project_id=33&search=Himanshu
 ```
 Roles: Admin, Project Manager, Project Coordinator only.
 `project_id` optional — narrows to that project (PM/PC must belong to it).
+`search` optional — full-name substring filter (§0).
+`scope` optional — `current` (default) keeps `open_now`/`overdue_now` as the
+all-time state of assigned tickets; `range` restricts those (and the per-member
+and per-project lists) to tickets **created in** `[from_date, to_date]`.
+`created_in_range`/`closed_in_range` are range-scoped in both modes.
 
 ### Success response `200`
 
@@ -419,8 +466,9 @@ scope / no linked login.
 - Leave status buckets: `approved` = approved + emergency; `pending` =
   pending + cancellation_requested; `rejected` = rejected +
   cancellation_rejected; `cancelled` = cancelled. `by_status` keeps raw values.
-- `approved_days` counts **working days only** (Mon–Fri minus national
-  holidays) — a Sat–Sun leave counts 0, same logic as attendance.
+- `approved_days` counts the leave's overlap with the member's **assigned shift
+  days** (the roster) — same working-day rule as attendance. Leave on a day with
+  no shift counts 0.
 - `trend` points are keyed by request `start_date` (`applied` = requests
   starting that day, `approved` = approved ones starting that day).
 - `monthly` = last 6 calendar months ending with `to_date`'s month
@@ -468,6 +516,8 @@ GET /api/analytics/leaves/team?from_date=2026-09-01&to_date=2026-09-11&project_i
 ```
 Roles: Admin, Project Manager, Project Coordinator only.
 `project_id` optional. Same team scope as the other team endpoints.
+`search` optional — full-name substring filter (§0). The `monthly` series is
+recomputed over the filtered scope.
 
 ### Success response `200`
 
@@ -548,6 +598,8 @@ GET /api/analytics/wfh/team?from_date=2026-09-01&to_date=2026-09-11&project_id=3
 ```
 Roles: Admin, Project Manager, Project Coordinator only.
 `project_id` optional. Same team scope as the other team endpoints.
+`search` optional — full-name substring filter (§0). The `monthly` series is
+recomputed over the filtered scope.
 
 ### Success response `200`
 

@@ -173,8 +173,6 @@ def team_attendance(
     group_by: str = Query("day", description="day, week, or month buckets for the daily grid"),
     hide_empty: bool = Query(False, description="Hide members with no attendance rows"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (member list)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -199,7 +197,6 @@ def team_attendance(
     return svc.attendance_team(
         scope_where, scope_params, from_d, to_d,
         sort_by=sort_by, sort_dir=sort_dir, group_by=group_by, hide_empty=hide_empty,
-        page=page, page_size=page_size,
     )
 
 
@@ -266,8 +263,6 @@ def team_punctuality(
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     late_min: int = Query(3, ge=1, le=31, description="Late days marking a habitual latecomer"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (ranking)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -283,7 +278,7 @@ def team_punctuality(
         scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.punctuality_team(scope_where, scope_params, from_d, to_d, late_min=late_min, page=page, page_size=page_size)
+    return svc.punctuality_team(scope_where, scope_params, from_d, to_d, late_min=late_min)
 
 
 @router.get("/attendance/absenteeism/me", response_model=AbsenteeismMe)
@@ -313,8 +308,6 @@ def team_absenteeism(
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     streak_min: int = Query(3, ge=2, le=31, description="Consecutive absent days marking a red flag"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (member list)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -330,7 +323,17 @@ def team_absenteeism(
         scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.absenteeism_team(scope_where, scope_params, from_d, to_d, streak_min=streak_min, page=page, page_size=page_size)
+    return svc.absenteeism_team(scope_where, scope_params, from_d, to_d, streak_min=streak_min)
+
+
+_TICKET_SCOPES = {"current", "range"}
+
+
+def _check_ticket_scope(scope: str) -> str:
+    scope = (scope or "current").lower()
+    if scope not in _TICKET_SCOPES:
+        raise HTTPException(status_code=400, detail="scope must be 'current' or 'range'")
+    return scope
 
 
 @router.get("/tickets/me", response_model=TicketSummaryMe)
@@ -339,17 +342,19 @@ def my_tickets(
     request: Request,
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
+    scope: str = Query("current", description="current: all-time header; range: header over tickets created in range"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """My ticket analytics: open/overdue now, created-vs-closed in range, breakdowns, trend."""
     _require_roles(current_user, _MEMBER_ROLES)
+    scope = _check_ticket_scope(scope)
     svc = AnalyticsService(db)
     rm_user = svc.rm.get_user_by_email(current_user.get("email"))
     if not rm_user:
         raise HTTPException(status_code=404, detail="User not found in Redmine")
     from_d, to_d = _parse_range(from_date, to_date)
-    return svc.tickets_me(rm_user["id"], from_d, to_d)
+    return svc.tickets_me(rm_user["id"], from_d, to_d, scope=scope)
 
 
 @router.get("/tickets/team", response_model=TeamTicketsResponse)
@@ -360,13 +365,13 @@ def team_tickets(
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (member list)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
+    scope: str = Query("current", description="current: all-time open/overdue; range: over tickets created in range"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Team ticket analytics: per-member workload, per-project split, totals. Admin/PM/PC only."""
     roles = _require_roles(current_user, _LEAD_ROLES)
+    scope = _check_ticket_scope(scope)
     svc = AnalyticsService(db)
     rm_user = svc.rm.get_user_by_email(current_user.get("email"))
     if not rm_user:
@@ -376,7 +381,7 @@ def team_tickets(
         scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.tickets_team(scope_where, scope_params, from_d, to_d, project_id, page=page, page_size=page_size)
+    return svc.tickets_team(scope_where, scope_params, from_d, to_d, project_id, scope=scope)
 
 
 @router.get("/tickets/member", response_model=TicketMemberDetail)
@@ -388,6 +393,7 @@ def member_tickets(
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: first day of current month"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Restrict the target lookup to one project"),
+    scope: str = Query("current", description="current: all-time header; range: header over tickets created in range"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -395,6 +401,7 @@ def member_tickets(
     roles = current_user.get("roles", [])
     if not any(r in roles for r in _MEMBER_ROLES):
         raise HTTPException(status_code=403, detail="Access denied")
+    scope = _check_ticket_scope(scope)
     _check_project(db, project_id)
     svc = AnalyticsService(db)
     rm_user = svc.rm.get_user_by_email(current_user.get("email"))
@@ -405,7 +412,7 @@ def member_tickets(
         svc, current_user, roles, rm_user, redmine_user_id, user_email, project_id
     )
     # tickets_me keys on the Redmine user id.
-    return {"user": user_info, "tickets": svc.tickets_me(user_info["redmine_user_id"], from_d, to_d)}
+    return {"user": user_info, "tickets": svc.tickets_me(user_info["redmine_user_id"], from_d, to_d, scope=scope)}
 
 
 @router.get("/leaves/me", response_model=LeaveSummaryMe)
@@ -434,8 +441,6 @@ def team_leaves(
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (member list)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -450,7 +455,7 @@ def team_leaves(
         scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.leaves_team(scope_where, scope_params, from_d, to_d, page=page, page_size=page_size)
+    return svc.leaves_team(scope_where, scope_params, from_d, to_d)
 
 
 @router.get("/leaves/member", response_model=LeaveMemberDetail)
@@ -507,8 +512,6 @@ def team_wfh(
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, default: today"),
     project_id: Optional[int] = Query(None, description="Narrow to one project"),
     search: Optional[str] = Query(None, description="Filter members by name", max_length=100),
-    page: int = Query(1, ge=1, description="Page number (member list)"),
-    page_size: int = Query(50, ge=1, le=200, description="Members per page"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -523,7 +526,7 @@ def team_wfh(
         scope_where, scope_params = svc.team_scope(roles, rm_user["id"], project_id, search)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    return svc.wfh_team(scope_where, scope_params, from_d, to_d, page=page, page_size=page_size)
+    return svc.wfh_team(scope_where, scope_params, from_d, to_d)
 
 
 @router.get("/wfh/member", response_model=WfhMemberDetail)

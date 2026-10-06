@@ -58,6 +58,13 @@ class LeaveBusinessService:
         send_email_bg(method, *args)
 
     async def validate_leave_dates(self, start_date: datetime, end_date: datetime, user_id: str = None, leave_dates: list = None) -> dict:
+        """Classify each requested date as working/off and count leave days.
+
+        Shift-first: a date on which the user has a shift row is a **working**
+        day even if it is a Sunday or a public holiday (important tasks are
+        scheduled on such days). Weekends/holidays only count as non-working
+        when the user has no shift that day. Per-user, not global.
+        """
         IST = ZoneInfo("Asia/Kolkata")
 
         def _to_ist_date(dt):
@@ -65,68 +72,66 @@ class LeaveBusinessService:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(IST).date()
 
-        if leave_dates:
+        if leave_dates is not None:
             dates = sorted({_to_ist_date(d) for d in leave_dates})
             if not dates:
-                return {"valid": False, "total_days": 0, "working_days": 0, "weekends": 0, "holidays": 0, "warnings": []}
+                return {"valid": False, "total_days": 0, "working_days": 0, "weekends": 0, "holidays": 0, "no_shift": 0, "warnings": []}
             sd = dates[0]
             ed = dates[-1]
+            window = dates
         else:
             sd = _to_ist_date(start_date)
             ed = _to_ist_date(end_date)
             dates = None
+            window = [sd + timedelta(days=i) for i in range((ed - sd).days + 1)]
 
         holidays_in_range = self.leave_db.db.execute(
             select(Holiday).where(Holiday.holiday_date.between(sd, ed))
         ).scalars().all()
         holiday_map = {h.holiday_date: h.holiday_name for h in holidays_in_range}
 
-        warnings = []
-        weekend_count = 0
-        holiday_count = 0
-        no_shift_count = 0
-
+        # Which dates the user is actually scheduled to work (shift rows win).
         shift_dates = set()
         if user_id:
-            shifts = self.leave_db.db.execute(
+            shift_dates = set(self.leave_db.db.execute(
                 select(Shift.date).where(
                     Shift.keycloak_user_id == user_id,
                     Shift.date.between(sd, ed),
                 )
-            ).scalars().all()
-            shift_dates = set(shifts)
+            ).scalars().all())
 
-        if leave_dates:
-            total_days = len(dates)
-            for d in dates:
-                if d.weekday() == 6:
-                    warnings.append({"date": d.isoformat(), "type": "weekend", "label": "Sunday"})
-                    weekend_count += 1
-                elif d in holiday_map:
-                    warnings.append({"date": d.isoformat(), "type": "holiday", "label": holiday_map[d]})
-                    holiday_count += 1
-                elif shift_dates and d not in shift_dates:
-                    warnings.append({"date": d.isoformat(), "type": "no_shift", "label": "No shift assigned"})
-                    no_shift_count += 1
-        else:
-            total_days = (ed - sd).days + 1
-            current = sd
-            while current <= ed:
-                if current.weekday() == 6:
-                    warnings.append({"date": current.isoformat(), "type": "weekend", "label": "Sunday"})
-                    weekend_count += 1
-                elif current in holiday_map:
-                    warnings.append({"date": current.isoformat(), "type": "holiday", "label": holiday_map[current]})
-                    holiday_count += 1
-                elif shift_dates and current not in shift_dates:
-                    warnings.append({"date": current.isoformat(), "type": "no_shift", "label": "No shift assigned"})
-                    no_shift_count += 1
-                current += timedelta(days=1)
+        warnings = []
+        working_days = 0
+        weekend_count = 0
+        holiday_count = 0
+        no_shift_count = 0
 
-        working_days = total_days - weekend_count - holiday_count
+        for d in window:
+            is_weekend = d.weekday() >= 5  # Sat (5) + Sun (6)
+            is_holiday = d in holiday_map
+
+            if d in shift_dates:
+                # Scheduled to work — a working day regardless of weekend/holiday.
+                working_days += 1
+                if is_holiday:
+                    warnings.append({"date": d.isoformat(), "type": "working_holiday", "label": holiday_map[d]})
+                elif is_weekend:
+                    warnings.append({"date": d.isoformat(), "type": "working_weekend", "label": "Weekend"})
+            elif is_holiday:
+                warnings.append({"date": d.isoformat(), "type": "holiday", "label": holiday_map[d]})
+                holiday_count += 1
+            elif is_weekend:
+                warnings.append({"date": d.isoformat(), "type": "weekend", "label": "Weekend"})
+                weekend_count += 1
+            else:
+                # Weekday, not a holiday, no shift assigned — flag but keep it
+                # out of the working count.
+                warnings.append({"date": d.isoformat(), "type": "no_shift", "label": "No shift assigned"})
+                no_shift_count += 1
+
         return {
             "valid": working_days > 0,
-            "total_days": total_days,
+            "total_days": len(window),
             "working_days": working_days,
             "weekends": weekend_count,
             "holidays": holiday_count,
