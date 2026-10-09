@@ -243,6 +243,9 @@ class TeamTicketsResponse(BaseModel):
     member_count: int
     members: List[TeamTicketMember] = []
     by_project: List[TeamTicketProject] = []
+    by_status: List[TicketBreakdown] = []
+    by_priority: List[TicketBreakdown] = []
+    by_tracker: List[TicketBreakdown] = []
     totals: Dict[str, int] = {}
 
 

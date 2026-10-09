@@ -52,7 +52,10 @@ Filters combine, and every per-member list, total, and (where present) the
   and holidays are all treated the same way — the assigned schedule decides.
   No-shift members have 0 working days.
 - `present_days` = rows with `status = present` (includes OFFICE / WFH / remote).
-- `leave_days` = rows with `work_location_status = LEAVE` (or leave status).
+- `leave_days` = **shift days covered by an approved/emergency leave request**
+  (from the `leaves` table), or rows with `work_location_status = LEAVE` /
+  leave status. A day actually punched in stays present (**present wins**), so an
+  approved leave is never also counted as leave on a present day.
 - `wfh_days` = present rows with `work_location_status = WFH`; `office_days = present − wfh`.
 - `absent_days = max(working_days − present_days − leave_days, 0)` — a scheduled
   day with no punch counts as absent.

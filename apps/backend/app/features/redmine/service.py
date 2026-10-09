@@ -185,7 +185,7 @@ class RedmineService:
             for p in projects_data:
                 # 3. STRICT FILTER: Only include if the user has an explicit membership
                 if p["id"] in assigned_project_ids:
-                    custom_values = {cf["name"]: cf.get("value") for cf in p.get("custom_fields", [])}
+                    custom_values = {cf["name"]: (cf.get("value") or "") for cf in p.get("custom_fields", [])}
                     projects.append(ProjectResponse(
                         id=p["id"],
                         name=p["name"],

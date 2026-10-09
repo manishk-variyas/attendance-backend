@@ -25,7 +25,8 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.attendance import Attendance
 from app.utils.audit import audit_logger
 from app.utils.excel import build_shifts_excel
-from sqlalchemy import select, and_, or_
+from app.utils.holiday_scope import employee_state, find_holiday, holiday_scope_sql
+from sqlalchemy import select, and_, or_, text
 
 logger = logging.getLogger(__name__)
 
@@ -192,10 +193,8 @@ async def create_shift(
             current_date += timedelta(days=1)
             continue
         if payload.skipHolidays:
-            holiday_query = db.query(Holiday).filter(Holiday.holiday_date == current_date)
-            if payload.country:
-                holiday_query = holiday_query.filter(Holiday.country_code == payload.country)
-            if holiday_query.first():
+            target_state = employee_state(db, emp.keycloak_user_id) if emp else None
+            if find_holiday(db, current_date, target_state, payload.country):
                 skipped_holidays += 1
                 current_date += timedelta(days=1)
                 continue
@@ -554,22 +553,30 @@ async def get_shifts_by_range(
     effective_country = normalize_country(country) if country else None
     if not effective_country and target_emp and target_emp.country:
         effective_country = normalize_country(target_emp.country)
+    target_state = employee_state(db, target_emp.keycloak_user_id) if target_emp else None
 
-    hq = db.query(Holiday).filter(Holiday.holiday_date >= sd_range, Holiday.holiday_date <= ed_range)
-    if effective_country:
-        hq = hq.filter(or_(Holiday.country_code == effective_country, Holiday.is_national == True))
-    else:
-        hq = hq.filter(Holiday.is_national == True)
-    holidays = hq.all()
-    holiday_map = {h.holiday_date.isoformat(): h.to_dict() for h in holidays}
+    clause, hparams = holiday_scope_sql("", target_state, effective_country)
+    # Gazetted/national first so the primary holiday is the important one.
+    holiday_rows = db.query(Holiday).filter(
+        Holiday.holiday_date >= sd_range,
+        Holiday.holiday_date <= ed_range,
+        text(clause).bindparams(**hparams),
+    ).order_by(
+        (Holiday.holiday_type == "GAZETTED").desc(),
+        Holiday.is_national.desc(),
+        Holiday.holiday_name.asc(),
+    ).all()
+    # A date can carry several holidays; keep them all (first is the primary).
+    holidays_by_date: dict = {}
+    for h in holiday_rows:
+        holidays_by_date.setdefault(h.holiday_date.isoformat(), []).append(h.to_dict())
 
     timeline = {}
     for s in shifts:
         d = s.get("date")
         if not d:
             continue
-        if d not in timeline:
-            timeline[d] = {"date": d, "shift": None, "leave": None, "holiday": None}
+        timeline.setdefault(d, {"date": d, "shift": None, "leave": None})
         timeline[d]["shift"] = s
 
     for lv in leaves:
@@ -581,22 +588,18 @@ async def get_shifts_by_range(
         end = date.fromisoformat(ed) if isinstance(ed, str) else ed
         while current <= end:
             d_str = current.isoformat()
-            if d_str not in timeline:
-                timeline[d_str] = {"date": d_str, "shift": None, "leave": None, "holiday": None}
+            timeline.setdefault(d_str, {"date": d_str, "shift": None, "leave": None})
             if not timeline[d_str]["leave"]:
                 timeline[d_str]["leave"] = lv
             current += timedelta(days=1)
 
-    for d_str, h in holiday_map.items():
-        if d_str not in timeline:
-            timeline[d_str] = {"date": d_str, "shift": None, "leave": None, "holiday": None}
-        if not timeline[d_str]["holiday"]:
-            timeline[d_str]["holiday"] = h
+    for d_str in holidays_by_date:
+        timeline.setdefault(d_str, {"date": d_str, "shift": None, "leave": None})
+
     for entry in timeline.values():
-        if "holiday" not in entry:
-            entry["holiday"] = None
-        if entry["holiday"] is None and entry["date"] in holiday_map:
-            entry["holiday"] = holiday_map[entry["date"]]
+        hol = holidays_by_date.get(entry["date"], [])
+        entry["holiday"] = hol[0] if hol else None
+        entry["holidays"] = hol
 
     result = sorted(timeline.values(), key=lambda x: x["date"])
     return {"timeline": result}

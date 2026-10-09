@@ -582,7 +582,52 @@ class RedmineSQLService:
         ).fetchone()
         if not row:
             return None
-        return _issue_row_to_dict(row)
+        issue = _issue_row_to_dict(row)
+        issue["journals"] = self.get_issue_journals(issue_id)
+        return issue
+
+    def get_issue_journals(self, issue_id: int) -> list:
+        """Journal entries (notes + field changes) for an issue, oldest first."""
+        rows = self.db.execute(
+            text("""
+                SELECT j.id, j.user_id,
+                       btrim(COALESCE(u.firstname, '') || ' ' || COALESCE(u.lastname, '')) AS user_name,
+                       j.notes, j.private_notes, j.created_on
+                FROM redmine.journals j
+                LEFT JOIN redmine.users u ON u.id = j.user_id
+                WHERE j.journalized_id = :issue_id AND j.journalized_type = 'Issue'
+                ORDER BY j.created_on, j.id
+            """),
+            {"issue_id": issue_id},
+        ).fetchall()
+        if not rows:
+            return []
+        details = self.db.execute(
+            text("""
+                SELECT journal_id, property, prop_key, old_value, value
+                FROM redmine.journal_details
+                WHERE journal_id = ANY(:ids)
+                ORDER BY id
+            """),
+            {"ids": [r[0] for r in rows]},
+        ).fetchall()
+        by_journal: dict = {}
+        for jid, prop, key, old, new in details:
+            by_journal.setdefault(jid, []).append({
+                "property": prop, "name": key, "old_value": old, "new_value": new,
+            })
+        return [
+            {
+                "id": r[0],
+                "user_id": r[1],
+                "user_name": r[2] or "",
+                "notes": r[3],
+                "private_notes": bool(r[4]),
+                "created_on": r[5].isoformat() if r[5] else None,
+                "details": by_journal.get(r[0], []),
+            }
+            for r in rows
+        ]
 
     def get_duplicate_issue(self, subject: str, project_id: int) -> int | None:
         row = self.db.execute(

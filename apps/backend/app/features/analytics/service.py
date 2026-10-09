@@ -15,6 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.features.redmine.sql_service import RedmineSQLService
+from app.utils.holiday_scope import employee_state, holiday_dates_in_range
 
 MAX_RANGE_DAYS = 366
 _LEAVE_STATUSES = {"leave", "on_leave", "on leave"}
@@ -80,34 +81,51 @@ class AnalyticsService:
             return {}
         return self._shift_dates(list(kids), from_d, to_d)
 
-    def _holiday_set(self, from_d: date, to_d: date, country: Optional[str] = None) -> set:
-        """Holiday dates in range, matching the shifts roster calendar.
+    def _approved_leave_dates(self, keycloak_ids: list, from_d: date, to_d: date) -> dict:
+        """{keycloak_id: set(dates)} covered by approved/emergency leave in range.
 
-        Roster rule (``shifts/routes.py``): an employee's country holidays plus
-        all national holidays. We mirror that here so attendance/leave day math
-        agrees with the roster. ``country`` is the employee's ISO code; when
-        omitted, every holiday in range counts (all company data is single
-        country, and this equals the roster for any employee in it).
+        An approved leave request means the person was on leave — used so those
+        days are counted as leave (not absent) in attendance analytics.
         """
-        if country:
-            sql = """
-                SELECT holiday_date FROM holidays
-                WHERE holiday_date BETWEEN :f AND :t
-                  AND (country_code = :country OR is_national = true)
-            """
-            params = {"f": from_d, "t": to_d, "country": country}
-        else:
-            sql = "SELECT holiday_date FROM holidays WHERE holiday_date BETWEEN :f AND :t"
-            params = {"f": from_d, "t": to_d}
-        return {r[0] for r in self.db.execute(text(sql), params).fetchall()}
+        ids = [k for k in keycloak_ids if k]
+        if not ids:
+            return {}
+        rows = self.db.execute(
+            text("""
+                SELECT keycloak_user_id, start_date, end_date
+                FROM leaves
+                WHERE keycloak_user_id = ANY(:kids)
+                  AND approval_status IN ('approved', 'emergency')
+                  AND start_date <= :t AND end_date >= :f
+            """),
+            {"kids": ids, "f": from_d, "t": to_d},
+        ).fetchall()
+        out: dict = defaultdict(set)
+        for kid, start, end in rows:
+            a, b = max(start, from_d), min(end, to_d)
+            d = a
+            while d <= b:
+                out[kid].add(d)
+                d += timedelta(days=1)
+        return out
 
-    def holiday_days(self, from_d: date, to_d: date) -> int:
-        """Holidays in range (all days, including weekend holidays).
+    def _holiday_set(self, from_d: date, to_d: date, state: Optional[str] = None,
+                     country: Optional[str] = None) -> set:
+        """Holiday dates in range that apply to an employee in ``state``.
 
-        A distinct calendar figure; working days come from shifts, so a shift
-        scheduled on a holiday is both a working day and a holiday.
+        National holidays apply to all; country-wide holidays (region NULL)
+        apply to the whole country; state holidays only to that state.
         """
-        return len(self._holiday_set(from_d, to_d))
+        return holiday_dates_in_range(self.db, from_d, to_d, state, country)
+
+    def holiday_days(self, from_d: date, to_d: date, state: Optional[str] = None,
+                     country: Optional[str] = None) -> int:
+        """Holidays in range that apply to this employee (a distinct calendar figure).
+
+        Working days come from shifts, so a shift on a holiday is both a working
+        day and a holiday.
+        """
+        return len(self._holiday_set(from_d, to_d, state, country))
 
     def _attendance_rows(self, keycloak_ids: list, from_d: date, to_d: date) -> list:
         if not keycloak_ids:
@@ -134,9 +152,12 @@ class AnalyticsService:
     def _is_leave(status: Optional[str], work_location: Optional[str]) -> bool:
         return (work_location or "").upper() == "LEAVE" or (status or "").lower() in _LEAVE_STATUSES
 
-    def _summarize_rows(self, rows: list, working_days: int) -> dict:
+    def _summarize_rows(self, rows: list, working_days: int,
+                        leave_days: Optional[int] = None) -> dict:
         present = sum(1 for r in rows if self._is_present(r[2]))
-        leave = sum(1 for r in rows if not self._is_present(r[2]) and self._is_leave(r[2], r[3]))
+        if leave_days is None:
+            leave_days = sum(1 for r in rows if not self._is_present(r[2]) and self._is_leave(r[2], r[3]))
+        leave = leave_days
         wfh = sum(1 for r in rows if self._is_present(r[2]) and (r[3] or "").upper() == "WFH")
         late = sum(1 for r in rows if r[7])
         hours = round(sum(float(r[6]) for r in rows if r[6] is not None), 2)
@@ -317,27 +338,70 @@ class AnalyticsService:
 
     def attendance_me(self, keycloak_id: str, from_d: date, to_d: date) -> dict:
         rows = self._attendance_rows([keycloak_id], from_d, to_d)
-        working = self._working_days_for(keycloak_id, from_d, to_d)
-        summary = self._summarize_rows(rows, working)
+        work_dates = set(self._working_dates(keycloak_id, from_d, to_d))
+        working = len(work_dates)
+        # Leave = the person's shift days covered by an approved leave request
+        # or a leave-marked attendance row.
+        approved = self._approved_leave_dates([keycloak_id], from_d, to_d).get(keycloak_id, set())
+        present_dates = {r[1] for r in rows if self._is_present(r[2])}
+        att_leave = {r[1] for r in rows if not self._is_present(r[2]) and self._is_leave(r[2], r[3])}
+        # Present wins: a day actually worked is present, never leave.
+        leave_dates = ({d for d in work_dates if d in approved or d in att_leave}) - present_dates
+        leave_days = len(leave_dates)
+        holiday_dates = holiday_dates_in_range(
+            self.db, from_d, to_d, employee_state(self.db, keycloak_id)
+        )
+        summary = self._summarize_rows(rows, working, leave_days=leave_days)
         summary.update({
             "from_date": from_d.isoformat(),
             "to_date": to_d.isoformat(),
             "working_days": working,
-            "holiday_days": self.holiday_days(from_d, to_d),
-            "daily": [
-                {
-                    "date": r[1].isoformat(),
+            "holiday_days": len(holiday_dates),
+            "daily": self._daily_calendar(
+                rows, work_dates, leave_dates, holiday_dates, present_dates
+            ),
+        })
+        return summary
+
+    def _daily_calendar(self, rows: list, work_dates: set, leave_dates: set,
+                        holiday_dates: set, present_dates: set) -> list:
+        """One entry per relevant day: attendance row, else leave, holiday or absent.
+
+        Days with an attendance row use its recorded values; otherwise the day is
+        classified as leave / holiday / absent (present wins, then leave, holiday,
+        then a scheduled day with no punch).
+        """
+        att_by_date = {r[1]: r for r in rows}
+        days = sorted(set(work_dates) | set(holiday_dates) | leave_dates
+                      | present_dates | set(att_by_date))
+        daily = []
+        for d in days:
+            r = att_by_date.get(d)
+            if r is not None:
+                daily.append({
+                    "date": d.isoformat(),
                     "status": r[2],
                     "work_location": r[3],
                     "check_in": r[4].isoformat() if r[4] else None,
                     "check_out": r[5].isoformat() if r[5] else None,
                     "hours": float(r[6]) if r[6] is not None else None,
                     "is_late": bool(r[7]),
-                }
-                for r in rows
-            ],
-        })
-        return summary
+                })
+                continue
+            status = ("leave" if d in leave_dates
+                      else "holiday" if d in holiday_dates
+                      else "absent")
+            daily.append({
+                "date": d.isoformat(),
+                "status": status,
+                "work_location": None,
+                "check_in": None,
+                "check_out": None,
+                "hours": None,
+                "is_late": False,
+            })
+        return daily
+
 
     # Attendance row predicates shared by the member/totals/daily queries below.
     # They mirror _is_present/_is_leave exactly (NULL-safe: FILTER keeps only TRUE).
@@ -358,6 +422,34 @@ class AnalyticsService:
         return f"""{join} attendance a ON a.keycloak_user_id = m.keycloak_user_id
             AND a.attendance_date BETWEEN :f AND :t
             AND COALESCE(a.is_deleted, false) = false"""
+
+    # A member's shift days that are leave: covered by an approved leave request
+    # OR a leave-marked attendance row, but never a day they were present
+    # (present wins). Requires alias ``m`` and params :f, :t.
+    _LEAVE_WORKDAYS_SQL = """COALESCE((
+        SELECT COUNT(DISTINCT s2.date)
+        FROM shifts s2
+        WHERE s2.keycloak_user_id = m.keycloak_user_id
+          AND s2.date BETWEEN :f AND :t
+          AND NOT EXISTS (SELECT 1 FROM attendance a3
+                          WHERE a3.keycloak_user_id = m.keycloak_user_id
+                            AND a3.attendance_date = s2.date
+                            AND COALESCE(a3.is_deleted, false) = false
+                            AND LOWER(a3.status::text) = 'present')
+          AND (
+            EXISTS (SELECT 1 FROM leaves l
+                    WHERE l.keycloak_user_id = m.keycloak_user_id
+                      AND l.approval_status IN ('approved', 'emergency')
+                      AND l.start_date <= s2.date AND l.end_date >= s2.date)
+            OR EXISTS (SELECT 1 FROM attendance a2
+                       WHERE a2.keycloak_user_id = m.keycloak_user_id
+                         AND a2.attendance_date = s2.date
+                         AND COALESCE(a2.is_deleted, false) = false
+                         AND NOT (LOWER(a2.status::text) = 'present')
+                         AND (UPPER(a2.work_location_status::text) = 'LEAVE'
+                              OR LOWER(a2.status::text) IN ('leave', 'on_leave', 'on leave')))
+          )
+    ), 0)"""
 
     def attendance_team(
         self,
@@ -397,7 +489,7 @@ class AnalyticsService:
         member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
                (m.keycloak_user_id IS NOT NULL) AS has_login,
                COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
-               COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days,
+               {self._LEAVE_WORKDAYS_SQL} AS leave_days,
                COUNT(a.id) FILTER (WHERE a.is_late) AS late_days,
                COALESCE(SUM(a.total_hours), 0) AS total_hours,
                COUNT(a.id) FILTER (WHERE {self._ATT_WFH}) AS wfh_days,
@@ -459,11 +551,11 @@ class AnalyticsService:
                 {self._attendance_scope_join(hide_empty)}"""),
             params,
         ).fetchone()
-        present_total, leave_total = (agg[0] or 0), (agg[1] or 0)
+        present_total = agg[0] or 0
         totals = {
             "present_days": present_total,
             "absent_days": sum(m["absent_days"] for m in member_rows),
-            "leave_days": leave_total,
+            "leave_days": sum(m["leave_days"] for m in member_rows),
             "wfh_days": (agg[4] or 0),
             "late_days": (agg[2] or 0),
             "total_hours": round(float(agg[3] or 0), 2),
@@ -472,7 +564,6 @@ class AnalyticsService:
         day_rows = self.db.execute(
             text(f"""SELECT date_trunc('{trunc}', a.attendance_date)::date AS b,
                     COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_PRESENT}) AS present,
-                    COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_LEAVE}) AS leave,
                     COUNT(DISTINCT (a.keycloak_user_id, a.attendance_date)) FILTER (WHERE {self._ATT_WFH}) AS wfh
                 FROM attendance a
                 JOIN ({identity}) m ON m.keycloak_user_id = a.keycloak_user_id
@@ -481,7 +572,39 @@ class AnalyticsService:
                 GROUP BY b ORDER BY b"""),
             params,
         ).fetchall()
-        per_bucket = {r[0]: {"present": r[1] or 0, "leave": r[2] or 0, "wfh": r[3] or 0} for r in day_rows}
+        per_bucket = {r[0]: {"present": r[1] or 0, "wfh": r[2] or 0} for r in day_rows}
+        # Leave per bucket = scheduled member-days that are leave (approved
+        # leave request or leave-marked attendance row).
+        leave_rows = self.db.execute(
+            text(f"""SELECT date_trunc('{trunc}', s.date)::date AS b,
+                    COUNT(DISTINCT (s.keycloak_user_id, s.date)) AS leave
+                FROM shifts s
+                JOIN ({identity}) m ON m.keycloak_user_id = s.keycloak_user_id
+                WHERE s.date BETWEEN :f AND :t
+                  AND NOT EXISTS (SELECT 1 FROM attendance a3
+                                  WHERE a3.keycloak_user_id = s.keycloak_user_id
+                                    AND a3.attendance_date = s.date
+                                    AND COALESCE(a3.is_deleted, false) = false
+                                    AND LOWER(a3.status::text) = 'present')
+                  AND (
+                    EXISTS (SELECT 1 FROM leaves l
+                            WHERE l.keycloak_user_id = s.keycloak_user_id
+                              AND l.approval_status IN ('approved', 'emergency')
+                              AND l.start_date <= s.date AND l.end_date >= s.date)
+                    OR EXISTS (SELECT 1 FROM attendance a2
+                               WHERE a2.keycloak_user_id = s.keycloak_user_id
+                                 AND a2.attendance_date = s.date
+                                 AND COALESCE(a2.is_deleted, false) = false
+                                 AND NOT (LOWER(a2.status::text) = 'present')
+                                 AND (UPPER(a2.work_location_status::text) = 'LEAVE'
+                                      OR LOWER(a2.status::text) IN ('leave', 'on_leave', 'on leave')))
+                  )
+                GROUP BY b"""),
+            params,
+        ).fetchall()
+        for r in leave_rows:
+            per_bucket.setdefault(r[0], {}).setdefault("leave", 0)
+            per_bucket[r[0]]["leave"] = r[1] or 0
         # Scheduled member-days per bucket = distinct (member, date) shift rows,
         # i.e. how many people were rostered each bucket. Absent = scheduled
         # minus present minus leave.
@@ -520,11 +643,24 @@ class AnalyticsService:
             params,
         ).scalar() or 0
 
+        # Team holidays = union of holidays across scope members' states.
+        scope_states = {r[0] for r in self.db.execute(
+            text(f"""SELECT DISTINCT COALESCE(em2.state_code, ol.state_code)
+                FROM ({identity}) m
+                JOIN employee_master em2 ON em2.keycloak_user_id = m.keycloak_user_id
+                LEFT JOIN office_locations ol ON ol.id = em2.location_id
+                WHERE m.keycloak_user_id IS NOT NULL"""),
+            params,
+        ).fetchall()}
+        team_holidays = set()
+        for st in scope_states:
+            team_holidays |= holiday_dates_in_range(self.db, from_d, to_d, st)
+
         return {
             "from_date": from_d.isoformat(),
             "to_date": to_d.isoformat(),
             "working_days": team_working_days,
-            "holiday_days": self.holiday_days(from_d, to_d),
+            "holiday_days": len(team_holidays),
             "group_by": group_by,
             "member_count": n,
             "members": member_rows,
@@ -740,7 +876,10 @@ class AnalyticsService:
         rows = self._attendance_rows([keycloak_id], from_d, to_d)
         status = self._member_day_status(rows).get(keycloak_id, {})
         work_dates = self._working_dates(keycloak_id, from_d, to_d)
-        day_map = {d: ("present" if status.get(d) == "present" else "leave" if status.get(d) == "leave" else "absent") for d in work_dates}
+        approved = self._approved_leave_dates([keycloak_id], from_d, to_d).get(keycloak_id, set())
+        day_map = {d: ("present" if status.get(d) == "present"
+                       else "leave" if (status.get(d) == "leave" or d in approved)
+                       else "absent") for d in work_dates}
         streaks = self._streaks(day_map, work_dates, 2)
         by_weekday = Counter(d.weekday() for d in work_dates if day_map[d] == "absent")
         return {
@@ -768,7 +907,7 @@ class AnalyticsService:
         member_inner = f"""SELECT m.redmine_user_id AS rm_id, m.name AS name, m.email AS email,
                (m.keycloak_user_id IS NOT NULL) AS has_login,
                COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
-               COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days,
+               {self._LEAVE_WORKDAYS_SQL} AS leave_days,
                COALESCE((
                    SELECT COUNT(DISTINCT s.date) FROM shifts s
                    WHERE s.keycloak_user_id = m.keycloak_user_id
@@ -779,16 +918,6 @@ class AnalyticsService:
                 AND a.attendance_date BETWEEN :f AND :t
                 AND COALESCE(a.is_deleted, false) = false
             GROUP BY m.redmine_user_id, m.name, m.email, m.keycloak_user_id"""
-        # member_sums reused by the absent_total aggregate below.
-        member_sums = f"""SELECT
-                COUNT(a.id) FILTER (WHERE {self._ATT_PRESENT}) AS present_days,
-                COUNT(a.id) FILTER (WHERE {self._ATT_LEAVE}) AS leave_days,
-                m.keycloak_user_id AS keycloak_user_id
-            FROM ({identity}) m
-            LEFT JOIN attendance a ON a.keycloak_user_id = m.keycloak_user_id
-                AND a.attendance_date BETWEEN :f AND :t
-                AND COALESCE(a.is_deleted, false) = false
-            GROUP BY m.redmine_user_id, m.keycloak_user_id"""
         params = {**scope_params, "f": from_d, "t": to_d}
         result = self.db.execute(
             text(f"SELECT * FROM ({member_inner}) t "
@@ -825,14 +954,16 @@ class AnalyticsService:
                 params,
             ).fetchall()]
         shift_map = self._shift_dates(all_member_kids, from_d, to_d)
+        approved_map = self._approved_leave_dates(all_member_kids, from_d, to_d)
 
         def _work_dates_for(kid: Optional[str]) -> list:
             return sorted(shift_map.get(kid, set())) if kid else []
 
         def _day_map_for(kid: str, wd: list) -> dict:
             status = page_status.get(kid, {})
+            approved = approved_map.get(kid, set())
             return {d: ("present" if status.get(d) == "present"
-                        else "leave" if status.get(d) == "leave" else "absent")
+                        else "leave" if (status.get(d) == "leave" or d in approved) else "absent")
                     for d in wd}
 
         member_rows = []
@@ -884,8 +1015,9 @@ class AnalyticsService:
             if not status:
                 zero_list.append((name or "").strip())
             wd = _work_dates_for(kid)
+            approved = approved_map.get(kid or "", set())
             day_map = {d: ("present" if status.get(d) == "present"
-                           else "leave" if status.get(d) == "leave" else "absent")
+                           else "leave" if (status.get(d) == "leave" or d in approved) else "absent")
                        for d in wd}
             for s in self._streaks(day_map, wd, streak_min):
                 red_flags.append({"name": (name or "").strip(), "email": email or "", **s})
@@ -893,19 +1025,8 @@ class AnalyticsService:
         # matching the old loop-over-name-ordered-members behavior.
         red_flags.sort(key=lambda x: x["length"], reverse=True)
         # totals.absent_days sums the per-member absence: each member's working
-        # set is their assigned shift dates.
-        absent_total = self.db.execute(
-            text(f"""SELECT COALESCE(SUM(GREATEST(
-                        COALESCE((
-                            SELECT COUNT(DISTINCT s.date) FROM shifts s
-                            WHERE s.keycloak_user_id = t.keycloak_user_id
-                              AND s.date BETWEEN :f AND :t
-                        ), 0)
-                        - present_days - leave_days, 0)), 0)
-                FROM ({member_sums}) t"""),
-            params,
-        ).fetchone()
-        absent_total = absent_total[0] or 0 if absent_total else 0
+        # set is their assigned shift dates, with approved leave counted as leave.
+        absent_total = sum(m["absent_days"] for m in member_rows)
         n = len(result)
         return {
             "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
@@ -1580,7 +1701,9 @@ class AnalyticsService:
             text(f"""SELECT COUNT(i.id) FILTER (WHERE NOT st.is_closed) AS open_now,
                    COUNT(i.id) FILTER (WHERE NOT st.is_closed AND i.due_date < {self._IST_TODAY_SQL}) AS overdue,
                     COUNT(i.id) FILTER (WHERE i.created_on::date BETWEEN :f AND :t) AS created_in_range,
-                    COUNT(i.id) FILTER (WHERE st.is_closed AND i.closed_on::date BETWEEN :f AND :t) AS closed_in_range
+                    COUNT(i.id) FILTER (WHERE st.is_closed AND i.closed_on::date BETWEEN :f AND :t) AS closed_in_range,
+                    COUNT(i.id) AS total,
+                    COUNT(i.id) FILTER (WHERE st.is_closed) AS closed
                 FROM redmine.issues i
                 JOIN redmine.issue_statuses st ON st.id = i.status_id
                 WHERE i.assigned_to_id IN (
@@ -1612,6 +1735,27 @@ class AnalyticsService:
                 ORDER BY total DESC, i.project_id ASC"""),
             params,
         ).fetchall()
+        def _breakdown(col: str, join: str, name_col: str) -> list:
+            rows = self.db.execute(
+                text(f"""
+                    SELECT {col} AS bid, {name_col} AS bname, COUNT(*) AS cnt
+                    FROM redmine.issues i
+                    JOIN redmine.issue_statuses st ON st.id = i.status_id
+                    {join}
+                    WHERE i.assigned_to_id IN (
+                        SELECT u.id
+                        FROM redmine.users u
+                        JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                        LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                        WHERE {scope_where}
+                    ) {proj_filter} {cohort_filter}
+                    GROUP BY {col}, {name_col}
+                    ORDER BY cnt DESC
+                """),
+                params,
+            ).fetchall()
+            return [{"id": r[0], "name": r[1], "count": r[2]} for r in rows]
+
         return {
             "from_date": from_d.isoformat(),
             "to_date": to_d.isoformat(),
@@ -1621,7 +1765,17 @@ class AnalyticsService:
                 {"project_id": r[0], "project_name": r[1], "total": r[2], "open": r[3] or 0, "closed": r[4] or 0}
                 for r in project_rows
             ],
+            "by_status": _breakdown("st.id", "", "st.name"),
+            "by_priority": _breakdown(
+                "i.priority_id", "JOIN redmine.enumerations p ON p.id = i.priority_id", "p.name"
+            ),
+            "by_tracker": _breakdown(
+                "i.tracker_id", "JOIN redmine.trackers t ON t.id = i.tracker_id", "t.name"
+            ),
             "totals": {
+                "total": totals[4] or 0,
+                "open": totals[0] or 0,
+                "closed": totals[5] or 0,
                 "open_now": totals[0] or 0,
                 "overdue_now": totals[1] or 0,
                 "created_in_range": totals[2] or 0,

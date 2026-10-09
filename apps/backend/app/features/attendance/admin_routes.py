@@ -256,12 +256,12 @@ def admin_create_attendance(
         remarks=payload.remarks,
         location_id=payload.location_id,
     )
+    if payload.shift_code and shift_rec:
+        shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
+
     db.add(attendance)
     db.commit()
     db.refresh(attendance)
-
-    if payload.shift_code and shift_rec:
-        shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
 
     logger.info(f"Admin {current_user['email']} created attendance for {payload.user_email} on {att_date}")
     return _to_response(db, attendance)
