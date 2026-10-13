@@ -164,6 +164,9 @@ app.include_router(leave_balance_manager_router, prefix="/api", tags=["admin-lea
 from app.features.countries import router as countries_router
 app.include_router(countries_router, prefix="/api", tags=["countries"])
 
+from app.features.states.routes import router as states_router
+app.include_router(states_router, prefix="/api", tags=["states"])
+
 # Register Location Tracking routes
 from app.features.location.routes import router as location_router
 app.include_router(location_router, prefix="/api/location", tags=["location"])
@@ -209,4 +212,10 @@ app.include_router(notifications_router, prefix="/api", tags=["notifications"])
 # Register Analytics routes
 from app.features.analytics.routes import router as analytics_router
 app.include_router(analytics_router, prefix="/api", tags=["analytics"])
+
+from app.core.database import engine
+from app.core.telemetry import init_metrics, init_tracing
+
+init_metrics(app)
+init_tracing(app, engine=engine)
 

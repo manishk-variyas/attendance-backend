@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, date
-from sqlalchemy import Column, String, Date, DateTime, Numeric, Boolean, Enum as SAEnum, Computed, UniqueConstraint, CheckConstraint, text
+from sqlalchemy import Column, String, Date, DateTime, Numeric, Boolean, Enum as SAEnum, UniqueConstraint, CheckConstraint, ForeignKey, text
 from sqlalchemy.dialects.postgresql import UUID
 from app.core.models import Base
 
@@ -27,17 +27,16 @@ class Attendance(Base):
     check_out_lat = Column(Numeric(10, 8), nullable=True)
     check_out_lng = Column(Numeric(11, 8), nullable=True)
     check_out_location_name = Column(String(500), nullable=True)
+    check_in_device = Column(String(100), nullable=True)
+    check_out_device = Column(String(100), nullable=True)
     location_id = Column(UUID(as_uuid=True), nullable=True)
-    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'LEAVE', name='work_location', create_type=False), nullable=False, server_default=text("'OFFICE'"))
+    shift_id = Column(UUID(as_uuid=True), ForeignKey("shifts.id", ondelete="SET NULL"), nullable=True)
+    actual_location_id = Column(UUID(as_uuid=True), ForeignKey("office_locations.id", ondelete="SET NULL"), nullable=True)
+    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'OUT_OF_OFFICE', 'LEAVE', name='work_location', create_type=False), nullable=False, server_default=text("'OFFICE'"))
     per_diem_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     conveyance_eligible = Column(Boolean, nullable=False, server_default=text("false"))
     shift_code = Column(String(50), nullable=True)
-    total_hours = Column(Numeric(5, 2), Computed(
-        "CASE WHEN check_in_time IS NOT NULL AND check_out_time IS NOT NULL "
-        "THEN EXTRACT(EPOCH FROM (check_out_time - check_in_time)) / 3600.0 "
-        "ELSE NULL END",
-        persisted=True,
-    ))
+    total_hours = Column(Numeric(5, 2), nullable=True)
     is_late = Column(Boolean, nullable=False, server_default=text("false"))
     status = Column(SAEnum('present', 'absent', 'half_day', 'on_leave', 'holiday', name='attendance_status', create_type=False), nullable=False, server_default=text("'present'"))
     is_manual_entry = Column(Boolean, nullable=False, server_default=text("false"))
@@ -64,7 +63,16 @@ class Attendance(Base):
             "checkOutLat": float(self.check_out_lat) if self.check_out_lat else None,
             "checkOutLng": float(self.check_out_lng) if self.check_out_lng else None,
             "checkOutLocationName": self.check_out_location_name,
+            "checkInDevice": self.check_in_device,
+            "checkOutDevice": self.check_out_device,
             "locationId": str(self.location_id) if self.location_id else None,
+            "expectedLocationId": str(self.location_id) if self.location_id else None,
+            "shiftId": str(self.shift_id) if self.shift_id else None,
+            "actualLocationId": str(self.actual_location_id) if self.actual_location_id else None,
+            "locationMismatch": bool(
+                self.location_id and self.actual_location_id
+                and self.location_id != self.actual_location_id
+            ),
             "workLocationStatus": self.work_location_status,
             "perDiemEligible": self.per_diem_eligible,
             "conveyanceEligible": self.conveyance_eligible,

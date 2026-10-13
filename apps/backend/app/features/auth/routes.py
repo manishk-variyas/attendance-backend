@@ -59,6 +59,7 @@ from app.utils.turnstile import verify_turnstile
 from app.services.email_service import email_service
 from app.utils.email import send_password_reset_email, send_password_changed_email
 from app.middleware.logging import _get_client_ip, _get_security_ip
+from app.utils.session_token import get_request_session_id
 from app.features.auth.schemas import LoginRequest, SignupRequest, SignupResponse, ForgotPasswordRequest, ResetPasswordRequest
 from app.features.redmine.service import redmine_service
 
@@ -310,6 +311,10 @@ async def login(
         ))
         db.commit()
 
+    # Do NOT invalidate a session presented via the shared browser cookie: with
+    # per-tab sessions each tab has its own token, and the cookie still belongs
+    # to another tab's user. Only the new session is created here; each user's
+    # own extra sessions are capped by enforce_session_limit below.
     session_id = await create_session(
         user_data,
         tokens.get("refresh_token"),
@@ -328,7 +333,13 @@ async def login(
     log_login(correlation_id, payload.username, success=True, client_ip=client_ip, extra={"user_sub": user_data.get("sub")})
 
     # Send response with session cookie
-    response = JSONResponse({"message": "Login successful", "user": user_data})
+    response = JSONResponse({
+        "message": "Login successful",
+        "user": user_data,
+        # Per-tab token: the SPA stores this in sessionStorage and sends it as
+        # `Authorization: Bearer <token>`, so each tab holds its own session.
+        "session_token": session_id,
+    })
     response.set_cookie(
         key="session_id",
         value=session_id,
@@ -354,6 +365,18 @@ async def login(
     return response
 
 
+@router.get("/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Who am I — the user behind the current session cookie.
+
+    The frontend calls this on load to detect a user switch in a shared
+    browser (one session cookie per browser; the last login wins for all
+    tabs). If the returned user differs from the cached one, the UI must
+    replace its auth state (or prompt to switch users).
+    """
+    return current_user
+
+
 @router.post("/refresh")
 @limiter.limit("20/minute")
 async def refresh_session_endpoint(
@@ -374,8 +397,8 @@ async def refresh_session_endpoint(
     correlation_id = request.state.correlation_id
     client_ip = _get_client_ip(request)
 
-    # Get the session cookie from the request
-    old_session_id = request.cookies.get("session_id")
+    # Get the session id from the header (per-tab) or cookie
+    old_session_id = get_request_session_id(request)
     if not old_session_id:
         log_session_refresh(correlation_id, success=False, client_ip=client_ip)
         raise HTTPException(status_code=401, detail="No session")
@@ -429,7 +452,11 @@ async def refresh_session_endpoint(
     log_session_refresh(correlation_id, username=user_data.get("username"), success=True, client_ip=client_ip)
 
     # Set the new session cookie
-    response = JSONResponse({"message": "Session refreshed", "user": user_data})
+    response = JSONResponse({
+        "message": "Session refreshed",
+        "user": user_data,
+        "session_token": new_session_id,
+    })
     response.set_cookie(
         key="session_id",
         value=new_session_id,
@@ -456,7 +483,7 @@ async def activity(request: Request, current_user: dict = Depends(get_current_us
     so that a mid-session IP change can be detected later (compared
     against the login IP stored in `session.data.login_ip`).
     """
-    session_id = request.cookies.get("session_id")
+    session_id = get_request_session_id(request)
     if session_id:
         await update_session_login_ip(session_id, _get_client_ip(request))
     return {"ok": True}
@@ -479,7 +506,7 @@ async def logout(request: Request):
     client_ip = _get_client_ip(request)
     username = "-"
 
-    session_id = request.cookies.get("session_id")
+    session_id = get_request_session_id(request)
 
     if session_id:
         session_data = await get_session(session_id)

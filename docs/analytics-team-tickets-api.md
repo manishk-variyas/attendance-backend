@@ -65,6 +65,23 @@ GET /api/analytics/tickets/team
 `{ id, name, count }` — same shape as the per-employee breakdowns, so the frontend
 can reuse one component. Labels come from Redmine (e.g. `High P1`, `Critical P0`).
 
+`by_status[]` also carries the **status × priority cross-tab** in `by_priority`:
+```json
+"by_status": [
+  { "id": 1, "name": "Open", "count": 51,
+    "by_priority": [
+      { "id": 3, "name": "High P1",   "count": 18 },
+      { "id": 4, "name": "Medium P2", "count": 21 },
+      { "id": 5, "name": "Low P3",    "count": 12 }
+    ] }
+]
+```
+`count` always equals the sum of its `by_priority` counts.
+
+### `authored_by_priority[]`
+Priority split of tickets **authored by** the team members in scope:
+`[{ id, name, count }]`.
+
 ### `totals`
 | Field | Meaning |
 |---|---|

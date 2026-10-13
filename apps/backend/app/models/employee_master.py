@@ -30,6 +30,7 @@ class EmployeeMaster(Base):
     contact_number = Column(String(50), nullable=True)
     alt_contact_number = Column(String(50), nullable=True)
     country = Column(String(100), server_default=text("''"))
+    state_code = Column(String(10), nullable=True)
     title = Column(String(10), nullable=True)
     status = Column(String(20), nullable=False, server_default=text("'active'"))
     is_active = Column(Boolean, nullable=False, server_default=text("true"))

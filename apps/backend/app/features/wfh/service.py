@@ -8,6 +8,8 @@ from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.employee_master import EmployeeMaster
 from app.models.holiday import Holiday
+from app.utils.holiday_scope import employee_state, find_holiday
+from app.utils.sanitize import escape_like
 
 
 SORT_COLUMNS = {"created_at", "start_date", "status", "user_email"}
@@ -33,7 +35,7 @@ class WfhService:
         if status:
             query = query.filter(WfhRequest.status == status)
         if search:
-            query = query.filter(WfhRequest.reason.ilike(f"%{search}%"))
+            query = query.filter(WfhRequest.reason.ilike(f"%{escape_like(search)}%", escape="\\"))
         return self._apply_pagination(query, sort_by, sort_dir, page, page_size)
 
     def get_managed_requests_paginated(self, db: Session, target_emails: list | None,
@@ -52,9 +54,9 @@ class WfhService:
             query = query.filter(WfhRequest.start_date <= to_dt)
         if search:
             matching = db.query(EmployeeMaster.user_email).filter(
-                EmployeeMaster.user_email.ilike(f"%{search}%") |
-                EmployeeMaster.first_name.ilike(f"%{search}%") |
-                EmployeeMaster.last_name.ilike(f"%{search}%")
+                EmployeeMaster.user_email.ilike(f"%{escape_like(search)}%", escape="\\") |
+                EmployeeMaster.first_name.ilike(f"%{escape_like(search)}%", escape="\\") |
+                EmployeeMaster.last_name.ilike(f"%{escape_like(search)}%", escape="\\")
             ).all()
             emails = {e[0] for e in matching}
             if emails:
@@ -112,6 +114,7 @@ class WfhService:
         request_ids = []
         created = 0
         skipped = {"weekends": 0, "holidays": 0}
+        state = employee_state(db, keycloak_user_id)
 
         # Build the list of dates to process
         if wfh_dates:
@@ -128,8 +131,7 @@ class WfhService:
                 skipped["weekends"] += 1
                 continue
             if skip_holidays:
-                holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
-                if holiday:
+                if find_holiday(db, current, state):
                     skipped["holidays"] += 1
                     continue
 

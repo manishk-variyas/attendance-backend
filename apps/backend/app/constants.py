@@ -10,6 +10,7 @@ class WorkLocation(str, Enum):
     WFH = "WFH"
     REMOTE_ONSITE = "REMOTE_ONSITE"
     REMOTE_OFFSITE = "REMOTE_OFFSITE"
+    OUT_OF_OFFICE = "OUT_OF_OFFICE"
     LEAVE = "LEAVE"
 
 
@@ -51,6 +52,7 @@ class WorkLocation(str, Enum):
     WFH = "WFH"
     REMOTE_ONSITE = "REMOTE_ONSITE"
     REMOTE_OFFSITE = "REMOTE_OFFSITE"
+    OUT_OF_OFFICE = "OUT_OF_OFFICE"
     LEAVE = "LEAVE"
 
 

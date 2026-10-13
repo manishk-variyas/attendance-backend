@@ -61,6 +61,33 @@ def _validate_uploaded_file(f: UploadFile):
         )
 
 
+def _user_error(e: Exception, action: str) -> tuple[int, str]:
+    """Map an upstream failure to a (status_code, message) safe to show an end user.
+
+    Never exposes the upstream product name, raw response body, or stack traces.
+    `action` is a user-facing verb phrase, e.g. "create tickets in this project".
+    """
+    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+        code = e.response.status_code
+        body = (e.response.text or "").lower()
+        if code in (401, 403) or "not authorized" in body:
+            return 403, f"You don't have permission to {action}. Please contact your administrator."
+        if code == 404:
+            return 404, "We couldn't find what you were looking for. It may have been removed."
+        if code == 409:
+            return 409, "This change conflicts with an existing item. Please refresh and try again."
+        if code == 422:
+            # The upstream service drops required fields (e.g. project/tracker
+            # come back "blank") when the acting user lacks permission for the
+            # action, so treat that pattern as a permission problem.
+            if "cannot be blank" in body or "is not included in the list" in body:
+                return 403, f"You don't have permission to {action}. Please contact your administrator."
+            return 422, "Some of the details are invalid. Please review them and try again."
+        if code >= 500:
+            return 503, "The service is temporarily unavailable. Please try again in a few minutes."
+    return 502, f"We couldn't {action} right now. Please try again or contact your administrator."
+
+
 def _resolve_employee_id_from_redmine_user_id(db: Session, redmine_user_id) -> Optional[uuid.UUID]:
     """Resolve a Redmine internal user id (integer) into our app's
     employee_master.id (UUID).
@@ -209,15 +236,17 @@ async def create_redmine_role(
     try:
         role = await redmine_service.create_role(payload.name, payload.permissions)
     except httpx.HTTPStatusError as e:
-        detail = e.response.text if e.response is not None else str(e)
-        raise HTTPException(status_code=400, detail=detail)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Role create failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "create this role")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        logger.exception("Role create failed")
+        raise HTTPException(status_code=400, detail="We couldn't create the role right now. Please try again.")
     try:
         db.commit()
     except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Role created in Redmine but failed to commit backend transaction")
+        raise HTTPException(status_code=500, detail="Something went wrong while saving the role. Please try again.")
     audit_logger.info(
         f"Role created: {payload.name} by {current_user.get('username')}",
         extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "create_role", "username": current_user.get("username"), "status": "success", "role_name": payload.name, "client_ip": _get_client_ip(request)}},
@@ -246,16 +275,18 @@ async def update_redmine_role(
         role = await redmine_service.update_role(role_id, payload.name, payload.permissions)
     except httpx.HTTPStatusError as e:
         db.rollback()
-        detail = e.response.text if e.response is not None else str(e)
-        raise HTTPException(status_code=400, detail=detail)
-    except Exception as e:
+        logger.error("Role update failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "update this role")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("Role update failed")
+        raise HTTPException(status_code=400, detail="We couldn't update the role right now. Please try again.")
     try:
         db.commit()
     except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Role updated in Redmine but failed to commit backend transaction")
+        raise HTTPException(status_code=500, detail="Something went wrong while saving the role. Please try again.")
     audit_logger.info(
         f"Role {role_id} updated by {current_user.get('username')}",
         extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "update_role", "username": current_user.get("username"), "status": "success", "role_id": role_id, "role_name": payload.name, "client_ip": _get_client_ip(request)}},
@@ -292,14 +323,20 @@ async def delete_redmine_role(
     except HTTPException:
         db.rollback()
         raise
-    except Exception as e:
+    except httpx.HTTPStatusError as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Role delete failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "delete this role")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        db.rollback()
+        logger.exception("Role delete failed")
+        raise HTTPException(status_code=400, detail="We couldn't delete the role right now. Please try again.")
     try:
         db.commit()
     except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Role deleted in Redmine but failed to commit backend transaction")
+        raise HTTPException(status_code=500, detail="Something went wrong while saving the role. Please try again.")
     audit_logger.info(
         f"Role {role_id} deleted by {current_user.get('username')}",
         extra={"correlation_id": request.state.correlation_id, "extra_data": {"action": "delete_role", "username": current_user.get("username"), "status": "success", "role_id": role_id, "role_name": existing["name"], "client_ip": _get_client_ip(request)}},
@@ -382,9 +419,13 @@ async def create_project(
         project = await redmine_service.create_project(data)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Project creation failed for {data.customerName}: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        logger.error("Project create failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "create this project")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        logger.exception(f"Project creation failed for {data.customerName}")
+        raise HTTPException(status_code=400, detail="We couldn't create the project right now. Please try again.")
 
     audit_logger.info(
         f"Project created: {data.customerName} by {current_user.get('username')}",
@@ -420,9 +461,13 @@ async def update_project(
         project = await redmine_service.update_project(project_id_or_identifier, data)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Project update failed for {project_id_or_identifier}: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        logger.error("Project update failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "update this project")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        logger.exception(f"Project update failed for {project_id_or_identifier}")
+        raise HTTPException(status_code=400, detail="We couldn't update the project right now. Please try again.")
 
     audit_logger.info(
         f"Project updated: {project_id_or_identifier} by {current_user.get('username')}",
@@ -456,12 +501,16 @@ async def delete_project(
         deleted = await redmine_service.delete_project(project_id_or_identifier)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Project deletion failed for {project_id_or_identifier}: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        logger.error("Project delete failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "delete this project")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        logger.exception(f"Project deletion failed for {project_id_or_identifier}")
+        raise HTTPException(status_code=400, detail="We couldn't delete the project right now. Please try again.")
 
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id_or_identifier}' not found in Redmine")
+        raise HTTPException(status_code=404, detail="Project not found")
 
     audit_logger.info(
         f"Project deleted: {project_id_or_identifier} by {current_user.get('username')}",
@@ -1394,7 +1443,7 @@ async def remove_project_member(
 
 @router.get("/search", response_model=SearchResponse)
 async def global_search(
-    q: str = Query(..., min_length=1, description="Search query"),
+    q: str = Query(..., min_length=1, max_length=100, description="Search query"),
     limit: int = Query(5, ge=1, le=50, description="Max results per section"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1467,7 +1516,7 @@ def list_custom_fields(
 
 @router.get("/redmine/issues/search")
 def search_redmine_issues(
-    q: str = Query(..., min_length=1, description="Search query"),
+    q: str = Query(..., min_length=1, max_length=100, description="Search query"),
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
     limit: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
@@ -1538,7 +1587,7 @@ async def create_redmine_issue(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Redmine user not found. Contact admin to sync your account.",
+            detail="Your account isn't set up for tickets yet. Please contact your administrator.",
         )
 
     redmine_user_id = user["id"]
@@ -1675,16 +1724,14 @@ async def create_redmine_issue(
 
         return {"status": "success", "message": "Issue created successfully", "id": issue["id"]}
     except httpx.HTTPStatusError as e:
-        logger.error("Redmine error (create issue): status=%s body=%s", e.response.status_code, e.response.text)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Redmine error: {e.response.text}",
-        )
+        logger.error("Ticket create failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "create tickets in this project")
+        raise HTTPException(status_code=code, detail=message)
     except Exception as e:
-        logger.error("Failed to create issue: %s", e)
+        logger.exception("Ticket create failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to create issue: {e}",
+            detail="We couldn't create the ticket right now. Please try again or contact your administrator.",
         )
 
 
@@ -1704,7 +1751,12 @@ async def download_attachment(
         )
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail="Attachment not found")
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            logger.error("Attachment download failed: status=%s", resp.status_code)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="We couldn't download the attachment right now. Please try again.",
+            )
 
         content_type = resp.headers.get("content-type", "application/octet-stream")
         return StreamingResponse(
@@ -1740,7 +1792,7 @@ async def delete_attachment(
 
     user = sql.get_user_by_email(email)
     if not user:
-        raise HTTPException(status_code=404, detail="Redmine user not found")
+        raise HTTPException(status_code=404, detail="Your account isn't set up for tickets yet. Please contact your administrator.")
     redmine_user_id = user["id"]
 
     if is_admin:
@@ -1782,7 +1834,7 @@ async def upload_issue_attachment(
     email = current_user.get("email")
     user = sql.get_user_by_email(email)
     if not user:
-        raise HTTPException(status_code=400, detail="Redmine user not found")
+        raise HTTPException(status_code=400, detail="Your account isn't set up for tickets yet. Please contact your administrator.")
 
     redmine_user_id = user["id"]
     is_admin = "Admin" in roles
@@ -1858,6 +1910,24 @@ def get_redmine_issue(
     issue = sql.get_issue_by_id_enriched(issue_id)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
+
+    # Scope like the subtasks/edit endpoints: Admin has full access; PM/PC only
+    # in the issue's project; everyone else only their own (assigned/authored).
+    if "Admin" not in roles:
+        rm_user = sql.get_user_by_email(current_user.get("email"))
+        if not rm_user:
+            raise HTTPException(status_code=404, detail="User not found in Redmine")
+        if "Project Manager" in roles or "Project Coordinator" in roles:
+            if not sql.is_project_member(rm_user["id"], issue["project_id"]):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this issue's project",
+                )
+        elif issue.get("assigned_to_id") != rm_user["id"] and issue.get("author_id") != rm_user["id"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only view tickets you created or are assigned to",
+            )
     return {"status": "success", "issue": issue}
 
 
@@ -1951,7 +2021,18 @@ async def delete_redmine_issue(
     if "Admin" not in roles:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
-    deleted = await redmine_service.delete_issue(issue_id)
+    try:
+        deleted = await redmine_service.delete_issue(issue_id)
+    except httpx.HTTPStatusError as e:
+        logger.error("Ticket delete failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "delete this ticket")
+        raise HTTPException(status_code=code, detail=message)
+    except Exception:
+        logger.exception("Ticket delete failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="We couldn't delete the ticket right now. Please try again or contact your administrator.",
+        )
     if not deleted:
         raise HTTPException(status_code=404, detail="Issue not found")
 
@@ -1988,7 +2069,7 @@ async def update_redmine_issue(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Redmine user not found. Contact admin to sync your account.",
+            detail="Your account isn't set up for tickets yet. Please contact your administrator.",
         )
 
     redmine_user_id = user["id"]
@@ -2142,14 +2223,12 @@ async def update_redmine_issue(
 
         return {"status": "success", "message": "Issue updated successfully", "id": issue_id}
     except httpx.HTTPStatusError as e:
-        logger.error("Redmine error (update issue): status=%s body=%s", e.response.status_code, e.response.text)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Redmine error: {e.response.text}",
-        )
+        logger.error("Ticket update failed: status=%s body=%s", e.response.status_code, e.response.text)
+        code, message = _user_error(e, "edit this ticket")
+        raise HTTPException(status_code=code, detail=message)
     except Exception as e:
-        logger.error("Failed to update issue: %s", e)
+        logger.exception("Ticket update failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to update issue: {e}",
+            detail="We couldn't update the ticket right now. Please try again or contact your administrator.",
         )

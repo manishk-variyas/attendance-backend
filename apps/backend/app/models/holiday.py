@@ -1,19 +1,30 @@
 import uuid
-from sqlalchemy import Column, String, Date, Boolean, text
+from datetime import datetime
+
+from sqlalchemy import Boolean, Column, Date, DateTime, String, text
 from sqlalchemy.dialects.postgresql import UUID
+
 from app.core.models import Base
 
 
 class Holiday(Base):
+    """A company holiday.
+
+    `region` is the state code (``states.code``, e.g. ``IN-UP``). It is NULL for
+    a national/all-states holiday. `is_national` marks country-wide holidays.
+    """
+
     __tablename__ = "holidays"
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     country_code = Column(String(10), nullable=False)
-    region = Column(String(100), nullable=True)
+    region = Column(String(10), nullable=True)
     holiday_date = Column(Date, nullable=False)
     holiday_name = Column(String(255), nullable=False)
     holiday_type = Column(String(50), nullable=False)
     is_national = Column(Boolean, nullable=False, server_default=text("false"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"), onupdate=text("now()"))
 
     def to_dict(self) -> dict:
         return {

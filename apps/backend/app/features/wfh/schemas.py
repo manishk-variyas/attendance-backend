@@ -7,7 +7,7 @@ class WfhRequestCreate(BaseModel):
     end_date: Optional[str] = None
     resuming_date: Optional[str] = None
     reason: Optional[str] = Field(None, max_length=500)
-    comment: Optional[str] = None
+    comment: Optional[str] = Field(None, max_length=500)
     contact_number: Optional[str] = None
     approver_id: Optional[int] = None
     project_id: Optional[int] = None
@@ -22,7 +22,7 @@ class WfhRequestUpdate(BaseModel):
     end_date: Optional[str] = None
     resuming_date: Optional[str] = None
     reason: Optional[str] = Field(None, max_length=500)
-    comment: Optional[str] = None
+    comment: Optional[str] = Field(None, max_length=500)
     contact_number: Optional[str] = None
     project_id: Optional[int] = None
     project_name: Optional[str] = None

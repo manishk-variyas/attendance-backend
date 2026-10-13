@@ -174,7 +174,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Shift Date</td><td>{shift_date}</td></tr>
             <tr><td>Shift Start Time</td><td>{shift_start_time}</td></tr>
         </table>
-        <p>If you are working today, please log into the Attendance Portal and check in as soon as possible. If you are on leave, please submit a leave request in the portal.</p>
+        <p>If you are working today, please log into the {brand_name} and check in as soon as possible. If you are on leave, please submit a leave request in the portal.</p>
     """,
     "leave_applied": """
         <div class="badge badge-info">New Leave Request</div>
@@ -187,7 +187,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
-        <p class="cta">Please login to the <a href="{portal_url}/leaves">Attendance Portal</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
+        <p class="cta">Please login to the <a href="{portal_url}/leaves">{brand_name}</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
     """,
     "leave_applied_confirmation": """
         <div class="badge badge-info">Confirmation</div>
@@ -200,7 +200,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Reason</td><td>{reason}</td></tr>
         </table>
         <p>You will receive an email notification once your manager reviews the request.</p>
-        <p class="cta">View your request on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View your request on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
     """,
     "leave_approved": """
         <div class="badge badge-success">Approved</div>
@@ -212,7 +212,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>Your leave credits have been adjusted accordingly. Please plan your work handover before the leave period.</p>
-        <p class="cta">View on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
     """,
     "leave_rejected": """
         <div class="badge badge-danger">Rejected</div>
@@ -224,7 +224,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>If you have questions about this decision, please contact your manager directly.</p>
-        <p class="cta">View on the <a href="{portal_url}/leaves">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
     """,
     "cancel_requested": """
         <div class="badge badge-warning">Cancellation Request</div>
@@ -235,7 +235,7 @@ _EMAIL_TEMPLATES = {
             <tr><td>Leave Dates</td><td>{start} — {end}</td></tr>
             <tr><td>Cancellation Reason</td><td>{remark}</td></tr>
         </table>
-        <p class="cta">Please login to the Attendance Portal to <strong>approve</strong> or <strong>reject</strong> this cancellation.</p>
+        <p class="cta">Please login to the {brand_name} to <strong>approve</strong> or <strong>reject</strong> this cancellation.</p>
     """,
     "cancel_approved": """
         <div class="badge badge-success">Cancellation Approved</div>
@@ -266,7 +266,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
         </table>
-        <p class="cta">Please login to the <a href="{portal_url}/wfh">Attendance Portal</a> to approve or reject this request.</p>
+        <p class="cta">Please login to the <a href="{portal_url}/wfh">{brand_name}</a> to approve or reject this request.</p>
     """,
     "wfh_approved": """
         <h2 style="color:#16a34a;margin:0 0 8px">WFH Approved</h2>
@@ -276,7 +276,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
         </table>
-        <p class="cta">View on the <a href="{portal_url}/wfh">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/wfh">{brand_name}</a>.</p>
     """,
     "wfh_rejected": """
         <h2 style="color:#dc2626;margin:0 0 8px">WFH Rejected</h2>
@@ -287,7 +287,7 @@ _EMAIL_TEMPLATES = {
             <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
         </table>
         <p>Please contact your manager if you have any questions.</p>
-        <p class="cta">View on the <a href="{portal_url}/wfh">Attendance Portal</a>.</p>
+        <p class="cta">View on the <a href="{portal_url}/wfh">{brand_name}</a>.</p>
     """,
     "onboarding_welcome": """
         <div class="badge badge-success">Welcome Aboard</div>
@@ -301,8 +301,8 @@ _EMAIL_TEMPLATES = {
             <tr><td>Joining Date</td><td>{joining_date}</td></tr>
             <tr><td>Reporting To</td><td>{reports_to_name}</td></tr>
         </table>
-        <p><strong>Next steps:</strong> Log in to the Attendance Portal to complete your profile, view your shifts, and explore leave & WFH features.</p>
-        <p class="cta"><a href="{portal_url}">Go to Attendance Portal →</a></p>
+        <p><strong>Next steps:</strong> Log in to the {brand_name} to complete your profile, view your shifts, and explore leave & WFH features.</p>
+        <p class="cta"><a href="{portal_url}">Go to {brand_name} →</a></p>
         <p>If you need assistance, contact HR or your reporting manager. We're excited to have you on board!</p>
         <p>Warm regards,<br><strong>Team {company_name}</strong></p>
     """,
@@ -371,8 +371,7 @@ def _template(name: str, **kwargs) -> str:
 <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08)">
     <tr>
         <td style="background:linear-gradient(135deg,#1a2332,#2d3f54);padding:28px 36px;text-align:center">
-            <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.3px">Attendance Portal</h1>
-            <p style="margin:4px 0 0;color:#8899aa;font-size:12px">{brand_name}</p>
+            <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.3px">{brand_name}</h1>
         </td>
     </tr>
     <tr>
@@ -397,7 +396,7 @@ def _template(name: str, **kwargs) -> str:
     <tr>
         <td style="background:#f4f5f7;padding:20px 36px;text-align:center">
             <p style="margin:0;font-size:11px;color:#8993a4;line-height:1.8">
-                This is an automated notification from the Attendance Portal.<br>
+                This is an automated notification from the {brand_name}.<br>
                 Please do not reply to this email. For assistance, contact your administrator.
             </p>
             <p style="margin:10px 0 0;font-size:11px;color:#b3bac5">© {trademark}</p>

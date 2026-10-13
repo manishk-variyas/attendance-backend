@@ -9,12 +9,14 @@ from app.models.system_setting import SystemSetting
 from app.models.employee_master import EmployeeMaster
 from app.models.attendance import Attendance
 from app.models.shift_attendance import ShiftAttendance
+from app.models.attendance_punch import AttendancePunch
 from app.models.session import Session
 from app.models.password_reset import PasswordResetToken
 from app.models.delete_verification import DeleteVerificationToken
 from app.models.login_attempt import LoginAttempt
 from app.models.notification import Notification
 from app.models.trusted_device import TrustedDevice, LoginAlertCooldown
+from app.models.state import State
 
 __all__ = [
     "Base",
@@ -27,10 +29,12 @@ __all__ = [
     "EmployeeMaster",
     "Attendance",
     "ShiftAttendance",
+    "AttendancePunch",
     "PasswordResetToken",
     "DeleteVerificationToken",
     "LoginAttempt",
     "Notification",
     "TrustedDevice",
     "LoginAlertCooldown",
+    "State",
 ]

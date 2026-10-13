@@ -9,6 +9,7 @@ class OfficeLocationCreate(BaseModel):
     address: Optional[str] = Field(None, max_length=500)
     city: Optional[str] = Field(None, max_length=100)
     country: Optional[str] = Field(None, max_length=50)
+    state_code: Optional[str] = Field(None, max_length=10)
     latitude: float
     longitude: float
     radius_meters: float = Field(300, ge=1, le=1000)
@@ -21,6 +22,7 @@ class OfficeLocationUpdate(BaseModel):
     address: Optional[str] = Field(None, max_length=500)
     city: Optional[str] = Field(None, max_length=100)
     country: Optional[str] = Field(None, max_length=50)
+    state_code: Optional[str] = Field(None, max_length=10)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     radius_meters: Optional[float] = Field(None, ge=1, le=1000)
@@ -34,6 +36,8 @@ class OfficeLocationResponse(BaseModel):
     address: Optional[str] = None
     city: Optional[str] = None
     country: Optional[str] = None
+    state_code: Optional[str] = None
+    state_name: Optional[str] = None
     latitude: float
     longitude: float
     radius_meters: float

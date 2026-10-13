@@ -10,15 +10,20 @@ from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
 from app.models.office_location import OfficeLocation
 from app.models.shift import Shift
-from app.models.shift_attendance import ShiftAttendance
+from app.models.attendance_punch import AttendancePunch
 from app.models.shift_definition import ShiftDefinition
 from app.models.system_setting import SystemSetting
 from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp_dt
-from app.features.attendance.services.geo import determine_work_location, location_name
+from app.features.attendance.services.geo import determine_work_location, location_name, find_office_at
+from app.features.attendance.services.punch_service import recompute_daily_attendance
 
 
 class ShiftAttendanceService:
-    """Lean service for per-shift punches stored in the `shift_attendance` table."""
+    """Per-shift punches stored in `attendance_punches` (multi-shift source of truth).
+
+    After every punch write the daily `attendance` rollup is recomputed so all
+    existing readers keep working unchanged.
+    """
 
     def check_in(
         self,
@@ -28,7 +33,8 @@ class ShiftAttendanceService:
         latitude: Optional[float],
         longitude: Optional[float],
         client_timestamp: Optional[datetime],
-    ) -> ShiftAttendance:
+        check_in_device: Optional[str] = None,
+    ) -> AttendancePunch:
         shift = db.execute(
             select(Shift).where(Shift.id == shift_id, Shift.keycloak_user_id == keycloak_user_id)
         ).scalars().first()
@@ -52,7 +58,7 @@ class ShiftAttendanceService:
             raise HTTPException(status_code=400, detail="You are on leave for this shift date. Cannot check in.")
 
         existing = db.execute(
-            select(ShiftAttendance).where(ShiftAttendance.shift_id == shift.id)
+            select(AttendancePunch).where(AttendancePunch.shift_id == shift.id)
         ).scalars().first()
         if existing:
             return existing
@@ -99,7 +105,7 @@ class ShiftAttendanceService:
             else:
                 check_in_location_name = location_name(db, latitude, longitude, location_id)
 
-        punch = ShiftAttendance(
+        punch = AttendancePunch(
             shift_id=shift.id,
             keycloak_user_id=keycloak_user_id,
             attendance_date=shift.date,
@@ -108,12 +114,16 @@ class ShiftAttendanceService:
             check_in_lat=latitude,
             check_in_lng=longitude,
             check_in_location_name=check_in_location_name,
+            check_in_location_id=find_office_at(db, latitude, longitude),
+            check_in_device=check_in_device,
             work_location_status=work_location_status,
             is_late=is_late,
             status="in_progress",
         )
         db.add(punch)
         shift.status = "In Progress"
+        db.flush()
+        recompute_daily_attendance(db, keycloak_user_id, shift.date)
         db.commit()
         db.refresh(punch)
 
@@ -128,9 +138,13 @@ class ShiftAttendanceService:
         longitude: Optional[float],
         client_timestamp: Optional[datetime],
         remarks: Optional[str] = None,
-    ) -> ShiftAttendance:
+        check_out_device: Optional[str] = None,
+    ) -> AttendancePunch:
         punch = db.execute(
-            select(ShiftAttendance).where(ShiftAttendance.shift_id == shift_id)
+            select(AttendancePunch).where(
+                AttendancePunch.shift_id == shift_id,
+                AttendancePunch.keycloak_user_id == keycloak_user_id,
+            )
         ).scalars().first()
         if not punch:
             raise HTTPException(status_code=404, detail="No check-in found for this shift")
@@ -170,8 +184,12 @@ class ShiftAttendanceService:
         punch.check_out_lat = latitude
         punch.check_out_lng = longitude
         punch.check_out_location_name = check_out_location_name
+        punch.check_out_location_id = find_office_at(db, latitude, longitude)
+        punch.check_out_device = check_out_device
         punch.work_location_status = work_location_status
         punch.status = "completed"
+        if remarks:
+            punch.remarks = remarks
 
         if punch.check_in_time:
             delta = check_out_time - punch.check_in_time
@@ -179,6 +197,8 @@ class ShiftAttendanceService:
                 punch.total_hours = round(delta.total_seconds() / 3600.0, 2)
 
         shift.status = "Completed"
+        db.flush()
+        recompute_daily_attendance(db, keycloak_user_id, punch.attendance_date)
         db.commit()
         db.refresh(punch)
 

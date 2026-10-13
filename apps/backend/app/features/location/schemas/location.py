@@ -1,10 +1,10 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime
 from typing import Optional
 
 
 class LocationSaveRequest(BaseModel):
-    email: str
+    email: EmailStr = Field(..., max_length=255)
     latitude: float
     longitude: float
 

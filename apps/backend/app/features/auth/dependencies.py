@@ -19,10 +19,11 @@ from fastapi import Request, HTTPException, Depends
 from sqlalchemy.orm import Session as DBSession
 from app.features.auth.services.session import get_session
 from app.core.database import get_db
+from app.utils.session_token import get_request_session_id
 
 
 async def get_current_user(request: Request) -> dict:
-    session_id = request.cookies.get("session_id")
+    session_id = get_request_session_id(request)
     if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 

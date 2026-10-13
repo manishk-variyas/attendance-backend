@@ -18,7 +18,7 @@ class Shift(Base):
     shift_code = Column(String(50), nullable=False)
     project_id = Column(Integer, nullable=True)
     project_name = Column(String(255), nullable=True)
-    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'LEAVE', name='work_location', create_type=False), nullable=False)
+    work_location_status = Column(SAEnum('OFFICE', 'WFH', 'REMOTE_ONSITE', 'REMOTE_OFFSITE', 'OUT_OF_OFFICE', 'LEAVE', name='work_location', create_type=False), nullable=False)
     work_address = Column(String(500), server_default=text("'N/A'"))
     shift_start_time = Column(Time, nullable=True)
     shift_end_time = Column(Time, nullable=True)
@@ -34,7 +34,7 @@ class Shift(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
-    attendance_punch = relationship("ShiftAttendance", back_populates="shift", uselist=False)
+    attendance_punch = relationship("AttendancePunch", back_populates="shift", uselist=False)
 
     def to_dict(self) -> dict:
         return {

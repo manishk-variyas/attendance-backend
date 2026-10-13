@@ -25,6 +25,7 @@ def employee_to_dict(e: EmployeeMaster) -> dict:
         "contact_number": e.contact_number,
         "alt_contact_number": e.alt_contact_number,
         "country": e.country,
+        "state_code": e.state_code,
         "title": e.title,
         "status": e.status,
         "is_active": e.is_active,
@@ -49,6 +50,15 @@ _SORT_COLUMNS = {
     "created_at",
     "updated_at",
 }
+
+
+def _attach_state_names(db: Session, records: list) -> list:
+    """Add `state_name` (display name) to each record from its `state_code`."""
+    from app.features.states.service import state_name_map
+    name_map = state_name_map(db, [r.get("state_code") for r in records])
+    for r in records:
+        r["state_name"] = name_map.get(r.get("state_code"))
+    return records
 
 
 def _enrich_employees(sql: RedmineSQLService, employees: list) -> list:
@@ -161,7 +171,7 @@ def get_employees_paginated(
     total = len(employees)
 
     if export:
-        records = _enrich_employees(sql, employees)
+        records = _attach_state_names(db, _enrich_employees(sql, employees))
         return {
             "records": records,
             "total": total,
@@ -174,7 +184,7 @@ def get_employees_paginated(
     offset = (page - 1) * page_size
     page_employees = employees[offset:offset + page_size]
 
-    records = [employee_to_dict(e) for e in page_employees]
+    records = _attach_state_names(db, [employee_to_dict(e) for e in page_employees])
 
     return {
         "records": records,

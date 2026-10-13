@@ -21,8 +21,8 @@ class LeaveApplyRequest(BaseModel):
     start_date: datetime
     end_date: datetime
     leave_type: str = Field(..., min_length=1, max_length=20)
-    reason: Optional[str] = None
-    comment: Optional[str] = None
+    reason: Optional[str] = Field(None, max_length=1000)
+    comment: Optional[str] = Field(None, max_length=1000)
     is_traveling: Optional[bool] = None
     contact_number: Optional[str] = None
     resuming_date: Optional[datetime] = None

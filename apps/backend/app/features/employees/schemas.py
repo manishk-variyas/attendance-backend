@@ -18,6 +18,7 @@ class EmployeeCreate(BaseModel):
     contact_number: Optional[str] = Field(None, max_length=15)
     alt_contact_number: Optional[str] = Field(None, max_length=15)
     country: Optional[str] = Field("", max_length=50)
+    state_code: Optional[str] = Field(None, max_length=10, description="State code from /api/states, e.g. IN-UP")
     reports_to: Optional[int] = None
     location_id: Optional[str] = None
     joining_date: Optional[str] = None
@@ -60,6 +61,8 @@ class EmployeeResponse(BaseModel):
     contact_number: Optional[str] = None
     alt_contact_number: Optional[str] = None
     country: Optional[str] = None
+    state_code: Optional[str] = None
+    state_name: Optional[str] = None
     status: str
     onboarded_at: Optional[datetime] = None
     location_id: Optional[str] = None
@@ -123,6 +126,7 @@ class EmployeeUpdate(BaseModel):
     permanent_address: Optional[str] = None
     work_location_status: Optional[str] = None
     country: Optional[str] = Field(None, max_length=50)
+    state_code: Optional[str] = Field(None, max_length=10, description="State code from /api/states, e.g. IN-UP")
     timezone: Optional[str] = None
     location_id: Optional[str] = None
     reports_to: Optional[int] = None

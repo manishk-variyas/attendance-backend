@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     PORTAL_URL: str = ""
     # Generic company identity defaults (empty = must come from company settings row).
     COMPANY_NAME: str = ""
+    # White-label brand name shown in emails/UI. Empty = resolve from the
+    # company settings row → COMPANY_NAME → DEFAULT_BRAND_NAME.
+    BRAND_NAME: str = ""
+    # Last-resort brand used when nothing else is configured.
+    DEFAULT_BRAND_NAME: str = "Attendance Portal"
+    # Optional override for the public-holiday ICS feed. Empty = per-country default.
+    HOLIDAY_ICS_URL: str = ""
 
     # Cookie security settings
     COOKIE_SECURE: bool = False  # Set to True in production (requires HTTPS)

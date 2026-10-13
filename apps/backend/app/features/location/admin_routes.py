@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -16,7 +16,9 @@ from app.features.location.schemas.office_location import (
 from app.features.auth.dependencies import get_current_user, require_admin
 from app.middleware.logging import _get_client_ip
 from app.services.database.office_location_service import OfficeLocationService
+from app.features.states.service import state_exists, state_name_map
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
 from app.models.office_location import OfficeLocation
 from app.models.employee_master import EmployeeMaster
 from app.models.shift import Shift
@@ -24,7 +26,7 @@ from app.models.shift import Shift
 router = APIRouter(prefix="/admin/office-locations", tags=["admin-office-locations"])
 
 
-def _to_response(loc: OfficeLocation) -> dict:
+def _to_response(loc: OfficeLocation, state_name: Optional[str] = None) -> dict:
     return {
         "id": str(loc.id),
         "category": loc.category,
@@ -32,6 +34,8 @@ def _to_response(loc: OfficeLocation) -> dict:
         "address": loc.address,
         "city": loc.city,
         "country": loc.country,
+        "state_code": loc.state_code,
+        "state_name": state_name,
         "latitude": loc.latitude,
         "longitude": loc.longitude,
         "radius_meters": loc.radius_meters,
@@ -40,6 +44,11 @@ def _to_response(loc: OfficeLocation) -> dict:
         "created_at": loc.created_at,
         "updated_at": loc.updated_at,
     }
+
+
+def _with_state_name(db: Session, loc: OfficeLocation) -> dict:
+    """Office dict with the resolved `state_name` for its `state_code`."""
+    return _to_response(loc, state_name_map(db, [loc.state_code]).get(loc.state_code))
 
 
 @router.post("", response_model=OfficeLocationResponse, status_code=status.HTTP_201_CREATED)
@@ -57,6 +66,8 @@ def create_office_location(
             status_code=409,
             detail=f"Office location with name '{payload.name}' already exists",
         )
+    if not state_exists(db, payload.state_code):
+        raise HTTPException(status_code=400, detail=f"Unknown state code '{payload.state_code}'. Use a code from /api/states.")
     loc = svc.create(
         OfficeLocation,
         category=payload.category,
@@ -64,6 +75,7 @@ def create_office_location(
         address=payload.address,
         city=payload.city,
         country=payload.country or "",
+        state_code=payload.state_code,
         latitude=payload.latitude,
         longitude=payload.longitude,
         radius_meters=payload.radius_meters,
@@ -89,7 +101,7 @@ def create_office_location(
             },
         },
     )
-    return _to_response(loc)
+    return _with_state_name(db, loc)
 
 
 @router.get("")
@@ -113,7 +125,7 @@ def list_office_locations(
     if category:
         query = query.filter(OfficeLocation.category == category)
     if search_term:
-        query = query.filter(OfficeLocation.name.ilike(f"%{search_term}%"))
+        query = query.filter(OfficeLocation.name.ilike(f"%{escape_like(search_term)}%", escape="\\"))
 
     query = query.order_by(OfficeLocation.updated_at.desc())
     total = query.count()
@@ -164,8 +176,9 @@ def list_office_locations(
     offset = (page - 1) * page_size
     locations = query.offset(offset).limit(page_size).all()
 
+    state_names = state_name_map(db, [l.state_code for l in locations])
     return {
-        "locations": [_to_response(l) for l in locations],
+        "locations": [_to_response(l, state_names.get(l.state_code)) for l in locations],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -183,7 +196,7 @@ def get_office_location(
     loc = svc.fetch_one(OfficeLocation, id=location_id)
     if not loc:
         raise HTTPException(status_code=404, detail="Office location not found")
-    return _to_response(loc)
+    return _with_state_name(db, loc)
 
 
 @router.put("/{location_id}", response_model=OfficeLocationResponse)
@@ -202,7 +215,9 @@ def update_office_location(
 
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
-        return _to_response(existing)
+        return _with_state_name(db, existing)
+    if "state_code" in update_data and not state_exists(db, update_data["state_code"]):
+        raise HTTPException(status_code=400, detail=f"Unknown state code '{update_data['state_code']}'. Use a code from /api/states.")
     update_data["updated_at"] = datetime.now(timezone.utc)
 
     if "parent_location_id" in update_data:
@@ -247,7 +262,7 @@ def update_office_location(
             },
         },
     )
-    return _to_response(loc)
+    return _with_state_name(db, loc)
 
 
 @router.delete("/{location_id}", status_code=status.HTTP_204_NO_CONTENT)

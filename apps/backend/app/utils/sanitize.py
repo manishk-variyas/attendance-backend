@@ -24,3 +24,20 @@ def sanitize_rich_text(value: str | None) -> str | None:
         strip=True,
         strip_comments=True,
     )
+
+
+# --- SQL LIKE ----------------------------------------------------------------
+
+def escape_like(value: str | None) -> str:
+    """Escape LIKE wildcards so a user search term matches literally.
+
+    Escapes backslash, percent and underscore. Use the result inside a bound
+    LIKE pattern together with an explicit escape character in the SQL, e.g.
+    ``... ILIKE :term ESCAPE '\\\\'`` for raw SQL, or
+    ``column.ilike(pattern, escape="\\\\")`` for ORM queries. Values are still
+    passed as bound parameters - this only neutralizes wildcard abuse (e.g. a
+    bare ``%`` matching every row). Idempotent for already-clean text.
+    """
+    if not value:
+        return ""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

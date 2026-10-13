@@ -23,6 +23,8 @@ from app.models.leave import Leave
 from app.models.attendance import Attendance
 from app.middleware.logging import _get_client_ip
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
+from app.utils.holiday_scope import employee_state, find_holiday
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +227,7 @@ def request_wfh(
 
     user_email = current_user.get("email")
     keycloak_user_id = current_user.get("sub")
+    state = employee_state(db, keycloak_user_id)
 
     # Determine which dates to iterate over for validation
     dates_to_check = wfh_dates if wfh_dates else None
@@ -236,8 +239,7 @@ def request_wfh(
             if payload.skip_weekends and current.weekday() >= 5:
                 continue
             if payload.skip_holidays:
-                holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
-                if holiday:
+                if find_holiday(db, current, state):
                     continue
 
             shift = db.query(Shift).filter(
@@ -274,8 +276,7 @@ def request_wfh(
                 current += timedelta(days=1)
                 continue
             if payload.skip_holidays:
-                holiday = db.query(Holiday).filter(Holiday.holiday_date == current).first()
-                if holiday:
+                if find_holiday(db, current, state):
                     current += timedelta(days=1)
                     continue
 
@@ -399,7 +400,7 @@ def get_my_wfh_requests(
     if status:
         query = query.filter(WfhRequest.status == status)
     if search_term:
-        query = query.filter(WfhRequest.reason.ilike(f"%{search_term}%"))
+        query = query.filter(WfhRequest.reason.ilike(f"%{escape_like(search_term)}%", escape="\\"))
     query = _apply_date_filter(query, from_dt, to_dt)
 
     if export:
@@ -436,9 +437,9 @@ def get_pending_wfh_requests(
         query = _apply_date_filter(query, from_dt, to_dt)
         if search_term:
             matching = db.query(EmployeeMaster.user_email).filter(
-                EmployeeMaster.user_email.ilike(f"%{search_term}%") |
-                EmployeeMaster.first_name.ilike(f"%{search_term}%") |
-                EmployeeMaster.last_name.ilike(f"%{search_term}%")
+                EmployeeMaster.user_email.ilike(f"%{escape_like(search_term)}%", escape="\\") |
+                EmployeeMaster.first_name.ilike(f"%{escape_like(search_term)}%", escape="\\") |
+                EmployeeMaster.last_name.ilike(f"%{escape_like(search_term)}%", escape="\\")
             ).all()
             mails = {e[0] for e in matching}
             if mails:
@@ -485,9 +486,9 @@ def get_team_wfh_requests(
         query = _apply_date_filter(query, from_dt, to_dt)
         if search_term:
             matching = db.query(EmployeeMaster.user_email).filter(
-                EmployeeMaster.user_email.ilike(f"%{search_term}%") |
-                EmployeeMaster.first_name.ilike(f"%{search_term}%") |
-                EmployeeMaster.last_name.ilike(f"%{search_term}%")
+                EmployeeMaster.user_email.ilike(f"%{escape_like(search_term)}%", escape="\\") |
+                EmployeeMaster.first_name.ilike(f"%{escape_like(search_term)}%", escape="\\") |
+                EmployeeMaster.last_name.ilike(f"%{escape_like(search_term)}%", escape="\\")
             ).all()
             mails = {e[0] for e in matching}
             if mails:

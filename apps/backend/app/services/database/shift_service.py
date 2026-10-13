@@ -2,6 +2,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select, or_, func
 from app.services.database.base_service import BaseService
+from app.utils.sanitize import escape_like
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from datetime import datetime, timezone, date
@@ -72,8 +73,8 @@ class ShiftService(BaseService[Shift]):
         return list(self.db.execute(stmt).scalars().all())
 
     def search_by_project(self, query: str, limit: int = 5) -> List[Shift]:
-        q = query.lower()
-        stmt = select(Shift).where(Shift.shift_code.ilike(f"%{q}%")).order_by(Shift.date.desc()).limit(limit)
+        q = (query or "").lower().strip()[:100]
+        stmt = select(Shift).where(Shift.shift_code.ilike(f"%{escape_like(q)}%", escape="\\")).order_by(Shift.date.desc()).limit(limit)
         return list(self.db.execute(stmt).scalars().all())
 
     def delete_by_user_and_date(self, redmine_user_id: int, date_str: str):

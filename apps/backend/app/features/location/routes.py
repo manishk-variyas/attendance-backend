@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from pydantic import EmailStr
 from datetime import datetime, timezone, date
 from sqlalchemy.orm import Session
 from sqlalchemy import text, and_
@@ -108,7 +109,7 @@ def save_location(
 
 @router.get("/{email}", response_model=LocationGetResponse)
 def get_location(
-    email: str,
+    email: EmailStr = Path(..., max_length=255),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):

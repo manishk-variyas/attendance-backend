@@ -20,10 +20,11 @@ from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.location import UserLocation
 from app.models.holiday import Holiday
+from app.utils.holiday_scope import employee_state, find_holiday
 from app.models.leave import Leave
-from app.models.shift_attendance import ShiftAttendance
+from app.models.attendance_punch import AttendancePunch
 from app.features.attendance.services.shift_attendance_service import shift_attendance_service
-from app.features.attendance.services.geo import determine_work_location, location_name
+from app.features.attendance.services.geo import determine_work_location, location_name, find_office_at
 from app.features.shifts.service import shift_service
 from app.features.leaves.services.balance_utils import credit_comp_off
 from app.features.redmine.sql_service import RedmineSQLService
@@ -31,9 +32,11 @@ from app.models.system_setting import SystemSetting
 from app.core.cache import get_company_settings, get_shift_definition
 from app.services.email_service import email_service
 from app.utils.audit import audit_logger
-from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp
+from app.utils.device import device_label, compute_device_fingerprint, normalize_ua
+from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp, compute_total_hours
 from app.utils.excel import build_attendance_excel
 from app.middleware.logging import _get_client_ip
+from app.constants import DEFAULT_GRACE_MINUTES
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +49,16 @@ def _credit_comp_off_if_holiday(db: Session, attendance: Attendance) -> None:
     if not attendance.check_out_time:
         return
 
-    holiday = db.query(Holiday).filter(Holiday.holiday_date == attendance.attendance_date).first()
+    holiday = find_holiday(db, attendance.attendance_date, employee_state(db, attendance.keycloak_user_id))
     if not holiday:
         return
 
     keycloak_id = attendance.keycloak_user_id
     credit_comp_off(db, keycloak_id, attendance.attendance_date)
     attendance.comp_off_credited = True
-    attendance.remarks = ", ".join(filter(None, [attendance.remarks, f"Compoff Auto Credited - {holiday.holiday_name}"]))
+    attendance.remarks = ", ".join(filter(None, [attendance.remarks, f"Compoff Auto Credited - {holiday['name']}"]))
     db.commit()
-    logger.info(f"Comp-off credited: {keycloak_id} for {holiday.holiday_name} on {attendance.attendance_date}")
+    logger.info(f"Comp-off credited: {keycloak_id} for {holiday['name']} on {attendance.attendance_date}")
 
 
 def _find_matching_shift(db: Session, keycloak_user_id: str, shift_code: str,
@@ -282,6 +285,12 @@ def check_in(
         shift_code=shift_code,
         is_late=is_late,
         location_id=location_id,
+        shift_id=s.id if (shift_code and s) else None,
+        actual_location_id=(
+            None if is_wfh_shift
+            else find_office_at(db, payload.latitude, payload.longitude)
+        ),
+        check_in_device=device_label(request),
         is_synced=is_synced,
         server_received_at=server_received_at,
         remarks=remarks,
@@ -322,6 +331,10 @@ def check_in(
     check_in_time_str = attendance.check_in_time.strftime("%H:%M:%S") if attendance.check_in_time else (now.strftime("%H:%M:%S") if now else "-")
     lat_str = f"{payload.latitude:.4f}" if payload.latitude is not None else "-"
     lng_str = f"{payload.longitude:.4f}" if payload.longitude is not None else "-"
+    ua = (request.headers.get("user-agent") or "").strip()
+    dev_label = device_label(request)
+    dev_fp = compute_device_fingerprint(request)
+    _, _, is_mobile = normalize_ua(ua)
     audit_logger.info(
         f"Check-in: {current_user.get('email') or keycloak_user_id} on {target_date} at {check_in_time_str} (lat={lat_str}, lng={lng_str})",
         extra={
@@ -339,6 +352,10 @@ def check_in(
                 "latitude": float(payload.latitude) if payload.latitude is not None else None,
                 "longitude": float(payload.longitude) if payload.longitude is not None else None,
                 "is_late": attendance.is_late,
+                "device": dev_label,
+                "device_fingerprint": dev_fp,
+                "is_mobile": is_mobile,
+                "user_agent": ua[:300] or None,
             },
         },
     )
@@ -388,6 +405,7 @@ def check_out(
 
     check_out_time, is_synced = resolve_timestamp(payload.clientTimestamp)
     attendance.check_out_time = check_out_time
+    attendance.total_hours = compute_total_hours(attendance.check_in_time, check_out_time)
     if is_synced or target_date != today:
         attendance.is_synced = True
         if not attendance.server_received_at:
@@ -396,6 +414,7 @@ def check_out(
         attendance.remarks = ", ".join(filter(None, [attendance.remarks, "Next-day checkout"]))
     attendance.check_out_lat = payload.latitude
     attendance.check_out_lng = payload.longitude
+    attendance.check_out_device = device_label(request)
 
     check_out_ws = determine_work_location(db, payload.latitude, payload.longitude, attendance.location_id)
     if check_out_ws == "OFFICE" and attendance.location_id:
@@ -459,6 +478,10 @@ def check_out(
     ci_str = attendance.check_in_time.strftime("%H:%M:%S") if attendance.check_in_time else "-"
     co_str = attendance.check_out_time.strftime("%H:%M:%S") if attendance.check_out_time else "-"
     hours_str = f"{attendance.total_hours:.2f}" if attendance.total_hours is not None else "-"
+    ua = (request.headers.get("user-agent") or "").strip()
+    dev_label = device_label(request)
+    dev_fp = compute_device_fingerprint(request)
+    _, _, is_mobile = normalize_ua(ua)
     audit_logger.info(
         f"Check-out: {current_user.get('email') or keycloak_user_id} on {today} (in {ci_str} → out {co_str}, total {hours_str}h)",
         extra={
@@ -474,6 +497,10 @@ def check_out(
                 "check_out_time": attendance.check_out_time.isoformat() if attendance.check_out_time else None,
                 "work_location_status": attendance.work_location_status,
                 "total_hours": float(attendance.total_hours) if attendance.total_hours else None,
+                "device": dev_label,
+                "device_fingerprint": dev_fp,
+                "is_mobile": is_mobile,
+                "user_agent": ua[:300] or None,
             },
         },
     )
@@ -565,12 +592,20 @@ def check_out(
         check_in_lng=payload.longitude,
         check_in_location_name=loc_name,
         check_out_time=payload.checkOutTime,
+        total_hours=compute_total_hours(payload.checkInTime, payload.checkOutTime),
         check_out_lat=payload.latitude,
         check_out_lng=payload.longitude,
         check_out_location_name=loc_name,
         work_location_status=ws,
         shift_code=shift_code,
         location_id=location_id,
+        shift_id=shift.id if shift else None,
+        actual_location_id=(
+            None if is_wfh
+            else find_office_at(db, payload.latitude, payload.longitude)
+        ),
+        check_in_device=device_label(request),
+        check_out_device=device_label(request),
         is_synced=True,
         server_received_at=datetime.now(timezone.utc),
         remarks=f"Next-day completion" + (f" ({payload.remarks})" if payload.remarks else ""),
@@ -788,14 +823,16 @@ def get_today_shifts(
 ):
     keycloak_user_id = current_user["sub"]
     now = datetime.now(timezone.utc)
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    ist = ZoneInfo("Asia/Kolkata")
+    today = datetime.now(ist).date()
+    today_start = datetime.combine(today, time.min, tzinfo=ist)
 
-    # All shifts covering today (a shift covers today if date <= today <= end_date)
-    shifts_today = db.query(Shift).filter(
+    # Shifts scheduled yesterday or today. Yesterday is included so an overnight
+    # shift that ends this morning (or is still in progress) still shows.
+    candidates = db.query(Shift).filter(
         and_(
             Shift.keycloak_user_id == keycloak_user_id,
-            Shift.date <= today,
-            or_(Shift.end_date.is_(None), Shift.end_date >= today),
+            Shift.date.in_([today - timedelta(days=1), today]),
         )
     ).order_by(Shift.date.asc(), Shift.shift_start_time.asc()).all()
 
@@ -807,27 +844,31 @@ def get_today_shifts(
     ).first()
 
     # Shift definitions by code
-    shift_codes = {s.shift_code for s in shifts_today if s.shift_code}
+    shift_codes = {s.shift_code for s in candidates if s.shift_code}
     sd_map = {}
     if shift_codes:
         sds = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code.in_(shift_codes)).all()
         sd_map = {sd.shift_code: sd for sd in sds}
 
-    # New per-shift punches by shift_id
-    shift_ids = [s.id for s in shifts_today]
+    # Per-shift punches by shift_id
+    shift_ids = [s.id for s in candidates]
     punch_map = {}
     if shift_ids:
-        punches = db.query(ShiftAttendance).filter(ShiftAttendance.shift_id.in_(shift_ids)).all()
+        punches = db.query(AttendancePunch).filter(AttendancePunch.shift_id.in_(shift_ids)).all()
         punch_map = {p.shift_id: p for p in punches}
 
     entries = []
-    for s in shifts_today:
+    for s in candidates:
         sd = sd_map.get(s.shift_code)
-        tz = safe_zone(sd.timezone or "Asia/Kolkata") if sd else ZoneInfo("Asia/Kolkata")
+        tz = safe_zone(sd.timezone or "Asia/Kolkata") if sd else ist
         start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz) if (sd and sd.start_time) else None
         end_dt = shift_end_datetime(s.date, sd.start_time, sd.end_time, tz) if (sd and sd.end_time) else None
-
         punch = punch_map.get(s.id)
+
+        # Drop shifts that fully ended before today (e.g. yesterday's day shift),
+        # unless a punch is still open (overnight in progress).
+        if end_dt is not None and end_dt < today_start and not (punch and not punch.check_out_time):
+            continue
 
         # Per-shift status
         if on_leave_today or s.work_location_status == "LEAVE":
@@ -849,6 +890,8 @@ def get_today_shifts(
                 remaining = 0.0
             elif end_dt:
                 remaining = round(max((end_dt - now).total_seconds() / 3600, 0.0), 2)
+        elif start_dt and start_dt > now:
+            remaining = round((start_dt - now).total_seconds() / 3600, 2)
 
         entries.append({
             "shiftId": str(s.id),
@@ -863,6 +906,29 @@ def get_today_shifts(
             "status": status,
             "attendance": _shift_attendance_to_dict(punch) if punch else None,
             "remainingHours": remaining,
+        })
+
+    # Ad-hoc punch today (checked in without a shift)
+    adhoc = db.query(AttendancePunch).filter(
+        AttendancePunch.keycloak_user_id == keycloak_user_id,
+        AttendancePunch.attendance_date == today,
+        AttendancePunch.shift_id.is_(None),
+        AttendancePunch.is_deleted.is_(False),
+    ).first()
+    if adhoc:
+        entries.append({
+            "shiftId": None,
+            "shift_code": None,
+            "shift_name": None,
+            "date": today.isoformat(),
+            "start_time": None,
+            "end_time": None,
+            "work_location_status": adhoc.work_location_status,
+            "project_id": None,
+            "project_name": None,
+            "status": "completed" if adhoc.check_out_time else "in_progress",
+            "attendance": _shift_attendance_to_dict(adhoc),
+            "remainingHours": 0.0 if adhoc.check_out_time else None,
         })
 
     # Overall status
@@ -882,7 +948,7 @@ def get_today_shifts(
     return {"status": overall, "date": today.isoformat(), "shifts": entries}
 
 
-def _shift_attendance_to_dict(p: ShiftAttendance) -> dict:
+def _shift_attendance_to_dict(p: AttendancePunch) -> dict:
     return {
         "checkInTime": p.check_in_time.isoformat() if p.check_in_time else None,
         "checkInLat": float(p.check_in_lat) if p.check_in_lat else None,
@@ -897,6 +963,8 @@ def _shift_attendance_to_dict(p: ShiftAttendance) -> dict:
         "totalHours": float(p.total_hours) if p.total_hours else None,
         "shiftCode": p.shift_code,
         "status": p.status,
+        "checkInDevice": p.check_in_device,
+        "checkOutDevice": p.check_out_device,
         "updatedAt": p.updated_at.isoformat() if p.updated_at else None,
     }
 
@@ -909,6 +977,10 @@ def shift_check_in(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
 ):
+    ua = (request.headers.get("user-agent") or "").strip()
+    dev_label = device_label(request)
+    dev_fp = compute_device_fingerprint(request)
+    _, _, is_mobile = normalize_ua(ua)
     punch = shift_attendance_service.check_in(
         db,
         current_user["sub"],
@@ -916,9 +988,13 @@ def shift_check_in(
         payload.latitude,
         payload.longitude,
         payload.clientTimestamp,
+        check_in_device=dev_label,
     )
+    lat_s = f"{float(punch.check_in_lat):.4f}" if punch.check_in_lat is not None else "-"
+    lng_s = f"{float(punch.check_in_lng):.4f}" if punch.check_in_lng is not None else "-"
     audit_logger.info(
-        f"Shift check-in: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} at {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} (lat={float(punch.check_in_lat):.4f if punch.check_in_lat is not None else '-'}, lng={float(punch.check_in_lng):.4f if punch.check_in_lng is not None else '-'})",
+        f"Shift check-in: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} "
+        f"at {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} (lat={lat_s}, lng={lng_s})",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -933,6 +1009,10 @@ def shift_check_in(
                 "longitude": float(punch.check_in_lng) if punch.check_in_lng is not None else None,
                 "work_location_status": punch.work_location_status,
                 "is_late": punch.is_late,
+                "device": dev_label,
+                "device_fingerprint": dev_fp,
+                "is_mobile": is_mobile,
+                "user_agent": ua[:300] or None,
             },
         },
     )
@@ -947,6 +1027,10 @@ def shift_check_out(
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_active),
 ):
+    ua = (request.headers.get("user-agent") or "").strip()
+    dev_label = device_label(request)
+    dev_fp = compute_device_fingerprint(request)
+    _, _, is_mobile = normalize_ua(ua)
     punch = shift_attendance_service.check_out(
         db,
         current_user["sub"],
@@ -955,9 +1039,16 @@ def shift_check_out(
         payload.longitude,
         payload.clientTimestamp,
         payload.remarks,
+        check_out_device=dev_label,
     )
+    lat_s = f"{float(punch.check_out_lat):.4f}" if punch.check_out_lat is not None else "-"
+    lng_s = f"{float(punch.check_out_lng):.4f}" if punch.check_out_lng is not None else "-"
+    total_s = f"{float(punch.total_hours):.2f}" if punch.total_hours is not None else "-"
     audit_logger.info(
-        f"Shift check-out: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} (in {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} → out {punch.check_out_time.strftime('%H:%M:%S') if punch.check_out_time else '-'}, total {float(punch.total_hours):.2f if punch.total_hours is not None else '-'}h, lat={float(punch.check_out_lat):.4f if punch.check_out_lat is not None else '-'}, lng={float(punch.check_out_lng):.4f if punch.check_out_lng is not None else '-'})",
+        f"Shift check-out: {current_user.get('email') or current_user['sub']} shift={payload.shiftId} "
+        f"(in {punch.check_in_time.strftime('%H:%M:%S') if punch.check_in_time else '-'} "
+        f"-> out {punch.check_out_time.strftime('%H:%M:%S') if punch.check_out_time else '-'}, "
+        f"total {total_s}h, lat={lat_s}, lng={lng_s})",
         extra={
             "correlation_id": request.state.correlation_id,
             "extra_data": {
@@ -971,6 +1062,10 @@ def shift_check_out(
                 "check_out_time": punch.check_out_time.isoformat() if punch.check_out_time else None,
                 "work_location_status": punch.work_location_status,
                 "total_hours": float(punch.total_hours) if punch.total_hours else None,
+                "device": dev_label,
+                "device_fingerprint": dev_fp,
+                "is_mobile": is_mobile,
+                "user_agent": ua[:300] or None,
             },
         },
     )
@@ -1373,15 +1468,26 @@ def _get_attendance_paginated(
     attendance_status: Optional[str] = None,
     sort_by: str = "attendanceDate", sort_dir: str = "asc",
     page: int = 1, page_size: int = 50, export: bool = False,
+    include_future: bool = False,
 ) -> dict:
     f = date.fromisoformat(from_date) if from_date else None
     t = date.fromisoformat(to_date) if to_date else None
+
+    # Attendance history = what happened. Future dates are plans (roster shifts,
+    # upcoming leave), not attendance, so they are hidden by default. Pass
+    # include_future=True (or an explicit future to_date) to opt in. Any future
+    # row that is returned is labelled as a plan ("scheduled"/"on_leave"),
+    # never "present".
+    today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    include_future = include_future or (t is not None and t > today_ist)
 
     query = db.query(Attendance).filter(Attendance.keycloak_user_id.in_(keycloak_user_ids))
     if f:
         query = query.filter(Attendance.attendance_date >= f)
     if t:
         query = query.filter(Attendance.attendance_date <= t)
+    if not include_future:
+        query = query.filter(Attendance.attendance_date <= today_ist)
     if work_status:
         query = query.filter(Attendance.work_location_status == work_status)
     if per_diem is not None:
@@ -1402,7 +1508,7 @@ def _get_attendance_paginated(
 
     records = query.all()
 
-    grace_minutes = 15
+    grace_minutes = DEFAULT_GRACE_MINUTES
     company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
     if company and company.grace_minutes:
         grace_minutes = company.grace_minutes
@@ -1481,6 +1587,8 @@ def _get_attendance_paginated(
             continue
         if (s.keycloak_user_id, s.date) in covered:
             continue
+        if not include_future and s.date > today_ist:
+            continue
         emp = emp_map.get(s.keycloak_user_id)
         vr = _build_virtual_record(db, s, emp)
         vr["attendanceFlags"] = []
@@ -1496,6 +1604,8 @@ def _get_attendance_paginated(
             rd = min(l.end_date, t) if t else l.end_date
             current = ld
             while current <= rd:
+                if not include_future and current > today_ist:
+                    break
                 if (l.keycloak_user_id, current) not in covered:
                     emp = emp_map.get(l.keycloak_user_id)
                     record = {
@@ -1584,6 +1694,7 @@ def get_my_attendance(
     is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
     search: Optional[str] = Query(None, description="Search shift code, project, office"),
     attendance_status: Optional[str] = Query(None, description="Comma-separated: half_day, early_check_in, late_check_in, early_check_out, late_check_out"),
+    include_future: bool = Query(False, description="Include future planned shifts/leave (returned as plans, never 'present')"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1600,6 +1711,7 @@ def get_my_attendance(
         attendance_status=attendance_status,
         sort_by=sort_by, sort_dir=sort_dir,
         page=page, page_size=page_size, export=export,
+        include_future=include_future,
     )
     if export:
         output = build_attendance_excel(result["records"])
@@ -1643,6 +1755,7 @@ def get_team_attendance(
     is_late: Optional[bool] = Query(None, description="Filter late (true/false)"),
     search: Optional[str] = Query(None, description="Search by name, email, shift code, project"),
     attendance_status: Optional[str] = Query(None, description="Comma-separated: half_day, early_check_in, late_check_in, early_check_out, late_check_out"),
+    include_future: bool = Query(False, description="Include future planned shifts/leave (returned as plans, never 'present')"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1674,6 +1787,7 @@ def get_team_attendance(
         attendance_status=attendance_status,
         sort_by=sort_by, sort_dir=sort_dir,
         page=page, page_size=page_size, export=export,
+        include_future=include_future,
     )
     if export:
         output = build_attendance_excel(result["records"])

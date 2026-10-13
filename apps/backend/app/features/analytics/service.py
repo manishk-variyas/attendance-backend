@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.features.redmine.sql_service import RedmineSQLService
 from app.utils.holiday_scope import employee_state, holiday_dates_in_range
+from app.utils.sanitize import escape_like
 
 MAX_RANGE_DAYS = 366
 _LEAVE_STATUSES = {"leave", "on_leave", "on leave"}
@@ -152,6 +153,11 @@ class AnalyticsService:
     def _is_leave(status: Optional[str], work_location: Optional[str]) -> bool:
         return (work_location or "").upper() == "LEAVE" or (status or "").lower() in _LEAVE_STATUSES
 
+    @staticmethod
+    def _is_remote(work_location: Optional[str]) -> bool:
+        """Present but neither at the office nor working from home."""
+        return (work_location or "").upper() in ("REMOTE_ONSITE", "REMOTE_OFFSITE", "OUT_OF_OFFICE")
+
     def _summarize_rows(self, rows: list, working_days: int,
                         leave_days: Optional[int] = None) -> dict:
         present = sum(1 for r in rows if self._is_present(r[2]))
@@ -159,6 +165,7 @@ class AnalyticsService:
             leave_days = sum(1 for r in rows if not self._is_present(r[2]) and self._is_leave(r[2], r[3]))
         leave = leave_days
         wfh = sum(1 for r in rows if self._is_present(r[2]) and (r[3] or "").upper() == "WFH")
+        remote = sum(1 for r in rows if self._is_present(r[2]) and self._is_remote(r[3]))
         late = sum(1 for r in rows if r[7])
         hours = round(sum(float(r[6]) for r in rows if r[6] is not None), 2)
         absent = max(working_days - present - leave, 0)
@@ -168,7 +175,8 @@ class AnalyticsService:
             "absent_days": absent,
             "leave_days": leave,
             "wfh_days": wfh,
-            "office_days": present - wfh,
+            "remote_days": remote,
+            "office_days": present - wfh - remote,
             "late_days": late,
             "total_hours": hours,
             "avg_hours_per_day": round(hours / present, 2) if present else 0.0,
@@ -215,8 +223,8 @@ class AnalyticsService:
             params["ids"] = list(rm_ids)
         term = (search or "").strip()[:100]
         if term:
-            clauses.append("(u.firstname || ' ' || u.lastname) ILIKE :search")
-            params["search"] = f"%{term}%"
+            clauses.append("(u.firstname || ' ' || u.lastname) ILIKE :search ESCAPE '\\'")
+            params["search"] = f"%{escape_like(term)}%"
         return " AND ".join(clauses), params
 
     _MEMBER_JOINS = """
@@ -411,6 +419,8 @@ class AnalyticsService:
                   "LOWER(a.status::text) IN ('leave', 'on_leave', 'on leave'))")
     _ATT_WFH = ("LOWER(a.status::text) = 'present' AND "
                 "UPPER(a.work_location_status::text) = 'WFH'")
+    _ATT_REMOTE = ("LOWER(a.status::text) = 'present' AND "
+                   "UPPER(a.work_location_status::text) IN ('REMOTE_ONSITE', 'REMOTE_OFFSITE', 'OUT_OF_OFFICE')")
 
     def _attendance_scope_join(self, hide_empty: bool) -> str:
         """JOIN fragment from the member-identity subquery to attendance rows.
@@ -493,6 +503,7 @@ class AnalyticsService:
                COUNT(a.id) FILTER (WHERE a.is_late) AS late_days,
                COALESCE(SUM(a.total_hours), 0) AS total_hours,
                COUNT(a.id) FILTER (WHERE {self._ATT_WFH}) AS wfh_days,
+               COUNT(a.id) FILTER (WHERE {self._ATT_REMOTE}) AS remote_days,
                COALESCE((
                    SELECT COUNT(DISTINCT s.date) FROM shifts s
                    WHERE s.keycloak_user_id = m.keycloak_user_id
@@ -523,7 +534,8 @@ class AnalyticsService:
             present, leave, late = (r[4] or 0), (r[5] or 0), (r[6] or 0)
             hours = round(float(r[7] or 0), 2)
             wfh = r[8] or 0
-            mworking = r[9] or 0
+            remote = r[9] or 0
+            mworking = r[10] or 0
             absent = max(mworking - present - leave, 0)
             member_rows.append({
                 "redmine_user_id": r[0],
@@ -534,6 +546,7 @@ class AnalyticsService:
                 "absent_days": absent,
                 "leave_days": leave,
                 "wfh_days": wfh,
+                "remote_days": remote,
                 "late_days": late,
                 "total_hours": hours,
                 "attendance_pct": round(present / mworking * 100, 1) if mworking else 0.0,
@@ -557,6 +570,7 @@ class AnalyticsService:
             "absent_days": sum(m["absent_days"] for m in member_rows),
             "leave_days": sum(m["leave_days"] for m in member_rows),
             "wfh_days": (agg[4] or 0),
+            "remote_days": sum(m["remote_days"] for m in member_rows),
             "late_days": (agg[2] or 0),
             "total_hours": round(float(agg[3] or 0), 2),
         }
@@ -1588,6 +1602,38 @@ class AnalyticsService:
             "t.name",
         )
 
+        # Status × priority cross-tab: each status carries its priority split.
+        crosstab = self.db.execute(
+            text(f"""
+                SELECT st.id, p.id, p.name, COUNT(*)
+                {base}
+                JOIN redmine.enumerations p ON p.id = i.priority_id
+                WHERE {cohort}
+                GROUP BY st.id, p.id, p.name
+            """),
+            {"uid": rm_user_id, "f": from_d, "t": to_d},
+        ).fetchall()
+        prio_by_status: dict = {}
+        for sid, pid, pname, cnt in crosstab:
+            prio_by_status.setdefault(sid, []).append({"id": pid, "name": pname, "count": cnt})
+        for s in by_status:
+            s["by_priority"] = sorted(prio_by_status.get(s["id"], []), key=lambda x: -x["count"])
+
+        authored_by_priority = [
+            {"id": r[0], "name": r[1], "count": r[2]}
+            for r in self.db.execute(
+                text("""
+                    SELECT p.id, p.name, COUNT(*)
+                    FROM redmine.issues i
+                    JOIN redmine.enumerations p ON p.id = i.priority_id
+                    WHERE i.author_id = :uid AND i.created_on::date BETWEEN :f AND :t
+                    GROUP BY p.id, p.name
+                    ORDER BY COUNT(*) DESC
+                """),
+                {"uid": rm_user_id, "f": from_d, "t": to_d},
+            ).fetchall()
+        ]
+
         authored = self.db.execute(
             text("""
                 SELECT COUNT(*) FROM redmine.issues
@@ -1640,6 +1686,7 @@ class AnalyticsService:
             "by_status": by_status,
             "by_priority": by_priority,
             "by_tracker": by_tracker,
+            "authored_by_priority": authored_by_priority,
             "trend": [
                 {
                     "date": d.isoformat(),
@@ -1756,6 +1803,51 @@ class AnalyticsService:
             ).fetchall()
             return [{"id": r[0], "name": r[1], "count": r[2]} for r in rows]
 
+        by_status = _breakdown("st.id", "", "st.name")
+        crosstab = self.db.execute(
+            text(f"""
+                SELECT st.id, p.id, p.name, COUNT(*)
+                FROM redmine.issues i
+                JOIN redmine.issue_statuses st ON st.id = i.status_id
+                JOIN redmine.enumerations p ON p.id = i.priority_id
+                WHERE i.assigned_to_id IN (
+                    SELECT u.id
+                    FROM redmine.users u
+                    JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                    LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                    WHERE {scope_where}
+                ) {proj_filter} {cohort_filter}
+                GROUP BY st.id, p.id, p.name
+            """),
+            params,
+        ).fetchall()
+        prio_by_status: dict = {}
+        for sid, pid, pname, cnt in crosstab:
+            prio_by_status.setdefault(sid, []).append({"id": pid, "name": pname, "count": cnt})
+        for s in by_status:
+            s["by_priority"] = sorted(prio_by_status.get(s["id"], []), key=lambda x: -x["count"])
+
+        authored_by_priority = [
+            {"id": r[0], "name": r[1], "count": r[2]}
+            for r in self.db.execute(
+                text(f"""
+                    SELECT p.id, p.name, COUNT(*)
+                    FROM redmine.issues i
+                    JOIN redmine.enumerations p ON p.id = i.priority_id
+                    WHERE i.author_id IN (
+                        SELECT u.id
+                        FROM redmine.users u
+                        JOIN redmine.email_addresses e ON e.user_id = u.id AND e.is_default = true
+                        LEFT JOIN employee_master em ON em.redmine_user_id = u.id
+                        WHERE {scope_where}
+                    ) {proj_filter} {cohort_filter}
+                    GROUP BY p.id, p.name
+                    ORDER BY COUNT(*) DESC
+                """),
+                params,
+            ).fetchall()
+        ]
+
         return {
             "from_date": from_d.isoformat(),
             "to_date": to_d.isoformat(),
@@ -1765,13 +1857,14 @@ class AnalyticsService:
                 {"project_id": r[0], "project_name": r[1], "total": r[2], "open": r[3] or 0, "closed": r[4] or 0}
                 for r in project_rows
             ],
-            "by_status": _breakdown("st.id", "", "st.name"),
+            "by_status": by_status,
             "by_priority": _breakdown(
                 "i.priority_id", "JOIN redmine.enumerations p ON p.id = i.priority_id", "p.name"
             ),
             "by_tracker": _breakdown(
                 "i.tracker_id", "JOIN redmine.trackers t ON t.id = i.tracker_id", "t.name"
             ),
+            "authored_by_priority": authored_by_priority,
             "totals": {
                 "total": totals[4] or 0,
                 "open": totals[0] or 0,

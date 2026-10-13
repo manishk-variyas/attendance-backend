@@ -22,6 +22,9 @@ services:
     environment:
       # Internal Docker network URL for the backend
       BACKEND_URL: http://backend:8000
+      OTEL_SERVICE_NAME: attendance-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
     depends_on:
       keycloak-db:
         condition: service_started

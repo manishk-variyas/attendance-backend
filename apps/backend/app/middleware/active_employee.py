@@ -2,6 +2,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from app.features.auth.services.session import get_session
+from app.utils.session_token import get_request_session_id
 
 
 PUBLIC_PATHS = {"/", "/health", "/server-time", "/api/me"}
@@ -13,7 +14,7 @@ async def active_employee_middleware(request: Request, call_next) -> Response:
     if path in PUBLIC_PATHS:
         return await call_next(request)
 
-    session_id = request.cookies.get("session_id")
+    session_id = get_request_session_id(request)
     if not session_id:
         return await call_next(request)
 

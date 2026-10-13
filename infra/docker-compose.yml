@@ -18,5 +18,6 @@ include:
   - minio/docker-compose.yml
   - postgres/docker-compose.yml
   - pgbouncer/docker-compose.yml
+  - monitoring/docker-compose.yml
 
 

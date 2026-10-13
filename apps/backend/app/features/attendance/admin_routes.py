@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import date, datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func
 
@@ -20,8 +20,9 @@ from app.models.leave import Leave
 from app.services.database.base_service import BaseService
 from zoneinfo import ZoneInfo
 
-from app.utils.shift_time import safe_zone
+from app.utils.shift_time import safe_zone, compute_total_hours
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
 from app.middleware.logging import _get_client_ip
 from app.features.leaves.services.balance_utils import reverse_comp_off
 
@@ -71,6 +72,13 @@ def _to_response_with_email_batched(
 
     shift = shift_map.get((a.keycloak_user_id, a.attendance_date))
     data["shiftProject"] = shift.project_name if shift else None
+    # Expected office is read live from the linked shift (falls back to the
+    # stored snapshot); mismatch flags expected != actual (geofenced) office.
+    expected_loc = shift.location_id if shift else a.location_id
+    data["expectedLocationId"] = str(expected_loc) if expected_loc else None
+    data["locationMismatch"] = bool(
+        expected_loc and a.actual_location_id and expected_loc != a.actual_location_id
+    )
 
     leave = leave_map.get((a.keycloak_user_id, a.attendance_date))
     data["onLeave"] = leave is not None
@@ -149,7 +157,17 @@ def _build_virtual_record(db: Session, shift, emp) -> dict:
             shift_start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
             has_started = now_ist >= shift_start_dt
 
-    derived = "not_started" if not has_started else "no_show"
+    # A synthesized row is a *plan*, not a punch. Label it honestly:
+    #   future day (no punch yet) -> "scheduled" (never "present")
+    #   past/today already started, no punch -> "absent"
+    #   today, not started yet -> "present" (unchanged legacy behaviour)
+    is_future = bool(shift.date and shift.date > now_ist.date())
+    if is_future:
+        status, derived = "scheduled", "scheduled"
+    elif has_started:
+        status, derived = "absent", "no_show"
+    else:
+        status, derived = "present", "not_started"
 
     return {
         "id": None,
@@ -160,7 +178,7 @@ def _build_virtual_record(db: Session, shift, emp) -> dict:
         "locationId": None, "officeName": None,
         "workLocationStatus": shift.work_location_status,
         "shiftCode": shift.shift_code, "shiftName": None,
-        "totalHours": None, "isLate": False, "status": "present",
+        "totalHours": None, "isLate": False, "status": status,
         "isManualEntry": False, "isSynced": False, "remarks": None,
         "userEmail": emp.user_email if emp else shift.user_email,
         "userName": f"{emp.first_name} {emp.last_name}".strip() if emp else shift.user_email,
@@ -245,6 +263,7 @@ def admin_create_attendance(
         attendance_date=att_date,
         check_in_time=check_in,
         check_out_time=check_out,
+        total_hours=compute_total_hours(check_in, check_out),
         work_location_status=payload.work_location_status,
         shift_code=payload.shift_code,
         status=payload.status,
@@ -255,6 +274,8 @@ def admin_create_attendance(
         modified_by=current_user["sub"],
         remarks=payload.remarks,
         location_id=payload.location_id,
+        shift_id=shift_rec.id if shift_rec else None,
+        actual_location_id=payload.location_id if payload.work_location_status == "OFFICE" else None,
     )
     if payload.shift_code and shift_rec:
         shift_rec.status = "Ended" if payload.check_out_time else "In Progress"
@@ -269,6 +290,7 @@ def admin_create_attendance(
 
 @router.put("/{attendance_id}", response_model=AttendanceResponse)
 def admin_update_attendance(
+    request: Request,
     attendance_id: uuid.UUID,
     payload: AdminAttendanceUpdate,
     db: Session = Depends(get_db),
@@ -316,6 +338,9 @@ def admin_update_attendance(
         if payload.work_location_status is not None:
             attendance.work_location_status = payload.work_location_status
         if payload.shift_code is not None:
+            sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == payload.shift_code).first()
+            if not sd:
+                raise HTTPException(status_code=400, detail=f"Invalid shift code: {payload.shift_code}")
             attendance.shift_code = payload.shift_code
         if payload.status is not None:
             attendance.status = payload.status
@@ -351,6 +376,7 @@ def admin_update_attendance(
     if attendance.check_in_time and attendance.check_out_time and attendance.check_out_time < attendance.check_in_time:
         raise HTTPException(status_code=400, detail="check_out_time cannot be before check_in_time")
 
+    attendance.total_hours = compute_total_hours(attendance.check_in_time, attendance.check_out_time)
     attendance.is_manual_entry = True
     attendance.modified_by = current_user["sub"]
 
@@ -360,6 +386,8 @@ def admin_update_attendance(
             Shift.date == attendance.attendance_date,
             Shift.shift_code == attendance.shift_code,
         ).first()
+        # Keep the shift link consistent when the shift code is edited.
+        attendance.shift_id = shift_rec.id if shift_rec else None
         if shift_rec:
             if attendance.check_out_time:
                 shift_rec.status = "Ended"
@@ -384,12 +412,12 @@ def admin_update_attendance(
     audit_logger.info(
         f"Attendance for {target_email or attendance.keycloak_user_id} on {att_date} edited by {editor_email} — changed: {changed_fields}",
         extra={
-            "correlation_id": "-",
+            "correlation_id": request.state.correlation_id,
             "extra_data": {
                 "action": "attendance_update",
                 "username": editor_email,
                 "status": "success",
-                "client_ip": "-",
+                "client_ip": _get_client_ip(request),
                 "attendance_id": str(attendance_id),
                 "attendance_date": att_date,
                 "employee_email": target_email,
@@ -430,7 +458,7 @@ def admin_list_attendance(
     query = db.query(Attendance)
 
     if user_email:
-        emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.ilike(f"{user_email}%")).limit(50).all()
+        emps = db.query(EmployeeMaster).filter(EmployeeMaster.user_email.ilike(f"{escape_like(user_email)}%", escape="\\")).limit(50).all()
         if not emps:
             return {"total": 0, "records": []}
         keycloak_ids = [e.keycloak_user_id for e in emps if e.keycloak_user_id]
@@ -583,6 +611,7 @@ def admin_list_attendance(
 
 @router.delete("/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
 def admin_delete_attendance(
+    request: Request,
     attendance_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -627,12 +656,12 @@ def admin_delete_attendance(
     audit_logger.info(
         f"Attendance deleted for {target_name or target_email or att_user_kc} on {att_date} by {current_user.get('email')}",
         extra={
-            "correlation_id": "-",
+            "correlation_id": request.state.correlation_id,
             "extra_data": {
                 "action": "attendance_delete",
                 "username": current_user.get("email"),
                 "status": "success",
-                "client_ip": "-",
+                "client_ip": _get_client_ip(request),
                 "attendance_id": str(attendance_id),
                 "attendance_date": att_date.isoformat() if att_date else None,
                 "target_user_email": target_email,
@@ -644,12 +673,12 @@ def admin_delete_attendance(
         audit_logger.info(
             f"Comp-off reversed for {target_name or target_email or att_user_kc} (holiday {att_date}) — attendance for {att_date} deleted by {current_user.get('email')}",
             extra={
-                "correlation_id": "-",
+                "correlation_id": request.state.correlation_id,
                 "extra_data": {
                     "action": "compoff_reversed",
                     "username": current_user.get("email"),
                     "status": "success" if compoff_reversed else "warning",
-                    "client_ip": "-",
+                    "client_ip": _get_client_ip(request),
                     "attendance_id": str(attendance_id),
                     "attendance_date": att_date.isoformat() if att_date else None,
                     "target_user_email": target_email,

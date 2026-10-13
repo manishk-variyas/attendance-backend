@@ -13,7 +13,7 @@ from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
 from app.models.system_setting import SystemSetting
 from app.services.email_service import email_service
-from app.utils.shift_time import safe_zone_plain, shift_end_datetime
+from app.utils.shift_time import safe_zone_plain, shift_end_datetime, compute_total_hours
 
 logger = logging.getLogger("app.sweeper")
 
@@ -32,6 +32,7 @@ def run_attendance_background_sweep():
         company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
         auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
         cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
+        checkin_reminder_delay_minutes = company.checkin_reminder_delay_minutes if company and company.checkin_reminder_delay_minutes is not None else 30
 
         # ── 1. Auto-Checkout Night Sweeper ─────────────────────────────────────────
         open_attendances = db.query(Attendance).filter(
@@ -63,6 +64,7 @@ def run_attendance_background_sweep():
 
                 if now_utc > cutoff_dt:
                     att.check_out_time = cutoff_dt
+                    att.total_hours = compute_total_hours(att.check_in_time, cutoff_dt)
                     cutoff_str = cutoff_time_setting.strftime("%I:%M %p")
                     att.remarks = ", ".join(filter(None, [att.remarks, f"Auto-checkout: shift ended ({cutoff_str} cutoff)"]))
                     
@@ -99,8 +101,8 @@ def run_attendance_background_sweep():
                 tz = safe_zone_plain(sd.timezone or "Asia/Kolkata")
                 start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
 
-                # Check if current time > shift_start + 30 minutes
-                if now_utc > start_dt + timedelta(minutes=30):
+                # Check if current time > shift_start + configured delay
+                if now_utc > start_dt + timedelta(minutes=checkin_reminder_delay_minutes):
                     # Check if user has an attendance record for this shift date
                     att_exists = db.query(Attendance).filter(
                         and_(

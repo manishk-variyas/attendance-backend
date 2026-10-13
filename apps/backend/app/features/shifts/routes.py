@@ -24,6 +24,7 @@ from app.models.holiday import Holiday
 from app.models.shift_definition import ShiftDefinition
 from app.models.attendance import Attendance
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
 from app.utils.excel import build_shifts_excel
 from app.utils.holiday_scope import employee_state, find_holiday, holiday_scope_sql
 from sqlalchemy import select, and_, or_, text
@@ -182,8 +183,10 @@ async def create_shift(
         new_start = time.fromisoformat(payload.shiftStartTime[:5])
         new_end = time.fromisoformat(payload.shiftEndTime[:5])
     except ValueError:
-        new_start = None
-        new_end = None
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid shift start/end time format. Use HH:MM (24-hour).",
+        )
     current_date = start
     skipped_weekends = 0
     skipped_holidays = 0
@@ -454,7 +457,7 @@ async def get_shifts_by_email(
 def get_work_locations(
     current_user: dict = Depends(get_current_user),
 ):
-    return ["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "LEAVE"]
+    return ["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "OUT_OF_OFFICE", "LEAVE"]
 
 
 @router.get("/range")
@@ -1102,7 +1105,7 @@ def get_all_shift_definitions(
 
     query = db.query(ShiftDefinition)
     if search_term:
-        query = query.filter(ShiftDefinition.shift_name.ilike(f"%{search_term}%"))
+        query = query.filter(ShiftDefinition.shift_name.ilike(f"%{escape_like(search_term)}%", escape="\\"))
     if country:
         query = query.filter(ShiftDefinition.country == country)
 

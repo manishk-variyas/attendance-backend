@@ -54,3 +54,10 @@ def resolve_timestamp_dt(client_timestamp: Optional[datetime]) -> datetime:
     """Normalize a client timestamp, returning only the datetime."""
     ts, _ = resolve_timestamp(client_timestamp)
     return ts
+
+
+def compute_total_hours(check_in: Optional[datetime], check_out: Optional[datetime]) -> Optional[float]:
+    """Worked hours between check-in and check-out (rounded), or None."""
+    if check_in and check_out and check_out > check_in:
+        return round((check_out - check_in).total_seconds() / 3600.0, 2)
+    return None

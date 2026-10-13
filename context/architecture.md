@@ -18,6 +18,9 @@
 | redmine | `infra-redmine-1` | `127.0.0.1:3000` |
 | pgbouncer | `infra-pgbouncer-1` | `127.0.0.1:6432` |
 | postgres | `backend_postgres` | `192.168.122.101:5432` |
+| grafana | `infra-grafana` | `127.0.0.1:3001` |
+| prometheus | `infra-prometheus` | `127.0.0.1:9090` |
+| tempo | `infra-tempo` | `127.0.0.1:3200` (internal 4317/4318) |
 
 ## Request flow (API)
 ```

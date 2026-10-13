@@ -10,6 +10,7 @@ from app.features.auth.dependencies import get_current_user, require_admin
 from app.features.leaves.schemas.leaves import LeaveTypeCreate, LeaveTypeUpdate, LeaveTypeResponse
 from app.models.leave_type import LeaveTypeConfig
 from app.services.database.base_service import BaseService
+from app.utils.sanitize import escape_like
 
 router = APIRouter(prefix="/admin/leave-types", tags=["admin-leave-types"])
 
@@ -36,8 +37,8 @@ def list_leave_types(
         term = (search or "").strip()[:100]
         if term:
             query = query.filter(or_(
-                LeaveTypeConfig.code.ilike(f"%{term}%"),
-                LeaveTypeConfig.name.ilike(f"%{term}%"),
+                LeaveTypeConfig.code.ilike(f"%{escape_like(term)}%", escape="\\"),
+                LeaveTypeConfig.name.ilike(f"%{escape_like(term)}%", escape="\\"),
             ))
 
     allowed_sort = {"name", "code", "created_at"}

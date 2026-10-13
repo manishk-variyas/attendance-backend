@@ -108,7 +108,15 @@ for all four.
 | `created_in_range`, `closed_in_range`, `authored_in_range` | range-scoped |
 | `avg_resolution_days` | float or null |
 | `by_status`, `by_priority`, `by_tracker` | `[{ id, name, count }]` |
+| `authored_by_priority` | priority split of tickets **authored** by the employee |
 | `trend` | `[{ date, created, closed }]` |
+
+`by_status[]` also carries the **status × priority cross-tab**:
+```json
+{ "id": 1, "name": "Open", "count": 51,
+  "by_priority": [ { "id": 3, "name": "High P1", "count": 18 }, ... ] }
+```
+`count` equals the sum of its `by_priority` counts.
 
 ---
 

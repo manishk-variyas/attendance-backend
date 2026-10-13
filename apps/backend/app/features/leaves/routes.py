@@ -31,7 +31,9 @@ from app.models.holiday import Holiday as HolidayModel
 from app.features.leaves.dependencies import get_leave_business_service
 from app.features.notifications.service import schedule_notification
 from app.features.redmine.service import redmine_service
+from app.features.states.service import state_name_map
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
 import logging
 
 logger = logging.getLogger(__name__)
@@ -280,6 +282,7 @@ def get_holidays(
     search: str = Query(None, description="Search by holiday name"),
     holiday_type: str = Query(None, description="Filter: GAZETTED, RESTRICTED"),
     is_national: bool = Query(None, description="Filter by national flag"),
+    region: Optional[str] = Query(None, max_length=10, description="Filter by state code, e.g. IN-UP"),
     export: bool = Query(False, description="Export as Excel spreadsheet"),
     page: int = Query(1, description="Page number"),
     page_size: int = Query(50, description="Results per page"),
@@ -297,8 +300,10 @@ def get_holidays(
         query = query.filter(HolidayModel.holiday_type == holiday_type.upper())
     if is_national is not None:
         query = query.filter(HolidayModel.is_national == is_national)
+    if region:
+        query = query.filter(HolidayModel.region == region.strip().upper())
     if search_term:
-        query = query.filter(HolidayModel.holiday_name.ilike(f"%{search_term}%"))
+        query = query.filter(HolidayModel.holiday_name.ilike(f"%{escape_like(search_term)}%", escape="\\"))
 
     SORT_COLUMNS = {"holiday_date", "holiday_name", "holiday_type", "country_code"}
     sort_by = sort_by if sort_by in SORT_COLUMNS else "holiday_date"
@@ -315,12 +320,14 @@ def get_holidays(
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Holidays"
-        ws.append(["Country Code", "Region", "Date", "Holiday Name", "Type", "National"])
+        ws.append(["Country Code", "State Code", "State", "Date", "Holiday Name", "Type", "National"])
 
+        state_names = state_name_map(db, [h.region for h in holidays])
         for h in holidays:
             ws.append([
                 h.country_code,
                 h.region or "",
+                state_names.get(h.region, "") if h.region else "All states",
                 h.holiday_date.isoformat() if h.holiday_date else "",
                 h.holiday_name,
                 h.holiday_type,
@@ -355,8 +362,9 @@ def get_holidays(
     offset = (page - 1) * page_size
     holidays = query.offset(offset).limit(page_size).all()
 
+    state_names = state_name_map(db, [h.region for h in holidays])
     return {
-        "holidays": [h.to_dict() for h in holidays],
+        "holidays": [{**h.to_dict(), "state_name": state_names.get(h.region)} for h in holidays],
         "total": total,
         "page": page,
         "page_size": page_size,

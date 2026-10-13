@@ -13,7 +13,6 @@ from app.core.cache import get_company_settings
 from app.core.config import settings
 from app.core.database import SessionLocal
 
-_GENERIC_BRAND = "Attendance Portal"
 _LOCALHOST_PORTAL = "http://localhost:5173"
 
 
@@ -37,9 +36,11 @@ def resolve_brand_name(explicit: Optional[str] = None) -> str:
         name = (row.company_name or "").strip()
         if name:
             return name
+    if settings.BRAND_NAME and settings.BRAND_NAME.strip():
+        return settings.BRAND_NAME.strip()
     if settings.COMPANY_NAME and settings.COMPANY_NAME.strip():
         return settings.COMPANY_NAME.strip()
-    return _GENERIC_BRAND
+    return settings.DEFAULT_BRAND_NAME or "Attendance Portal"
 
 
 def resolve_trademark(explicit: Optional[str] = None) -> str:

@@ -3,6 +3,7 @@
 **Date:** 2026-10-07
 **Scope:** `apps/backend/app/**` (all Python)
 **Verdict:** No exploitable SQL injection found. **1 low-risk hardening item.**
+**Update 2026-10-10:** input-validation hardening applied (see § "Input validation").
 
 ---
 
@@ -95,3 +96,45 @@ rows = db.execute(
 2. Keep the whitelist approach for any future sort/order/group parameters.
 3. Optional CI guard: fail the build if an f-string is passed to `text(...)` or
    `.execute(...)`.
+
+---
+
+## Input validation hardening (applied 2026-10-10)
+
+Follow-up sweep for unconstrained user input (length/format). No SQLi or auth
+bypass was found; the class of issue was **unbounded input → `500`s on write,
+and unescaped LIKE wildcards on search**.
+
+### Write-input caps (oversized value used to 500 at the DB layer)
+| Input | Cap added | Matches DB column |
+|---|---|---|
+| `location` GET param + POST `email` | `EmailStr`, `max_length=255` | `user_locations.email` VARCHAR(255) |
+| attendance admin remarks + check-in/out location names | `max_length=500` | `attendance.*` VARCHAR(500) |
+| attendance admin `status` / `work_location_status` | `Literal[...]` of the enum sets | `attendance` SAEnums |
+| leave apply `reason` / `comment` | `max_length=1000` | `leaves.*` VARCHAR(1000) |
+| wfh `comment` (create + update) | `max_length=500` | `wfh_requests.comment` VARCHAR(500) |
+
+Invalid values now fail fast with `422` before any DB write (verified live).
+
+### Search caps
+- Redmine issue/global search `q` and employees `/suggest` `q`: `max_length=100`
+  (consistent with every other search box; services already truncate to 100).
+- `int()` parsing of comma-separated ids was already guarded with `400`
+  (`redmine/routes.py`, `employees/service.py`) — verified, no change needed.
+
+### LIKE-wildcard escaping
+New shared helper `app/utils/sanitize.py::escape_like()` (escapes `\`, `%`, `_`).
+Applied everywhere a user term is wrapped in `%…%`, with `ESCAPE '\'` on raw SQL
+and `escape="\\"` on ORM `ilike()`:
+analytics, attendance admin, employees suggest, leaves (routes/service/leave-types),
+location admin, redmine issues/projects/city/type search, shifts, states, wfh
+(routes/service), shift service. A bare `%` search now matches literally (0 rows)
+instead of everything in scope.
+
+### Verification (2026-10-10)
+- `GET /api/location/233232` → `422` (was 403/404); valid email still `200`.
+- 600-char attendance remarks → `422` (was potential `500`); 1000-char leave
+  reason and 500-char wfh comment accepted at the boundary.
+- 101-char redmine `q` → `422`; normal searches return results.
+- `%` as team search → 0 members (literal, not wildcard).
+- Regression suites: **76/76** (verify1 15, verify2 16, verify3 21, verify4 24).

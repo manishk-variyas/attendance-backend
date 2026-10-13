@@ -25,6 +25,7 @@ class OfficeLocation(Base):
     address = Column(String(500), nullable=True)
     city = Column(String(100), nullable=True)
     country = Column(String(50), nullable=True, server_default=text("''"))
+    state_code = Column(String(10), nullable=True)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     radius_meters = Column(Float, nullable=False, server_default=text("300"))  # geofence radius

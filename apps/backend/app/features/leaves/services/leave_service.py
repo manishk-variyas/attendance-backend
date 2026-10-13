@@ -24,7 +24,17 @@ from app.models.shift_definition import ShiftDefinition
 from app.models.system_setting import SystemSetting
 from app.models.attendance import Attendance
 from app.models.employee_master import EmployeeMaster
-from sqlalchemy import select, and_, or_, insert
+from app.utils.holiday_scope import employee_state, holiday_scope_sql
+from app.utils.sanitize import escape_like
+from app.core.config import settings
+from sqlalchemy import select, and_, or_, insert, text
+
+# Public-holiday ICS feeds by ISO country code. Override for a single
+# deployment via the HOLIDAY_ICS_URL env var. Empty map entry / unknown
+# country → caller must supply holidays manually.
+_HOLIDAY_ICS_URLS: Dict[str, str] = {
+    "IN": "https://calendar.google.com/calendar/ical/en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +95,14 @@ class LeaveBusinessService:
             dates = None
             window = [sd + timedelta(days=i) for i in range((ed - sd).days + 1)]
 
+        # Holidays applying to this employee's state (national + country/state).
+        emp_state = employee_state(self.leave_db.db, user_id)
+        h_clause, h_params = holiday_scope_sql("", emp_state, None)
         holidays_in_range = self.leave_db.db.execute(
-            select(Holiday).where(Holiday.holiday_date.between(sd, ed))
+            select(Holiday).where(
+                Holiday.holiday_date.between(sd, ed),
+                text(h_clause).bindparams(**h_params),
+            )
         ).scalars().all()
         holiday_map = {h.holiday_date: h.holiday_name for h in holidays_in_range}
 
@@ -678,6 +694,15 @@ class LeaveBusinessService:
         if not parsed_holidays:
             raise HTTPException(status_code=400, detail="No valid holiday data found in the Excel file.")
 
+        # `region` is a state code (states.code). Reject unknown codes.
+        valid_states = {r[0] for r in self.leave_db.db.execute(text("SELECT code FROM states")).fetchall()}
+        for h in parsed_holidays:
+            if h["region"] and h["region"] not in valid_states:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown region/state code '{h['region']}'. Use a code from /api/states (e.g. IN-UP) or leave it blank.",
+                )
+
         # Upsert
         inserted = 0
         modified = 0
@@ -698,7 +723,13 @@ class LeaveBusinessService:
         }
 
     async def _fetch_holidays_from_google_ics(self, year: int, country: str) -> list[dict]:
-        url = "https://calendar.google.com/calendar/ical/en.indian%23holiday%40group.v.calendar.google.com/public/basic.ics"
+        # Prefer an explicit env override; otherwise map by ISO country code.
+        url = (settings.HOLIDAY_ICS_URL or "").strip() or _HOLIDAY_ICS_URLS.get((country or "").strip().upper())
+        if not url:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No holiday feed is configured for country '{country}'. Set HOLIDAY_ICS_URL, or upload holidays manually.",
+            )
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url)
             resp.raise_for_status()
@@ -1009,10 +1040,10 @@ class LeaveBusinessService:
             term = (search or "").strip()[:100]
             if term:
                 emp_query = emp_query.filter(or_(
-                    EmployeeMaster.user_email.ilike(f"%{term}%"),
-                    EmployeeMaster.first_name.ilike(f"%{term}%"),
-                    EmployeeMaster.last_name.ilike(f"%{term}%"),
-                    EmployeeMaster.employee_id.ilike(f"%{term}%"),
+                    EmployeeMaster.user_email.ilike(f"%{escape_like(term)}%", escape="\\"),
+                    EmployeeMaster.first_name.ilike(f"%{escape_like(term)}%", escape="\\"),
+                    EmployeeMaster.last_name.ilike(f"%{escape_like(term)}%", escape="\\"),
+                    EmployeeMaster.employee_id.ilike(f"%{escape_like(term)}%", escape="\\"),
                 ))
 
         employees = emp_query.all()

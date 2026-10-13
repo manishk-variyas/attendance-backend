@@ -29,7 +29,7 @@ class ShiftAttendance(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
-    shift = relationship("Shift", back_populates="attendance_punch")
+    shift = relationship("Shift")
 
     def to_dict(self) -> dict:
         return {

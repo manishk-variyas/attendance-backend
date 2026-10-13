@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 
 from app.utils.shift_time import safe_zone, shift_end_datetime
+from app.utils.holiday_scope import employee_state, find_holiday
 
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
@@ -15,7 +16,7 @@ from app.models.holiday import Holiday
 from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.attendance import Attendance
-from app.models.shift_attendance import ShiftAttendance
+from app.models.attendance_punch import AttendancePunch
 from app.models.system_setting import SystemSetting
 from app.core.cache import clear_shift_definition_cache
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
@@ -114,14 +115,15 @@ class ShiftService:
 
     def _collect_warnings(self, db: Session, keycloak_id: str, start: date, end: date) -> list:
         warnings = []
+        state = employee_state(db, keycloak_id)
         current = start
         while current <= end:
             if current.weekday() >= 5:
                 warnings.append({"date": current.isoformat(), "type": "weekend", "label": current.strftime("%A")})
 
-            holiday_rec = db.query(Holiday).filter(Holiday.holiday_date == current).first()
+            holiday_rec = find_holiday(db, current, state)
             if holiday_rec:
-                warnings.append({"date": current.isoformat(), "type": "holiday", "label": holiday_rec.holiday_name})
+                warnings.append({"date": current.isoformat(), "type": "holiday", "label": holiday_rec["name"]})
 
             leave_rec = db.query(Leave).filter(
                 Leave.keycloak_user_id == keycloak_id,
@@ -191,7 +193,7 @@ class ShiftService:
             if not emp:
                 work_address = "N/A"
             elif ws == "WFH":
-                work_address = emp.home_address or "N/A"
+                work_address = emp.current_address or emp.permanent_address or "N/A"
             elif emp.location_id:
                 office = db.execute(select(OfficeLocation).where(OfficeLocation.id == emp.location_id)).scalars().first()
                 if office:
@@ -481,8 +483,8 @@ class ShiftService:
 
         punch_map: dict = {}
         if shift_ids:
-            punches = db.query(ShiftAttendance).filter(
-                ShiftAttendance.shift_id.in_(shift_ids)
+            punches = db.query(AttendancePunch).filter(
+                AttendancePunch.shift_id.in_(shift_ids)
             ).all()
             punch_map = {p.shift_id: p for p in punches}
 
@@ -1184,8 +1186,8 @@ class ShiftService:
             Attendance.attendance_date <= (shift.end_date or shift.date),
             Attendance.shift_code == shift.shift_code,
         ).delete(synchronize_session=False)
-        db.query(ShiftAttendance).filter(
-            ShiftAttendance.shift_id == shift_id
+        db.query(AttendancePunch).filter(
+            AttendancePunch.shift_id == shift_id
         ).delete(synchronize_session=False)
         db.delete(shift)
         db.commit()
@@ -1208,8 +1210,8 @@ class ShiftService:
             ).delete(synchronize_session=False)
 
             if shift.date == shift.end_date:
-                db.query(ShiftAttendance).filter(
-                    ShiftAttendance.shift_id == shift.id
+                db.query(AttendancePunch).filter(
+                    AttendancePunch.shift_id == shift.id
                 ).delete(synchronize_session=False)
                 db.delete(shift)
                 continue

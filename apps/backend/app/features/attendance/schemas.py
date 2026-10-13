@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 from datetime import datetime
 
 
@@ -41,12 +41,18 @@ class AttendanceResponse(BaseModel):
     checkInLat: Optional[float] = None
     checkInLng: Optional[float] = None
     checkInLocationName: Optional[str] = None
+    checkInDevice: Optional[str] = None
     checkOutTime: Optional[str] = None
     checkOutLat: Optional[float] = None
     checkOutLng: Optional[float] = None
     checkOutLocationName: Optional[str] = None
+    checkOutDevice: Optional[str] = None
     locationId: Optional[str] = None
     officeName: Optional[str] = None
+    shiftId: Optional[str] = None
+    expectedLocationId: Optional[str] = None
+    actualLocationId: Optional[str] = None
+    locationMismatch: bool = False
     workLocationStatus: str
     shiftCode: Optional[str] = None
     totalHours: Optional[float] = None
@@ -70,13 +76,13 @@ class AdminAttendanceCreate(BaseModel):
     attendance_date: str
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
-    work_location_status: str = "OFFICE"
+    work_location_status: Literal["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "OUT_OF_OFFICE", "LEAVE"] = "OFFICE"
     shift_code: Optional[str] = None
-    status: str = "present"
+    status: Literal["present", "absent", "half_day", "on_leave", "holiday"] = "present"
     per_diem_eligible: Optional[bool] = Field(None, alias="perDiemEligible")
     conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
     is_late: bool = False
-    remarks: Optional[str] = None
+    remarks: Optional[str] = Field(None, max_length=500)
     location_id: Optional[str] = None
 
 
@@ -85,16 +91,16 @@ class AdminAttendanceUpdate(BaseModel):
 
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
-    work_location_status: Optional[str] = None
+    work_location_status: Optional[Literal["OFFICE", "WFH", "REMOTE_ONSITE", "REMOTE_OFFSITE", "OUT_OF_OFFICE", "LEAVE"]] = None
     shift_code: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[Literal["present", "absent", "half_day", "on_leave", "holiday"]] = None
     is_late: Optional[bool] = None
-    remarks: Optional[str] = None
+    remarks: Optional[str] = Field(None, max_length=500)
     per_diem_eligible: Optional[bool] = Field(None, alias="perDiemEligible")
     conveyance_eligible: Optional[bool] = Field(None, alias="conveyanceEligible")
     location_id: Optional[str] = None
-    check_in_location_name: Optional[str] = None
-    check_out_location_name: Optional[str] = None
+    check_in_location_name: Optional[str] = Field(None, max_length=500)
+    check_out_location_name: Optional[str] = Field(None, max_length=500)
     check_in_lat: Optional[float] = None
     check_in_lng: Optional[float] = None
     check_out_lat: Optional[float] = None

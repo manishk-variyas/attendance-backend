@@ -4,6 +4,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 from app.core.config import settings
+from app.utils.company import resolve_brand_name
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ def _send_email(to_email: str, subject: str, html_body: str) -> bool:
 
 async def send_password_reset_email(to_email: str, reset_link: str):
     loop = __import__("asyncio").get_running_loop()
-    subject = "Reset Your Password — Attendance App"
+    brand = resolve_brand_name()
+    subject = f"Reset Your Password — {brand}"
     html = f"""\
 <html>
 <body style="font-family: Arial, sans-serif; padding: 20px;">
@@ -48,7 +50,7 @@ async def send_password_reset_email(to_email: str, reset_link: str):
   <p>This link expires in {settings.RESET_TOKEN_EXPIRE_MINUTES} minutes.</p>
   <p>If you didn't request this, you can ignore this email.</p>
   <hr>
-  <p style="color:#888;font-size:12px;">Attendance App</p>
+  <p style="color:#888;font-size:12px;">{brand}</p>
 </body>
 </html>"""
     return await loop.run_in_executor(None, _send_email, to_email, subject, html)
@@ -56,8 +58,9 @@ async def send_password_reset_email(to_email: str, reset_link: str):
 
 async def send_password_changed_email(to_email: str):
     loop = __import__("asyncio").get_running_loop()
-    subject = "Your Password Was Changed — Attendance App"
-    html = """\
+    brand = resolve_brand_name()
+    subject = f"Your Password Was Changed — {brand}"
+    html = f"""\
 <html>
 <body style="font-family: Arial, sans-serif; padding: 20px;">
   <h2>Password Changed</h2>
@@ -66,7 +69,7 @@ async def send_password_changed_email(to_email: str):
   <p style="color: #dc2626; font-weight: bold;">If you DID NOT make this change, please contact your administrator
      immediately — your account may be compromised.</p>
   <hr>
-  <p style="color:#888;font-size:12px;">Attendance App</p>
+  <p style="color:#888;font-size:12px;">{brand}</p>
 </body>
 </html>"""
     return await loop.run_in_executor(None, _send_email, to_email, subject, html)

@@ -26,6 +26,7 @@ class AttendanceSummary(BaseModel):
     absent_days: int
     leave_days: int
     wfh_days: int
+    remote_days: int = 0
     office_days: int
     late_days: int
     total_hours: float
@@ -44,6 +45,7 @@ class TeamMemberAttendance(BaseModel):
     absent_days: int = 0
     leave_days: int = 0
     wfh_days: int = 0
+    remote_days: int = 0
     late_days: int = 0
     total_hours: float = 0.0
     attendance_pct: float = 0.0
@@ -188,6 +190,10 @@ class TicketBreakdown(BaseModel):
     count: int
 
 
+class TicketStatusBreakdown(TicketBreakdown):
+    by_priority: List[TicketBreakdown] = []
+
+
 class TicketTrendPoint(BaseModel):
     date: str
     created: int = 0
@@ -212,9 +218,10 @@ class TicketSummaryMe(BaseModel):
     closed_in_range: int
     authored_in_range: int
     avg_resolution_days: Optional[float] = None
-    by_status: List[TicketBreakdown] = []
+    by_status: List[TicketStatusBreakdown] = []
     by_priority: List[TicketBreakdown] = []
     by_tracker: List[TicketBreakdown] = []
+    authored_by_priority: List[TicketBreakdown] = []
     trend: List[TicketTrendPoint] = []
 
 
@@ -243,9 +250,10 @@ class TeamTicketsResponse(BaseModel):
     member_count: int
     members: List[TeamTicketMember] = []
     by_project: List[TeamTicketProject] = []
-    by_status: List[TicketBreakdown] = []
+    by_status: List[TicketStatusBreakdown] = []
     by_priority: List[TicketBreakdown] = []
     by_tracker: List[TicketBreakdown] = []
+    authored_by_priority: List[TicketBreakdown] = []
     totals: Dict[str, int] = {}
 
 

@@ -3,6 +3,8 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from app.utils.sanitize import escape_like
+
 
 def _issue_row_to_dict(r) -> dict:
     return dict(
@@ -445,8 +447,8 @@ class RedmineSQLService:
             where.append("i.project_id = :project_id")
             params["project_id"] = project_id
         if search:
-            where.append("(i.subject ILIKE :q OR auth.firstname || ' ' || auth.lastname ILIKE :q)")
-            params["q"] = f"%{search}%"
+            where.append("(i.subject ILIKE :q ESCAPE '\\' OR auth.firstname || ' ' || auth.lastname ILIKE :q ESCAPE '\\')")
+            params["q"] = f"%{escape_like(search)}%"
         if from_date is not None:
             where.append("i.updated_on >= :from_date")
             params["from_date"] = from_date
@@ -754,8 +756,8 @@ class RedmineSQLService:
         return row is not None
 
     def search_issues(self, q: str, project_id: int | None = None, limit: int = 20) -> list[dict]:
-        q_param = f"%{q}%"
-        where = "i.subject ILIKE :q"
+        q_param = f"%{escape_like((q or '').strip()[:100])}%"
+        where = "i.subject ILIKE :q ESCAPE '\\'"
         params = {"q": q_param}
         if project_id is not None:
             where += " AND i.project_id = :project_id"
@@ -900,7 +902,7 @@ class RedmineSQLService:
         if search:
             clean_search = search.strip()[:100]
             if clean_search:
-                escaped_search = clean_search.replace("%", "\\%").replace("_", "\\_")
+                escaped_search = escape_like(clean_search)
                 where_clauses.append("""
                     (p.name ILIKE :search_term ESCAPE '\\' OR
                      p.identifier ILIKE :search_term ESCAPE '\\' OR
@@ -924,10 +926,10 @@ class RedmineSQLService:
                     WHERE cv_city.customized_id = p.id
                       AND cv_city.customized_type = 'Project'
                       AND cf_city.name = 'City'
-                      AND cv_city.value ILIKE :city_term
+                      AND cv_city.value ILIKE :city_term ESCAPE '\\'
                 )
             """)
-            params["city_term"] = f"%{clean_city}%"
+            params["city_term"] = f"%{escape_like(clean_city)}%"
 
         if project_type:
             clean_pt = project_type.strip()[:100]
@@ -938,10 +940,10 @@ class RedmineSQLService:
                     WHERE cv_pt.customized_id = p.id
                       AND cv_pt.customized_type = 'Project'
                       AND cf_pt.name = 'Project Type'
-                      AND cv_pt.value ILIKE :pt_term
+                      AND cv_pt.value ILIKE :pt_term ESCAPE '\\'
                 )
             """)
-            params["pt_term"] = f"%{clean_pt}%"
+            params["pt_term"] = f"%{escape_like(clean_pt)}%"
 
         where_sql = " AND ".join(where_clauses)
 

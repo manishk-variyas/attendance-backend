@@ -27,6 +27,11 @@ Use `redmine.` schema prefix for Redmine tables.
 - Redmine UI: `http://localhost:3000` (tunnel `ssh -L 3000:localhost:3000 ...`).
 - Keycloak: `127.0.0.1:8080`. Realms: `attendance-app` (default), `hepc-tenant`, `VAPT`.
 
+## Monitoring & Observability
+- Grafana UI: `http://localhost:3001` (user: `admin`, password: `admin`). Dashboards → System & API Overview.
+- Prometheus: `http://localhost:9090`.
+- Guide & runbook: `docs/monitoring-guide.md` and `infra/monitoring/README.md`.
+
 ## Verifying analytics (independent)
 Do not assert the code against itself. Recompute from raw SQL and compare to the
 API. Existing scripts (in `/tmp/opencode`, not committed): `verify1..4.py`.

@@ -24,9 +24,11 @@ from app.features.auth.services.keycloak import update_keycloak_user, remove_rea
 from app.features.auth.services.session import delete_sessions_by_sub
 from app.services.database.base_service import BaseService
 from app.features.employees.service import employee_to_dict, get_employees_paginated, get_employee_projects
+from app.features.states.service import state_exists, state_name_map
 from app.services.email_service import email_service
 from app.utils.storage import storage_service
 from app.utils.audit import audit_logger
+from app.utils.sanitize import escape_like
 from app.utils.company import resolve_brand_name, resolve_portal_url
 from app.utils.email_bg import send_email_bg
 from app.utils.excel import build_employees_excel
@@ -51,6 +53,13 @@ def _validate_joining_date(joining_date_str: Optional[str], db: Session) -> Opti
     return d
 
 router = APIRouter(prefix="/employees", tags=["employees"])
+
+
+def _emp_response(db: Session, emp: EmployeeMaster) -> dict:
+    """Employee dict with the resolved `state_name` for its `state_code`."""
+    rec = employee_to_dict(emp)
+    rec["state_name"] = state_name_map(db, [rec.get("state_code")]).get(rec.get("state_code"))
+    return rec
 
 
 @router.get("/me", response_model=UserProfileResponse)
@@ -419,13 +428,13 @@ def list_employees_v1(
 
 @router.get("/suggest")
 def suggest_employees(
-    q: str = Query(..., min_length=1, description="Search prefix for email or name"),
+    q: str = Query(..., min_length=1, max_length=100, description="Search prefix for email or name"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
 ):
     emps = db.query(EmployeeMaster).filter(
-        EmployeeMaster.user_email.ilike(f"{q}%")
+        EmployeeMaster.user_email.ilike(f"{escape_like(q)}%", escape="\\")
     ).limit(10).all()
     return [
         {"user_email": e.user_email, "first_name": e.first_name, "last_name": e.last_name, "designation": e.designation}
@@ -457,7 +466,7 @@ async def get_employee(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    result = employee_to_dict(emp)
+    result = _emp_response(db, emp)
     result["projects"] = []
     result["keycloak_role"] = None
     result["redmine_roles"] = []
@@ -537,8 +546,10 @@ async def create_employee(
                 raise HTTPException(status_code=400, detail="Reporting manager must be Admin, Project Manager, or Project Coordinator")
     if payload.joining_date:
         _validate_joining_date(payload.joining_date, db)
+    if not state_exists(db, payload.state_code):
+        raise HTTPException(status_code=400, detail=f"Unknown state code '{payload.state_code}'. Use a code from /api/states.")
     emp = svc.create(EmployeeMaster, **payload.model_dump())
-    return employee_to_dict(emp)
+    return _emp_response(db, emp)
 
 
 @router.post("/onboard")
@@ -598,7 +609,7 @@ async def onboard_employee(
         )
     except Exception as e:
         logger.warning(f"Failed to schedule onboarding welcome email for {emp.user_email}: {e}")
-    return employee_to_dict(emp)
+    return _emp_response(db, emp)
 
 
 @router.patch("/{employee_id}/status")
@@ -644,7 +655,7 @@ def update_employee_location(
 
     emp.location_id = payload.location_id
     db.commit()
-    return employee_to_dict(emp)
+    return _emp_response(db, emp)
 
 
 @router.patch("/{employee_id}/activate")
@@ -697,6 +708,9 @@ async def update_employee(
 
     warnings = []
     changes = payload.model_dump(exclude_none=True)
+
+    if "state_code" in changes and not state_exists(db, changes["state_code"]):
+        raise HTTPException(status_code=400, detail=f"Unknown state code '{changes['state_code']}'. Use a code from /api/states.")
 
     # Validate contact uniqueness
     if changes.get("contact_number"):
@@ -760,6 +774,7 @@ async def update_employee(
         "permanent_address": "permanent_address",
         "work_location_status": "work_location_status",
         "country": "country",
+        "state_code": "state_code",
         "location_id": "location_id",
         "reports_to": "reports_to",
         "user_email": "user_email",
@@ -846,7 +861,7 @@ async def update_employee(
 
     # ── Re-fetch and return ─────────────────────────────────────────────────
     db.refresh(emp)
-    response = employee_to_dict(emp)
+    response = _emp_response(db, emp)
     response["message"] = "Employee updated successfully"
     if warnings:
         response["warnings"] = warnings
@@ -875,12 +890,13 @@ async def assign_project(
         roles = await redmine_service.get_roles()
         role = next((r for r in roles if r["name"].lower() == payload.redmine_role_name.lower()), None)
         if not role:
-            raise HTTPException(status_code=400, detail=f"Redmine role '{payload.redmine_role_name}' not found")
+            raise HTTPException(status_code=400, detail=f"Role '{payload.redmine_role_name}' not found")
         await redmine_service.add_user_to_project(emp.redmine_user_id, payload.project_id, role["id"])
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to assign project: {e}")
+    except Exception:
+        logger.exception("Failed to assign project")
+        raise HTTPException(status_code=500, detail="Failed to assign the project. Please try again.")
 
     projects = await redmine_service.get_all_projects()
     project_name = next((p["name"] for p in projects if p["id"] == payload.project_id), str(payload.project_id))
@@ -919,8 +935,9 @@ async def disonboard_employee(
 
     try:
         await redmine_service.remove_user_from_project(emp.redmine_user_id, payload.project_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to remove from project: {e}")
+    except Exception:
+        logger.exception("Failed to remove user from project")
+        raise HTTPException(status_code=500, detail="Failed to remove the project. Please try again.")
 
     remaining_projects = await redmine_service.get_projects_for_user(emp.redmine_user_id)
     if not remaining_projects:
@@ -1076,7 +1093,7 @@ async def confirm_delete(
                 db.execute(text("DELETE FROM attendance WHERE keycloak_user_id = :k"), {"k": kc})
                 db.execute(text("DELETE FROM shifts WHERE keycloak_user_id = :k"), {"k": kc})
                 db.execute(text("DELETE FROM leaves WHERE keycloak_user_id = :k"), {"k": kc})
-                db.execute(text("DELETE FROM shift_attendance WHERE keycloak_user_id = :k"), {"k": kc})
+                db.execute(text("DELETE FROM attendance_punches WHERE keycloak_user_id = :k"), {"k": kc})
                 db.execute(text("DELETE FROM wfh_requests WHERE keycloak_user_id = :k"), {"k": kc})
                 db.execute(text("DELETE FROM sessions WHERE user_sub = :k"), {"k": kc})
             db.execute(text("DELETE FROM employee_master WHERE id = :id"), {"id": eid})
@@ -1148,7 +1165,7 @@ async def nuke_employee(
         db.execute(text("DELETE FROM attendance WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
         db.execute(text("DELETE FROM shifts WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
         db.execute(text("DELETE FROM leaves WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
-        db.execute(text("DELETE FROM shift_attendance WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
+        db.execute(text("DELETE FROM attendance_punches WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
         db.execute(text("DELETE FROM wfh_requests WHERE keycloak_user_id = :k"), {"k": keycloak_user_id})
         db.execute(text("DELETE FROM sessions WHERE user_sub = :k"), {"k": keycloak_user_id})
 
@@ -1170,4 +1187,4 @@ def get_employee_by_email(
     emp = svc.fetch_one(EmployeeMaster, user_email=email)
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
-    return employee_to_dict(emp)
+    return _emp_response(db, emp)

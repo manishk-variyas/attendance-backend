@@ -78,3 +78,18 @@ shift's location now shows up automatically — no manual fix-ups.
 - No Alembic — use the existing `_run_migrations()` pattern in `core/database.py`.
 - `check_in_location_name` can stay for audit, but stop relying on it for display.
 - Keep it incremental: Step 1+2 first (data), then Step 3 (writes), then Step 4 (reads).
+
+---
+
+## Status: IMPLEMENTED
+
+- **DB:** `attendance.shift_id` (FK → `shifts.id`) and `attendance.actual_location_id`
+  (FK → `office_locations.id`) added in `_run_migrations`, with backfill
+  (punch → roster shift by user+date+shift_code; actual = office for OFFICE rows).
+- **Writes:** check-in, next-day completion and manual create now set `shift_id`
+  and `actual_location_id` (`actual` = real geofence via `geo.find_office_at`).
+- **Reads:** responses expose `shiftId`, `expectedLocationId` (read **live** from the
+  linked shift, so shift edits reflect immediately), `actualLocationId`, and
+  `locationMismatch` (expected ≠ actual).
+- **Verified:** shift-office change reflects in `expectedLocationId`; forcing a
+  different actual sets `locationMismatch=true`; regression suites green.
