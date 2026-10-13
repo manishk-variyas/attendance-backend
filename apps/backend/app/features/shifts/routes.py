@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.limiter import limiter
 from app.features.auth.dependencies import get_current_user, require_active
-from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftStats, ShiftDefinitionCreate, ShiftDefinitionResponse
+from app.features.shifts.schemas import ShiftCreate, ShiftBulkCreate, ShiftUpdate, ShiftStats, ShiftDefinitionCreate, ShiftDefinitionUpdate, ShiftDefinitionResponse
 from app.features.shifts.service import shift_service
 from app.features.redmine.service import redmine_service
 from app.middleware.logging import _get_client_ip
@@ -1174,6 +1174,14 @@ def get_all_shift_definitions(
                 "endTime": d.end_time.isoformat() if d.end_time else None,
                 "timezone": d.timezone,
                 "country": d.country,
+                "autoCheckoutEnabled": d.auto_checkout_enabled,
+                "autoCheckoutGraceMinutes": d.auto_checkout_grace_minutes,
+                "graceMinutes": d.grace_minutes,
+                "checkinReminderDelayMinutes": d.checkin_reminder_delay_minutes,
+                "checkoutReminderGraceHours": d.checkout_reminder_grace_hours,
+                "earlyCheckinLimitMinutes": d.early_checkin_limit_minutes,
+                "checkinCutoffMinutes": d.checkin_cutoff_minutes,
+                "halfDayMinutes": d.half_day_minutes,
                 "createdAt": d.created_at,
                 "updatedAt": d.updated_at,
             }
@@ -1213,13 +1221,13 @@ async def get_shift_definition(
 @router.put("/definitions/{shift_id}")
 async def update_shift_definition(
     shift_id: str,
-    payload: ShiftDefinitionCreate,
+    payload: ShiftDefinitionUpdate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     if "Admin" not in current_user.get("roles", []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
-    updated = await shift_service.update_shift_definition(db, shift_id, payload.model_dump())
+    updated = await shift_service.update_shift_definition(db, shift_id, payload.model_dump(exclude_unset=True))
     if not updated:
         raise HTTPException(status_code=404, detail="Shift definition not found.")
     return updated

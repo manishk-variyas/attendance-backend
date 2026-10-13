@@ -1,18 +1,19 @@
 import logging
-from datetime import datetime, time, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
 from app.core.database import SessionLocal
+import app.models  # noqa: F401 — register every model so FK targets resolve standalone
 from app.models.attendance import Attendance
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
 from app.models.employee_master import EmployeeMaster
 from app.models.leave import Leave
-from app.models.system_setting import SystemSetting
 from app.services.email_service import email_service
+from app.utils.shift_policy import resolve_shift_policy
 from app.utils.shift_time import safe_zone_plain, shift_end_datetime, compute_total_hours
 
 logger = logging.getLogger("app.sweeper")
@@ -28,22 +29,14 @@ def run_attendance_background_sweep():
         today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
         logger.info("[Background Sweeper] Sweep started")
 
-        # ── 0. Company settings (auto-checkout toggle + cutoff time) ───────────────
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
-        cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
-        checkin_reminder_delay_minutes = company.checkin_reminder_delay_minutes if company and company.checkin_reminder_delay_minutes is not None else 30
-
-        # ── 1. Auto-Checkout Night Sweeper ─────────────────────────────────────────
+        # ── 1. Auto-Checkout Sweeper ───────────────────────────────────────────────
+        # Timing policy is per shift (shift_master), not company-wide.
         open_attendances = db.query(Attendance).filter(
             and_(
                 Attendance.check_out_time.is_(None),
                 Attendance.attendance_date >= today_ist - timedelta(days=3),
             )
         ).all()
-
-        if not auto_checkout_enabled:
-            open_attendances = []
 
         for att in open_attendances:
             try:
@@ -54,19 +47,21 @@ def run_attendance_background_sweep():
                 if not sd or not sd.end_time:
                     continue
 
+                policy = resolve_shift_policy(sd)
+                if not policy.auto_checkout_enabled:
+                    continue
+
                 tz = safe_zone_plain(sd.timezone or "Asia/Kolkata")
                 effective_date = att.attendance_date
                 shift_end = shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
 
-                # Configurable night cutoff (default 10:00 PM)
-                cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
-                cutoff_dt = max(cutoff_time, shift_end)
+                # Auto-checkout at the shift's own end + its configured grace.
+                cutoff_dt = shift_end + timedelta(minutes=policy.auto_checkout_grace_minutes)
 
                 if now_utc > cutoff_dt:
                     att.check_out_time = cutoff_dt
                     att.total_hours = compute_total_hours(att.check_in_time, cutoff_dt)
-                    cutoff_str = cutoff_time_setting.strftime("%I:%M %p")
-                    att.remarks = ", ".join(filter(None, [att.remarks, f"Auto-checkout: shift ended ({cutoff_str} cutoff)"]))
+                    att.remarks = ", ".join(filter(None, [att.remarks, f"Auto-checkout: shift ended (+{policy.auto_checkout_grace_minutes}m grace)"]))
                     
                     shift_rec = db.query(Shift).filter(
                         Shift.keycloak_user_id == att.keycloak_user_id,
@@ -101,8 +96,9 @@ def run_attendance_background_sweep():
                 tz = safe_zone_plain(sd.timezone or "Asia/Kolkata")
                 start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz)
 
-                # Check if current time > shift_start + configured delay
-                if now_utc > start_dt + timedelta(minutes=checkin_reminder_delay_minutes):
+                # Check if current time > shift_start + the shift's delay
+                policy = resolve_shift_policy(sd)
+                if now_utc > start_dt + timedelta(minutes=policy.checkin_reminder_delay_minutes):
                     # Check if user has an attendance record for this shift date
                     att_exists = db.query(Attendance).filter(
                         and_(

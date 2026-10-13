@@ -555,7 +555,6 @@ async def create_employee(
 @router.post("/onboard")
 async def onboard_employee(
     payload: EmployeeOnboardRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
@@ -591,24 +590,6 @@ async def onboard_employee(
 
     db.commit()
     db.refresh(emp)
-    try:
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        company_name = (company.company_name if company and company.company_name else None) or resolve_brand_name()
-        employee_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
-        background_tasks.add_task(
-            email_service.send_onboarding_welcome,
-            emp.user_email,
-            employee_name,
-            emp.designation or "Team Member",
-            emp.employee_id or "—",
-            emp.user_email,
-            emp.joining_date.isoformat() if emp.joining_date else "—",
-            emp.reports_to_name or "—",
-            company_name,
-            resolve_portal_url(),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to schedule onboarding welcome email for {emp.user_email}: {e}")
     return _emp_response(db, emp)
 
 
@@ -871,6 +852,7 @@ async def update_employee(
 @router.patch("/assign-project")
 async def assign_project(
     payload: AssignProjectRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     _: None = Depends(require_admin),
@@ -908,6 +890,28 @@ async def assign_project(
     svc.update(EmployeeMaster, emp.id, **update_fields)
 
     logger.info(f"Admin assigned project {payload.project_id} + reports-to {payload.reports_to} for {payload.user_email}")
+
+    # Onboarding welcome email is sent from THIS flow (after onboard) so the
+    # assigned project manager is known and shown under "Reporting To".
+    try:
+        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
+        company_name = (company.company_name if company and company.company_name else None) or resolve_brand_name()
+        employee_name = f"{emp.first_name or ''} {emp.last_name or ''}".strip() or emp.user_email
+        background_tasks.add_task(
+            email_service.send_onboarding_welcome,
+            emp.user_email,
+            employee_name,
+            emp.designation or "Team Member",
+            emp.employee_id or "—",
+            emp.user_email,
+            emp.joining_date.isoformat() if emp.joining_date else "—",
+            reports_to_name or "—",
+            company_name,
+            resolve_portal_url(),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to schedule onboarding welcome email for {emp.user_email}: {e}")
+
     return {
         "message": "Project assigned successfully",
         "project_id": payload.project_id,

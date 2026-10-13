@@ -7,6 +7,7 @@ from app.models.holiday import Holiday
 from app.models.location import UserLocation
 from app.models.system_setting import SystemSetting
 from app.models.employee_master import EmployeeMaster
+from app.models.office_location import OfficeLocation
 from app.models.attendance import Attendance
 from app.models.shift_attendance import ShiftAttendance
 from app.models.attendance_punch import AttendancePunch
@@ -27,6 +28,7 @@ __all__ = [
     "UserLocation",
     "SystemSetting",
     "EmployeeMaster",
+    "OfficeLocation",
     "Attendance",
     "ShiftAttendance",
     "AttendancePunch",

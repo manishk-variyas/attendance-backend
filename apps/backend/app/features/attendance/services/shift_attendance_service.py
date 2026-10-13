@@ -12,7 +12,7 @@ from app.models.office_location import OfficeLocation
 from app.models.shift import Shift
 from app.models.attendance_punch import AttendancePunch
 from app.models.shift_definition import ShiftDefinition
-from app.models.system_setting import SystemSetting
+from app.utils.shift_policy import resolve_shift_policy
 from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp_dt
 from app.features.attendance.services.geo import determine_work_location, location_name, find_office_at
 from app.features.attendance.services.punch_service import recompute_daily_attendance
@@ -65,24 +65,21 @@ class ShiftAttendanceService:
 
         check_in_time = resolve_timestamp_dt(client_timestamp)
 
-        grace_min = 0
-        company = db.execute(select(SystemSetting).where(SystemSetting.id == "company")).scalars().first()
-        if company and company.grace_minutes:
-            grace_min = company.grace_minutes
+        policy = resolve_shift_policy(sd)
 
         start_dt = datetime.combine(shift.date, sd.start_time, tzinfo=tz) if (sd and sd.start_time) else None
         end_dt = shift_end_datetime(shift.date, sd.start_time, sd.end_time, tz) if (sd and sd.end_time) else None
 
         is_late = False
         if start_dt:
-            if check_in_time < start_dt - timedelta(hours=1):
+            if check_in_time < start_dt - timedelta(minutes=policy.early_checkin_limit_minutes):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Too early to check in. Shift starts at {sd.start_time.strftime('%H:%M')}.",
                 )
-            if check_in_time > start_dt + timedelta(minutes=grace_min):
+            if check_in_time > start_dt + timedelta(minutes=policy.grace_minutes):
                 is_late = True
-        if end_dt and check_in_time > end_dt + timedelta(hours=2):
+        if end_dt and check_in_time > end_dt + timedelta(minutes=policy.checkin_cutoff_minutes):
             raise HTTPException(status_code=400, detail="Shift has already ended. Cannot check in.")
 
         emp = db.execute(

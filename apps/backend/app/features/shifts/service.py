@@ -7,6 +7,17 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.utils.shift_time import safe_zone, shift_end_datetime
 from app.utils.holiday_scope import employee_state, find_holiday
+from app.utils.shift_policy import resolve_shift_policy
+from app.constants import (
+    DEFAULT_AUTO_CHECKOUT_ENABLED,
+    DEFAULT_AUTO_CHECKOUT_GRACE_MINUTES,
+    DEFAULT_GRACE_MINUTES,
+    DEFAULT_CHECKIN_REMINDER_DELAY_MINUTES,
+    DEFAULT_CHECKOUT_REMINDER_GRACE_HOURS,
+    DEFAULT_EARLY_CHECKIN_LIMIT_MINUTES,
+    DEFAULT_CHECKIN_CUTOFF_MINUTES,
+    DEFAULT_HALF_DAY_MINUTES,
+)
 
 from app.models.shift import Shift
 from app.models.shift_definition import ShiftDefinition
@@ -17,7 +28,6 @@ from app.models.leave import Leave
 from app.models.leave_type import LeaveTypeConfig
 from app.models.attendance import Attendance
 from app.models.attendance_punch import AttendancePunch
-from app.models.system_setting import SystemSetting
 from app.core.cache import clear_shift_definition_cache
 from app.services.database.shift_service import ShiftService as PGShiftService, ShiftDefinitionService as PGShiftDefinitionService
 from sqlalchemy import select, func
@@ -41,12 +51,13 @@ def _roster_shift_status(shift: Shift, punch, leave, sd, tz: ZoneInfo) -> str:
     return "yet_to_start"
 
 
-def _build_shift_record(s: Shift, punch, sd, leave, grace_min: int) -> dict:
+def _build_shift_record(s: Shift, punch, sd, leave) -> dict:
     """Build one rich per-shift record from the shift + its punch (shift_attendance
     or a legacy `attendance` row fallback). `punch` may be None (not checked in)."""
     tz = safe_zone(sd.timezone if sd else None)
     start_time = s.shift_start_time or (sd.start_time if sd else None)
     end_time = s.shift_end_time or (sd.end_time if sd else None)
+    grace_min = resolve_shift_policy(sd).grace_minutes
 
     late_by = None
     if punch and punch.is_late and punch.check_in_time and sd and sd.start_time:
@@ -313,8 +324,6 @@ class ShiftService:
             return []
 
         emp = db.query(EmployeeMaster).filter(EmployeeMaster.user_email == email).first()
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        grace_min = company.grace_minutes if company and company.grace_minutes else 2
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
@@ -377,7 +386,7 @@ class ShiftService:
                 except Exception:
                     tz = ZoneInfo("Asia/Kolkata")
                 shift_start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
-                cutoff = shift_start_dt + timedelta(minutes=grace_min)
+                cutoff = shift_start_dt + timedelta(minutes=resolve_shift_policy(sd).grace_minutes)
                 if att.check_in_time > cutoff:
                     late_by = round((att.check_in_time - cutoff).total_seconds() / 3600, 1)
 
@@ -510,8 +519,6 @@ class ShiftService:
                 Leave.end_date >= sd_date,
             ).all()
 
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        grace_min = company.grace_minutes if company and company.grace_minutes else 0
         name_map = _leave_type_name_map(db)
 
         by_date: dict = {}
@@ -528,7 +535,7 @@ class ShiftService:
                 ),
                 None,
             )
-            record = _build_shift_record(s, punch, sd, leave, grace_min)
+            record = _build_shift_record(s, punch, sd, leave)
             entry = by_date.setdefault(d_str, {"date": d_str, "shifts": [], "leave": None})
             entry["shifts"].append(record)
 
@@ -608,9 +615,6 @@ class ShiftService:
         if not shifts and not leaves:
             return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
 
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        grace_min = company.grace_minutes if company and company.grace_minutes else 0
-
         shift_codes = list({s.shift_code for s in shifts if s.shift_code})
 
         # Legacy fallback: old /check-in wrote `attendance`, not shift_attendance
@@ -648,7 +652,7 @@ class ShiftService:
                 None,
             )
 
-            rec = _build_shift_record(s, punch, sd, leave, grace_min)
+            rec = _build_shift_record(s, punch, sd, leave)
             rec["userEmail"] = s.user_email
             rec["userName"] = (
                 f"{emp.first_name} {emp.middle_name or ''} {emp.last_name}".strip().replace("  ", " ")
@@ -763,8 +767,6 @@ class ShiftService:
         if not shifts:
             return []
 
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        grace_min = company.grace_minutes if company and company.grace_minutes else 2
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
@@ -831,7 +833,7 @@ class ShiftService:
                 except Exception:
                     tz = ZoneInfo("Asia/Kolkata")
                 shift_start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
-                cutoff = shift_start_dt + timedelta(minutes=grace_min)
+                cutoff = shift_start_dt + timedelta(minutes=resolve_shift_policy(sd).grace_minutes)
                 if att.check_in_time > cutoff:
                     late_by = round((att.check_in_time - cutoff).total_seconds() / 3600, 1)
 
@@ -944,8 +946,6 @@ class ShiftService:
         if not shifts:
             return {"records": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
 
-        company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-        grace_min = company.grace_minutes if company and company.grace_minutes else 2
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
         user_ids = list({s.keycloak_user_id for s in shifts if s.keycloak_user_id})
@@ -1011,7 +1011,7 @@ class ShiftService:
                 except Exception:
                     tz = ZoneInfo("Asia/Kolkata")
                 shift_start_dt = datetime.combine(s.date, sd.start_time, tzinfo=tz)
-                cutoff = shift_start_dt + timedelta(minutes=grace_min)
+                cutoff = shift_start_dt + timedelta(minutes=resolve_shift_policy(sd).grace_minutes)
                 if att.check_in_time > cutoff:
                     late_by = round((att.check_in_time - cutoff).total_seconds() / 3600, 1)
 
@@ -1284,6 +1284,14 @@ class ShiftService:
             end_time=end,
             timezone=data.get("timezone", "Asia/Kolkata"),
             country=data.get("country", ""),
+            auto_checkout_enabled=data.get("autoCheckoutEnabled", DEFAULT_AUTO_CHECKOUT_ENABLED),
+            auto_checkout_grace_minutes=data.get("autoCheckoutGraceMinutes", DEFAULT_AUTO_CHECKOUT_GRACE_MINUTES),
+            grace_minutes=data.get("graceMinutes", DEFAULT_GRACE_MINUTES),
+            checkin_reminder_delay_minutes=data.get("checkinReminderDelayMinutes", DEFAULT_CHECKIN_REMINDER_DELAY_MINUTES),
+            checkout_reminder_grace_hours=data.get("checkoutReminderGraceHours", DEFAULT_CHECKOUT_REMINDER_GRACE_HOURS),
+            early_checkin_limit_minutes=data.get("earlyCheckinLimitMinutes", DEFAULT_EARLY_CHECKIN_LIMIT_MINUTES),
+            checkin_cutoff_minutes=data.get("checkinCutoffMinutes", DEFAULT_CHECKIN_CUTOFF_MINUTES),
+            half_day_minutes=data.get("halfDayMinutes", DEFAULT_HALF_DAY_MINUTES),
         )
         clear_shift_definition_cache(data["shiftCode"])
         return self._serialize_def(sd)
@@ -1327,6 +1335,19 @@ class ShiftService:
             update_data["timezone"] = data["timezone"]
         if "country" in data:
             update_data["country"] = data["country"]
+        # Shift-level timing policy (optional fields; None = leave unchanged).
+        for camel, col in {
+            "autoCheckoutEnabled": "auto_checkout_enabled",
+            "autoCheckoutGraceMinutes": "auto_checkout_grace_minutes",
+            "graceMinutes": "grace_minutes",
+            "checkinReminderDelayMinutes": "checkin_reminder_delay_minutes",
+            "checkoutReminderGraceHours": "checkout_reminder_grace_hours",
+            "earlyCheckinLimitMinutes": "early_checkin_limit_minutes",
+            "checkinCutoffMinutes": "checkin_cutoff_minutes",
+            "halfDayMinutes": "half_day_minutes",
+        }.items():
+            if data.get(camel) is not None:
+                update_data[col] = data[camel]
         if update_data:
             svc.db.execute(
                 sql_update(ShiftDefinition).where(ShiftDefinition.shift_id == shift_id).values(**update_data)
@@ -1393,6 +1414,14 @@ class ShiftService:
             "endTime": sd.end_time.isoformat() if sd.end_time else None,
             "timezone": sd.timezone,
             "country": sd.country,
+            "autoCheckoutEnabled": sd.auto_checkout_enabled,
+            "autoCheckoutGraceMinutes": sd.auto_checkout_grace_minutes,
+            "graceMinutes": sd.grace_minutes,
+            "checkinReminderDelayMinutes": sd.checkin_reminder_delay_minutes,
+            "checkoutReminderGraceHours": sd.checkout_reminder_grace_hours,
+            "earlyCheckinLimitMinutes": sd.early_checkin_limit_minutes,
+            "checkinCutoffMinutes": sd.checkin_cutoff_minutes,
+            "halfDayMinutes": sd.half_day_minutes,
             "createdAt": sd.created_at,
             "updatedAt": sd.updated_at,
         }

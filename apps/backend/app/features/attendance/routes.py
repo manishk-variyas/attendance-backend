@@ -28,7 +28,6 @@ from app.features.attendance.services.geo import determine_work_location, locati
 from app.features.shifts.service import shift_service
 from app.features.leaves.services.balance_utils import credit_comp_off
 from app.features.redmine.sql_service import RedmineSQLService
-from app.models.system_setting import SystemSetting
 from app.core.cache import get_company_settings, get_shift_definition
 from app.services.email_service import email_service
 from app.utils.audit import audit_logger
@@ -36,7 +35,7 @@ from app.utils.device import device_label, compute_device_fingerprint, normalize
 from app.utils.shift_time import safe_zone, shift_end_datetime, resolve_timestamp, compute_total_hours
 from app.utils.excel import build_attendance_excel
 from app.middleware.logging import _get_client_ip
-from app.constants import DEFAULT_GRACE_MINUTES
+from app.utils.shift_policy import resolve_shift_policy, ShiftPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -236,18 +235,15 @@ def check_in(
             raise HTTPException(status_code=400,
                 detail=f"Your shift is scheduled for {s.date.isoformat()}. Cannot check in before the shift date.")
 
-    if shift_code and shift_start_time and now.tzinfo:
-        grace_min = 0
-        company = get_company_settings(db)
-        if company and company.grace_minutes:
-            grace_min = company.grace_minutes
+    if shift_code and shift_start_time and now.tzinfo and sd:
+        policy = resolve_shift_policy(sd)
         shift_start_dt = datetime.combine(target_date, shift_start_time, tzinfo=safe_zone(shift_tz))
-        if now < shift_start_dt - timedelta(hours=1):
+        if now < shift_start_dt - timedelta(minutes=policy.early_checkin_limit_minutes):
             raise HTTPException(
                 status_code=400,
                 detail=f"Too early to check in. Your shift starts at {shift_start_time.strftime('%H:%M')} on {target_date.isoformat()}.",
             )
-        if now > shift_start_dt + timedelta(minutes=grace_min):
+        if now > shift_start_dt + timedelta(minutes=policy.grace_minutes):
             is_late = True
 
     emp = getattr(request.state, "employee", None)
@@ -708,20 +704,14 @@ def get_today_attendance(
             effective_date = srec.date if srec else open_att.attendance_date
             sd = db.query(ShiftDefinition).filter(ShiftDefinition.shift_code == open_att.shift_code).first()
             if sd and sd.end_time:
-                company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-                auto_checkout_enabled = company.auto_checkout_enabled if company and company.auto_checkout_enabled is not None else True
-                cutoff_time_setting = company.auto_checkout_cutoff_time if company and company.auto_checkout_cutoff_time else time(22, 0)
-
+                policy = resolve_shift_policy(sd)
                 tz = safe_zone(sd.timezone or "Asia/Kolkata")
                 shift_end = shift_end_datetime(effective_date, sd.start_time, sd.end_time, tz)
-                # Configurable night cutoff: allow working late into evening.
-                # If shift_end is past cutoff (e.g. night shift ending next morning), cutoff is shift_end.
-                cutoff_time = datetime.combine(effective_date, cutoff_time_setting, tzinfo=tz)
-                cutoff_dt = max(cutoff_time, shift_end)
-                if auto_checkout_enabled and datetime.now(timezone.utc) > cutoff_dt:
+                # Auto-checkout at the shift's own end + its configured grace.
+                cutoff_dt = shift_end + timedelta(minutes=policy.auto_checkout_grace_minutes)
+                if policy.auto_checkout_enabled and datetime.now(timezone.utc) > cutoff_dt:
                     open_att.check_out_time = cutoff_dt
-                    cutoff_str = cutoff_time_setting.strftime("%I:%M %p")
-                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, f"Auto-checkout: shift ended ({cutoff_str} cutoff)"]))
+                    open_att.remarks = ", ".join(filter(None, [open_att.remarks, f"Auto-checkout: shift ended (+{policy.auto_checkout_grace_minutes}m grace)"]))
                     shift_rec = db.query(Shift).filter(
                         Shift.keycloak_user_id == open_att.keycloak_user_id,
                         Shift.date <= effective_date,
@@ -1407,14 +1397,15 @@ def get_my_projects_attendance(
     }
 
 
-def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: int) -> list:
+def _compute_attendance_flags(attendance: Attendance, shift, sd, policy: ShiftPolicy) -> list:
     flags = []
     ci = attendance.check_in_time
     if not ci:
         return flags
 
+    grace = policy.grace_minutes
     th = attendance.total_hours
-    if th is not None and float(th) < 4.0:
+    if th is not None and float(th) < policy.half_day_minutes / 60.0:
         flags.append("half_day")
 
     tz_str = "Asia/Kolkata"
@@ -1434,9 +1425,9 @@ def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: 
 
     if shift_start:
         start_dt = datetime.combine(d, shift_start, tzinfo=tz)
-        if ci < start_dt - timedelta(minutes=grace_minutes):
+        if ci < start_dt - timedelta(minutes=grace):
             flags.append("early_check_in")
-        elif ci > start_dt + timedelta(minutes=grace_minutes):
+        elif ci > start_dt + timedelta(minutes=grace):
             flags.append("late_check_in")
 
     co = attendance.check_out_time
@@ -1446,9 +1437,9 @@ def _compute_attendance_flags(attendance: Attendance, shift, sd, grace_minutes: 
         end_dt = datetime.combine(d, shift_end, tzinfo=tz)
         if shift_start and shift_end <= shift_start:
             end_dt += timedelta(days=1)
-        if co < end_dt - timedelta(minutes=grace_minutes):
+        if co < end_dt - timedelta(minutes=grace):
             flags.append("early_check_out")
-        elif co > end_dt + timedelta(minutes=grace_minutes):
+        elif co > end_dt + timedelta(minutes=grace):
             flags.append("late_check_out")
 
     return flags
@@ -1507,11 +1498,6 @@ def _get_attendance_paginated(
         )).filter(Shift.project_id == project_id)
 
     records = query.all()
-
-    grace_minutes = DEFAULT_GRACE_MINUTES
-    company = db.query(SystemSetting).filter(SystemSetting.id == "company").first()
-    if company and company.grace_minutes:
-        grace_minutes = company.grace_minutes
 
     user_ids = list({r.keycloak_user_id for r in records if r.keycloak_user_id} | set(keycloak_user_ids))
     loc_ids = list({str(r.location_id) for r in records if r.location_id})
@@ -1577,7 +1563,7 @@ def _get_attendance_paginated(
     for r in records:
         rec = _to_response_with_email_batched(r, emp_map, loc_map, sd_map, shift_map, leave_map, modified_by_map)
         shift = shift_map.get((r.keycloak_user_id, r.attendance_date))
-        rec["attendanceFlags"] = _compute_attendance_flags(r, shift, sd_map.get(r.shift_code), grace_minutes)
+        rec["attendanceFlags"] = _compute_attendance_flags(r, shift, sd_map.get(r.shift_code), resolve_shift_policy(sd_map.get(r.shift_code)))
         result.append(rec)
     covered = {(r.keycloak_user_id, r.attendance_date) for r in records}
 

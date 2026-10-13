@@ -137,10 +137,43 @@ class ShiftDefinitionCreate(BaseModel):
     endTime: str
     timezone: str = "Asia/Kolkata"
     country: str = ""
+    # Shift-level timing policy. Omitted/None → default on create, unchanged on update.
+    autoCheckoutEnabled: Optional[bool] = None
+    autoCheckoutGraceMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    graceMinutes: Optional[int] = Field(None, ge=0, le=240)
+    checkinReminderDelayMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    checkoutReminderGraceHours: Optional[int] = Field(None, ge=0, le=48)
+    earlyCheckinLimitMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    checkinCutoffMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    halfDayMinutes: Optional[int] = Field(None, ge=0, le=1440)
 
     @field_validator("timezone")
     @classmethod
     def coerce_timezone(cls, v: str) -> str:
+        return REDMINE_TO_IANA_TZ.get(v, v)
+
+
+class ShiftDefinitionUpdate(BaseModel):
+    shiftCode: Optional[str] = None
+    shiftName: Optional[str] = None
+    startTime: Optional[str] = None
+    endTime: Optional[str] = None
+    timezone: Optional[str] = None
+    country: Optional[str] = None
+    autoCheckoutEnabled: Optional[bool] = None
+    autoCheckoutGraceMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    graceMinutes: Optional[int] = Field(None, ge=0, le=240)
+    checkinReminderDelayMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    checkoutReminderGraceHours: Optional[int] = Field(None, ge=0, le=48)
+    earlyCheckinLimitMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    checkinCutoffMinutes: Optional[int] = Field(None, ge=0, le=1440)
+    halfDayMinutes: Optional[int] = Field(None, ge=0, le=1440)
+
+    @field_validator("timezone")
+    @classmethod
+    def coerce_timezone(cls, v):
+        if v is None:
+            return v
         return REDMINE_TO_IANA_TZ.get(v, v)
 
 
@@ -152,6 +185,14 @@ class ShiftDefinitionResponse(BaseModel):
     endTime: str
     timezone: str
     country: str
+    autoCheckoutEnabled: Optional[bool] = None
+    autoCheckoutGraceMinutes: Optional[int] = None
+    graceMinutes: Optional[int] = None
+    checkinReminderDelayMinutes: Optional[int] = None
+    checkoutReminderGraceHours: Optional[int] = None
+    earlyCheckinLimitMinutes: Optional[int] = None
+    checkinCutoffMinutes: Optional[int] = None
+    halfDayMinutes: Optional[int] = None
     createdAt: Optional[datetime] = None
     updatedAt: Optional[datetime] = None
 

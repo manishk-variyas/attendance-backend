@@ -145,7 +145,7 @@ class EmailService:
     ) -> bool:
         subject = "New sign-in to your Attendance account"
         ip_display = (ip or "").strip()
-        ip_row = f"<tr><td>IP address</td><td>{ip_display}</td></tr>" if ip_display and is_public_ip(ip_display) else ""
+        ip_row = f"<tr><td>IP address:</td><td>{ip_display}</td></tr>" if ip_display and is_public_ip(ip_display) else ""
         login_ist = login_time or "unknown"
         try:
             dt = datetime.strptime((login_time or "").strip(), "%Y-%m-%d %H:%M:%S UTC").replace(
@@ -171,8 +171,8 @@ _EMAIL_TEMPLATES = {
         <p>Hello {employee_name},</p>
         <p>Our records show that you have not checked in for your scheduled shift today.</p>
         <table class="details">
-            <tr><td>Shift Date</td><td>{shift_date}</td></tr>
-            <tr><td>Shift Start Time</td><td>{shift_start_time}</td></tr>
+            <tr><td>Shift Date:</td><td>{shift_date}</td></tr>
+            <tr><td>Shift Start Time:</td><td>{shift_start_time}</td></tr>
         </table>
         <p>If you are working today, please log into the {brand_name} and check in as soon as possible. If you are on leave, please submit a leave request in the portal.</p>
     """,
@@ -181,11 +181,11 @@ _EMAIL_TEMPLATES = {
         <p>Hello,</p>
         <p><strong>{applicant_name}</strong> has submitted a leave application that requires your review.</p>
         <table class="details">
-            <tr><td>Applicant</td><td>{applicant_name}</td></tr>
-            <tr><td>Start Date</td><td>{start}</td></tr>
-            <tr><td>End Date</td><td>{end}</td></tr>
-            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
-            <tr><td>Reason</td><td>{reason}</td></tr>
+            <tr><td>Applicant:</td><td>{applicant_name}</td></tr>
+            <tr><td>Start Date:</td><td>{start}</td></tr>
+            <tr><td>End Date:</td><td>{end}</td></tr>
+            <tr><td>Resuming Date:</td><td>{resuming}</td></tr>
+            <tr><td>Reason:</td><td>{reason}</td></tr>
         </table>
         <p class="cta">Please login to the <a href="{portal_url}/leaves">{brand_name}</a> to <strong>approve</strong> or <strong>reject</strong> this request.</p>
     """,
@@ -194,10 +194,10 @@ _EMAIL_TEMPLATES = {
         <p>Hello {applicant_name},</p>
         <p>Your leave application has been submitted and sent to your manager for approval.</p>
         <table class="details">
-            <tr><td>Start Date</td><td>{start}</td></tr>
-            <tr><td>End Date</td><td>{end}</td></tr>
-            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
-            <tr><td>Reason</td><td>{reason}</td></tr>
+            <tr><td>Start Date:</td><td>{start}</td></tr>
+            <tr><td>End Date:</td><td>{end}</td></tr>
+            <tr><td>Resuming Date:</td><td>{resuming}</td></tr>
+            <tr><td>Reason:</td><td>{reason}</td></tr>
         </table>
         <p>You will receive an email notification once your manager reviews the request.</p>
         <p class="cta">View your request on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
@@ -207,9 +207,9 @@ _EMAIL_TEMPLATES = {
         <p>Hello {applicant_name},</p>
         <p>Your leave application has been <strong>approved</strong> by your manager.</p>
         <table class="details">
-            <tr><td>Start Date</td><td>{start}</td></tr>
-            <tr><td>End Date</td><td>{end}</td></tr>
-            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
+            <tr><td>Start Date:</td><td>{start}</td></tr>
+            <tr><td>End Date:</td><td>{end}</td></tr>
+            <tr><td>Resuming Date:</td><td>{resuming}</td></tr>
         </table>
         <p>Your leave credits have been adjusted accordingly. Please plan your work handover before the leave period.</p>
         <p class="cta">View on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
@@ -219,9 +219,9 @@ _EMAIL_TEMPLATES = {
         <p>Hello {applicant_name},</p>
         <p>Your leave application has been <strong>rejected</strong> by your manager.</p>
         <table class="details">
-            <tr><td>Start Date</td><td>{start}</td></tr>
-            <tr><td>End Date</td><td>{end}</td></tr>
-            <tr><td>Resuming Date</td><td>{resuming}</td></tr>
+            <tr><td>Start Date:</td><td>{start}</td></tr>
+            <tr><td>End Date:</td><td>{end}</td></tr>
+            <tr><td>Resuming Date:</td><td>{resuming}</td></tr>
         </table>
         <p>If you have questions about this decision, please contact your manager directly.</p>
         <p class="cta">View on the <a href="{portal_url}/leaves">{brand_name}</a>.</p>
@@ -231,9 +231,9 @@ _EMAIL_TEMPLATES = {
         <p>Hello,</p>
         <p><strong>{applicant_name}</strong> has requested to cancel an approved leave. Your approval is required to process this cancellation.</p>
         <table class="details">
-            <tr><td>Applicant</td><td>{applicant_name}</td></tr>
-            <tr><td>Leave Dates</td><td>{start} — {end}</td></tr>
-            <tr><td>Cancellation Reason</td><td>{remark}</td></tr>
+            <tr><td>Applicant:</td><td>{applicant_name}</td></tr>
+            <tr><td>Leave Dates:</td><td>{start} — {end}</td></tr>
+            <tr><td>Cancellation Reason:</td><td>{remark}</td></tr>
         </table>
         <p class="cta">Please login to the {brand_name} to <strong>approve</strong> or <strong>reject</strong> this cancellation.</p>
     """,
@@ -242,7 +242,7 @@ _EMAIL_TEMPLATES = {
         <p>Hello {applicant_name},</p>
         <p>Your leave cancellation request has been <strong>approved</strong>. The leave has been successfully cancelled.</p>
         <table class="details">
-            <tr><td>Leave Dates</td><td>{start} — {end}</td></tr>
+            <tr><td>Leave Dates:</td><td>{start} — {end}</td></tr>
         </table>
         <p>Your leave balance has been restored. You are expected to report to work as per your regular schedule on these dates.</p>
     """,
@@ -251,8 +251,8 @@ _EMAIL_TEMPLATES = {
         <p>Hello {applicant_name},</p>
         <p>Your leave cancellation request has been <strong>rejected</strong> by your manager.</p>
         <table class="details">
-            <tr><td>Leave Dates</td><td>{start} — {end}</td></tr>
-            <tr><td>Manager's Remark</td><td>{remark}</td></tr>
+            <tr><td>Leave Dates:</td><td>{start} — {end}</td></tr>
+            <tr><td>Manager's Remark:</td><td>{remark}</td></tr>
         </table>
         <p>You may submit a new cancellation request with an updated reason (maximum 5 attempts).</p>
     """,
@@ -260,11 +260,11 @@ _EMAIL_TEMPLATES = {
         <h2 style="color:#2563eb;margin:0 0 8px">WFH Request</h2>
         <p>{applicant_name} has requested Work From Home.</p>
         <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
-            <tr><td style="font-weight:600;color:#5e6c84">Applicant</td><td>{applicant_name}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">Reason</td><td>{reason}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Applicant:</td><td>{applicant_name}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date:</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date:</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date:</td><td>{resuming}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Reason:</td><td>{reason}</td></tr>
         </table>
         <p class="cta">Please login to the <a href="{portal_url}/wfh">{brand_name}</a> to approve or reject this request.</p>
     """,
@@ -272,9 +272,9 @@ _EMAIL_TEMPLATES = {
         <h2 style="color:#16a34a;margin:0 0 8px">WFH Approved</h2>
         <p>{applicant_name}, your Work From Home request has been approved.</p>
         <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
-            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date:</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date:</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date:</td><td>{resuming}</td></tr>
         </table>
         <p class="cta">View on the <a href="{portal_url}/wfh">{brand_name}</a>.</p>
     """,
@@ -282,9 +282,9 @@ _EMAIL_TEMPLATES = {
         <h2 style="color:#dc2626;margin:0 0 8px">WFH Rejected</h2>
         <p>{applicant_name}, your Work From Home request ({start} → {end}) has been rejected.</p>
         <table cellpadding="8" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background:#f8f9fa;border-radius:8px;margin:16px 0">
-            <tr><td style="font-weight:600;color:#5e6c84">Start Date</td><td>{start}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">End Date</td><td>{end}</td></tr>
-            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date</td><td>{resuming}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Start Date:</td><td>{start}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">End Date:</td><td>{end}</td></tr>
+            <tr><td style="font-weight:600;color:#5e6c84">Resuming Date:</td><td>{resuming}</td></tr>
         </table>
         <p>Please contact your manager if you have any questions.</p>
         <p class="cta">View on the <a href="{portal_url}/wfh">{brand_name}</a>.</p>
@@ -295,11 +295,11 @@ _EMAIL_TEMPLATES = {
         <p>Welcome to <strong>{company_name}</strong>! We're delighted to have you join us as <strong>{designation}</strong>.</p>
         <p>Your employee account has been successfully onboarded and is now active.</p>
         <table class="details">
-            <tr><td>Employee ID</td><td>{employee_id}</td></tr>
-            <tr><td>Email</td><td>{email}</td></tr>
-            <tr><td>Designation</td><td>{designation}</td></tr>
-            <tr><td>Joining Date</td><td>{joining_date}</td></tr>
-            <tr><td>Reporting To</td><td>{reports_to_name}</td></tr>
+            <tr><td>Employee ID:</td><td>{employee_id}</td></tr>
+            <tr><td>Email:</td><td>{email}</td></tr>
+            <tr><td>Designation:</td><td>{designation}</td></tr>
+            <tr><td>Joining Date:</td><td>{joining_date}</td></tr>
+            <tr><td>Reporting To:</td><td>{reports_to_name}</td></tr>
         </table>
         <p><strong>Next steps:</strong> Log in to the {brand_name} to complete your profile, view your shifts, and explore leave & WFH features.</p>
         <p class="cta"><a href="{portal_url}">Go to {brand_name} →</a></p>

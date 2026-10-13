@@ -565,6 +565,57 @@ def _run_migrations():
         conn.execute(text("ALTER TABLE attendance ADD COLUMN IF NOT EXISTS check_out_device VARCHAR(100)"))
         conn.commit()
 
+        # Shift-master-level timing policy. Was company-wide / hardcoded; now the
+        # shift is the single source of truth. Backfills from the current company
+        # row so behavior is unchanged on the first deploy, then enforces
+        # NOT NULL. See docs/shift-level-timing-policy.md.
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'shift_master' AND column_name = 'auto_checkout_enabled'
+                ) THEN
+                    ALTER TABLE shift_master ADD COLUMN auto_checkout_enabled BOOLEAN;
+                    ALTER TABLE shift_master ADD COLUMN auto_checkout_grace_minutes INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN grace_minutes INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN checkin_reminder_delay_minutes INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN checkout_reminder_grace_hours INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN early_checkin_limit_minutes INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN checkin_cutoff_minutes INTEGER;
+                    ALTER TABLE shift_master ADD COLUMN half_day_minutes INTEGER;
+
+                    UPDATE shift_master SET
+                        auto_checkout_enabled = COALESCE((SELECT auto_checkout_enabled FROM system_settings WHERE id = 'company'), true),
+                        auto_checkout_grace_minutes = 60,
+                        grace_minutes = COALESCE((SELECT grace_minutes FROM system_settings WHERE id = 'company'), 15),
+                        checkin_reminder_delay_minutes = COALESCE((SELECT checkin_reminder_delay_minutes FROM system_settings WHERE id = 'company'), 30),
+                        checkout_reminder_grace_hours = COALESCE((SELECT checkout_reminder_grace_hours FROM system_settings WHERE id = 'company'), 2),
+                        early_checkin_limit_minutes = 60,
+                        checkin_cutoff_minutes = 120,
+                        half_day_minutes = 240;
+
+                    ALTER TABLE shift_master ALTER COLUMN auto_checkout_enabled SET DEFAULT true;
+                    ALTER TABLE shift_master ALTER COLUMN auto_checkout_enabled SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN auto_checkout_grace_minutes SET DEFAULT 60;
+                    ALTER TABLE shift_master ALTER COLUMN auto_checkout_grace_minutes SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN grace_minutes SET DEFAULT 15;
+                    ALTER TABLE shift_master ALTER COLUMN grace_minutes SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN checkin_reminder_delay_minutes SET DEFAULT 30;
+                    ALTER TABLE shift_master ALTER COLUMN checkin_reminder_delay_minutes SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN checkout_reminder_grace_hours SET DEFAULT 2;
+                    ALTER TABLE shift_master ALTER COLUMN checkout_reminder_grace_hours SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN early_checkin_limit_minutes SET DEFAULT 60;
+                    ALTER TABLE shift_master ALTER COLUMN early_checkin_limit_minutes SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN checkin_cutoff_minutes SET DEFAULT 120;
+                    ALTER TABLE shift_master ALTER COLUMN checkin_cutoff_minutes SET NOT NULL;
+                    ALTER TABLE shift_master ALTER COLUMN half_day_minutes SET DEFAULT 240;
+                    ALTER TABLE shift_master ALTER COLUMN half_day_minutes SET NOT NULL;
+                END IF;
+            END $$;
+        """))
+        conn.commit()
+
         # work_location enum: add OUT_OF_OFFICE for far check-ins on office shifts.
         # ALTER TYPE ... ADD VALUE cannot run inside a transaction.
         auto_conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
